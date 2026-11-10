@@ -1,0 +1,56 @@
+id: io.github.freewayplayer.FreewayPlayer
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: freeway-player
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --socket=pulseaudio
+  - --filesystem=home
+  - --env=FREEWAY_UI_FILE=/app/share/freeway-player/ui/main.xml
+  - --env=LD_LIBRARY_PATH=/app/lib
+modules:
+  - name: vulkan-headers
+    buildsystem: simple
+    build-commands:
+      - install -d /app/include
+      - cp -R include/vulkan /app/include/
+    sources:
+      - type: git
+        url: https://github.com/KhronosGroup/Vulkan-Headers.git
+        tag: v1.3.290
+  - name: raven
+    buildsystem: simple
+    build-commands:
+      - cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/app -DRAVEN_BUILD_SHARED=ON -DRAVEN_BUILD_EXAMPLES=OFF -DRAVEN_BUILD_TESTS=OFF -DRAVEN_BUILD_TOOLS=OFF -DRAVEN_BUILD_WEB=OFF -DRAVEN_PLATFORM=x11 -DRAVEN_VULKAN_INCLUDE_DIR=/app/include -DRAVEN_FETCH_VULKAN_HEADERS=OFF
+      - cmake --build build --parallel
+      - cmake --install build
+    sources:
+      - type: git
+        url: https://github.com/oscar-soirey/Raven.git
+        tag: v0.2.1
+  - name: freeway-player
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/freeway-player/cargo
+      # Needed for this first local manifest: cargo resolves and fetches crates
+      # while building. Flathub builds should use a Cargo.lock plus generated
+      # cargo-sources.json and remove this network permission.
+      build-args:
+        - --share=network
+    build-commands:
+      - RAVEN_LIB_DIR=/app/lib cargo build --release
+      - install -Dm755 target/release/freeway-player /app/bin/freeway-player
+      - install -Dm644 ui/main.xml /app/share/freeway-player/ui/main.xml
+      - install -Dm644 data/io.github.freewayplayer.FreewayPlayer.desktop /app/share/applications/io.github.freewayplayer.FreewayPlayer.desktop
+      - install -Dm644 data/io.github.freewayplayer.FreewayPlayer.svg /app/share/icons/hicolor/scalable/apps/io.github.freewayplayer.FreewayPlayer.svg
+    sources:
+      - type: dir
+        path: ..

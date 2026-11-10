@@ -1,0 +1,20 @@
+[package]
+name = "raven-gui"
+version = "0.2.1"
+edition = "2018"
+description = "Rust bindings for Raven, a lightweight multithreaded GUI library in C for editors and tools"
+license = "Apache-2.0"
+repository = "https://github.com/oscar-soirey/Raven"
+homepage = "https://github.com/oscar-soirey/Raven"
+documentation = "https://github.com/oscar-soirey/Raven/tree/main/bindings#readme"
+readme = "README.md"
+keywords = ["gui", "ui", "vulkan", "widgets", "editor"]
+categories = ["gui", "api-bindings"]
+links = "raven"
+build = "build.rs"
+include = ["src/**/*.rs", "examples/**/*.rs", "build.rs", "Cargo.toml", "README.md", "LICENSE"]
+
+[lib]
+# the crate is published as raven-gui, and used as `raven` (use raven::*;)
+name = "raven"
+path = "src/lib.rs"

@@ -1,0 +1,140 @@
+<Window Title="Freeway Player" Width="1180" Height="780">
+    <VBox Spacing="14" Slot.Padding="22" Color.Accent="#68D7A5">
+        <HBox Spacing="12">
+            <Label Text="♫" TextSize="26" Color.Text="#68D7A5" Slot.VAlign="Center"/>
+            <VBox Spacing="1" Slot.VAlign="Center">
+                <Label Text="FREEWAY PLAYER" TextSize="18"/>
+                <Label Text="Tu música, en orden" TextSize="11" Color.Text="#8D99A8"/>
+            </VBox>
+            <Spacer Width="24"/>
+            <Label Text="LISTAS" TextSize="11" Color.Text="#8D99A8" Slot.VAlign="Center"/>
+            <TabView Name="playlist-tabs" Documents="true" Height="46" Slot.Fill="1" OnChanged="player.playlist_changed"/>
+            <TextInput Name="playlist-name" Width="170" Placeholder="Renombrar lista" Tooltip="Escribe un nombre y pulsa Enter" OnCommitted="player.rename_playlist"/>
+            <Button Text="＋" Tooltip="Crear lista" OnClicked="player.add_playlist"/>
+        </HBox>
+
+        <Splitter Orientation="Horizontal" MinPaneSize="360" Slot.Fill="1">
+            <VBox Spacing="10" Slot.Fill="2">
+                <HBox Spacing="10">
+                    <VBox Spacing="2" Slot.Fill="1">
+                        <Label Text="Biblioteca" TextSize="21"/>
+                        <Label Name="playlist-summary" Text="Lista vacía" TextSize="12" Color.Text="#8D99A8"/>
+                    </VBox>
+                    <Button Text="＋ Añadir pistas" Style="Primary" Tooltip="Añadir archivos de audio a esta lista" OnClicked="player.open" Slot.VAlign="Center"/>
+                    <Button Text="−" Tooltip="Quitar la pista seleccionada de esta lista" OnClicked="player.remove_track" Slot.VAlign="Center"/>
+                </HBox>
+
+                <Border Padding="8" CornerRadius="14" Background="#171B22" BorderColor="#29313C" BorderWidth="1" Slot.Fill="1">
+                    <ListView Name="track-list" OnActivated="player.play_selected" Slot.Fill="1"/>
+                </Border>
+            </VBox>
+
+            <Switcher Name="right-panel" Slot.Fill="1">
+                <Border Padding="20" CornerRadius="16" Background="#171B22" BorderColor="#29313C" BorderWidth="1">
+                    <VBox Spacing="14" Slot.Fill="1">
+                        <HBox Spacing="10">
+                            <Label Text="♫" TextSize="20" Color.Text="#68D7A5"/>
+                            <VBox Spacing="2">
+                                <Label Text="Carátula" TextSize="18"/>
+                                <Label Text="Imagen del archivo que se está reproduciendo" TextSize="11" Color.Text="#8D99A8" Wrap="true"/>
+                            </VBox>
+                        </HBox>
+                        <Separator/>
+                        <Border Padding="12" CornerRadius="12" Background="#11151B" BorderColor="#29313C" BorderWidth="1" Slot.Fill="1">
+                            <Switcher Name="cover-switcher" Slot.Fill="1">
+                                <VBox Spacing="12" Slot.HAlign="Center" Slot.VAlign="Center">
+                                    <Spacer Slot.Fill="1"/>
+                                    <Label Text="♫" TextSize="88" Color.Text="#68D7A5" TextAlign="Center"/>
+                                    <Label Text="FREEWAY PLAYER" TextSize="13" Color.Text="#8D99A8" TextAlign="Center"/>
+                                    <Label Text="Sin carátula" TextSize="11" Color.Text="#657181" TextAlign="Center"/>
+                                    <Spacer Slot.Fill="1"/>
+                                </VBox>
+                                <Image Name="cover-image" Slot.Fill="1"/>
+                            </Switcher>
+                        </Border>
+                    </VBox>
+                </Border>
+
+                <Border Padding="20" CornerRadius="16" Background="#171B22" BorderColor="#29313C" BorderWidth="1">
+                    <VBox Spacing="11">
+                        <HBox Spacing="10">
+                            <Button Text="←" Tooltip="Volver a la carátula" OnClicked="player.close_metadata"/>
+                            <VBox Spacing="2">
+                                <Label Text="Metadatos" TextSize="18"/>
+                                <Label Text="Edita las etiquetas y la carátula" TextSize="11" Color.Text="#8D99A8" Wrap="true"/>
+                            </VBox>
+                        </HBox>
+                        <Separator/>
+                        <VBox Spacing="5">
+                            <Label Text="TÍTULO" TextSize="10" Color.Text="#8D99A8"/>
+                            <TextInput Name="meta-title" Placeholder="Título de la pista"/>
+                        </VBox>
+                        <VBox Spacing="5">
+                            <Label Text="ARTISTA" TextSize="10" Color.Text="#8D99A8"/>
+                            <TextInput Name="meta-artist" Placeholder="Artista"/>
+                        </VBox>
+                        <VBox Spacing="5">
+                            <Label Text="ÁLBUM" TextSize="10" Color.Text="#8D99A8"/>
+                            <TextInput Name="meta-album" Placeholder="Álbum"/>
+                        </VBox>
+                        <HBox Spacing="10">
+                            <VBox Spacing="5" Slot.Fill="1">
+                                <Label Text="GÉNERO" TextSize="10" Color.Text="#8D99A8"/>
+                                <TextInput Name="meta-genre" Placeholder="Género"/>
+                            </VBox>
+                            <VBox Spacing="5" Width="84">
+                                <Label Text="PISTA Nº" TextSize="10" Color.Text="#8D99A8"/>
+                                <TextInput Name="meta-track" Placeholder="—"/>
+                            </VBox>
+                        </HBox>
+                        <VBox Spacing="5">
+                            <Label Text="CARÁTULA" TextSize="10" Color.Text="#8D99A8"/>
+                            <HBox Spacing="8">
+                                <Button Text="Elegir imagen…" OnClicked="player.choose_cover"/>
+                                <Button Text="Quitar" Tooltip="Quitar la carátula incrustada" OnClicked="player.remove_cover"/>
+                            </HBox>
+                            <Label Name="cover-status" Text="Este archivo no tiene carátula" TextSize="10" Color.Text="#8D99A8" Wrap="true"/>
+                        </VBox>
+                        <Spacer Slot.Fill="1"/>
+                        <Button Text="✓  Guardar cambios" Style="Primary" OnClicked="player.save_metadata"/>
+                        <Label Name="metadata-hint" Text="Selecciona una pista para editar sus etiquetas" TextSize="11" Color.Text="#8D99A8" Wrap="true"/>
+                    </VBox>
+                </Border>
+            </Switcher>
+        </Splitter>
+
+        <Border Padding="16" CornerRadius="16" Background="#171B22" BorderColor="#29313C" BorderWidth="1">
+            <VBox Spacing="10">
+                <HBox Spacing="12">
+                    <Label Text="♫" TextSize="22" Color.Text="#68D7A5" Slot.VAlign="Center"/>
+                    <VBox Spacing="2" Slot.Fill="1">
+                        <Label Name="now-playing-title" Text="Ninguna pista" TextSize="15"/>
+                        <Label Name="now-playing-artist" Text="Abre una lista para empezar" TextSize="11" Color.Text="#8D99A8"/>
+                    </VBox>
+                    <Label Name="player-status" Text="Listo" TextSize="11" Color.Text="#8D99A8" Slot.VAlign="Center"/>
+                </HBox>
+
+                <HBox Spacing="10">
+                    <Label Name="elapsed" Text="00:00" Width="44" TextSize="10" Color.Text="#8D99A8" Slot.VAlign="Center"/>
+                    <Slider Name="seek" Min="0" Max="1" Value="0" Slot.Fill="1" OnChanged="player.seek"/>
+                    <Label Name="total" Text="--:--" Width="44" TextSize="10" Color.Text="#8D99A8" TextAlign="Right" Slot.VAlign="Center"/>
+                </HBox>
+
+                <HBox Spacing="10">
+                    <Spacer Slot.Fill="1"/>
+                    <Button Name="shuffle" Text="🔀" Tooltip="Activar reproducción aleatoria para esta lista" OnClicked="player.shuffle"/>
+                    <Button Text="⏮" Tooltip="Pista anterior" OnClicked="player.previous"/>
+                    <Button Text="▶" Style="Primary" Tooltip="Reproducir" OnClicked="player.play"/>
+                    <Button Text="⏸" Tooltip="Pausar" OnClicked="player.pause"/>
+                    <Button Text="■" Tooltip="Detener" OnClicked="player.stop"/>
+                    <Button Text="⏭" Tooltip="Pista siguiente" OnClicked="player.next"/>
+                    <Button Name="repeat" Text="🔁" Tooltip="Repetir esta lista al terminar" OnClicked="player.repeat"/>
+                    <Spacer Slot.Fill="1"/>
+                    <Label Text="◖" Tooltip="Volumen" Slot.VAlign="Center"/>
+                    <Slider Name="volume" Min="0" Max="1" Value="0.8" Step="0.01" Width="130" OnChanged="player.volume" Slot.VAlign="Center"/>
+                    <Label Name="volume-value" Text="80%" Width="38" TextAlign="Right" TextSize="11" Color.Text="#8D99A8" Slot.VAlign="Center"/>
+                </HBox>
+            </VBox>
+        </Border>
+    </VBox>
+</Window>
