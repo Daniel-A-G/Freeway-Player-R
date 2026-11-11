@@ -1,0 +1,35 @@
+<Theme Name="Freeway Night" Look="RavenDark" Accent="#B9A3F5" Material="Solid" CornerRadius="8">
+    <Colors
+        Window="#131118"
+        Panel="#17151D"
+        Border="#2B2732"
+        Text="#F1EEF5"
+        TextDisabled="#898392"
+        TextPlaceholder="#746E7D"
+        Accent="#B9A3F5"
+        AccentHovered="#C9B9F8"
+        AccentPressed="#9D86D8"
+        AccentText="#17131F"
+        Control="#201D27"
+        ControlHovered="#2B2733"
+        ControlPressed="#373140"
+        ControlBorder="#302B38"
+        Input="#1B1822"
+        Focus="#B9A3F5"
+        Selection="#4D4168"
+        RowHovered="#211E29"
+        Track="#2E2936"
+        Handle="#B9A3F5"
+        HandleHovered="#C9B9F8"
+        Separator="#2B2732"
+        Header="#18151F"
+        HeaderHovered="#24212C"
+        TabActive="#2A2434"
+        Popup="#191620"
+        PopupBorder="#302B38"
+        Tooltip="#211E29"
+        TooltipText="#F1EEF5"/>
+    <Metrics CornerRadius="8" ControlHeight="34" RowHeight="40" Spacing="8" PaddingX="11" PaddingY="7" BorderWidth="1" SliderHandleSize="13"/>
+    <Style Widget="Button" CornerRadius="8"/>
+    <Style Widget="TextInput" CornerRadius="7"/>
+</Theme>

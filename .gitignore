@@ -2,3 +2,5 @@
 /.local/
 /build-dir/
 /.flatpak-builder/
+/repo/
+/freeway-player.flatpak

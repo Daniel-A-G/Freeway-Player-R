@@ -12,7 +12,10 @@ RavenRS es otro proyecto: una GUI nativa implementada en Rust con vistas declara
 
 ## Funciones
 
-- Abrir una o varias pistas con el selector de archivos de Raven.
+- Interfaz oscura y opaca con acento lila, superficies planas y separadores sutiles; biblioteca, carátula/editor y controles forman una sola composición sin paneles tipo tarjeta.
+- El icono `icon.png` se incrusta en el binario para la ventana y el encabezado, y se instala para el lanzador Flatpak.
+- Los símbolos de controles y las notas musicales usan fuentes Noto incluidas en el programa; aleatorio y repetición usan iconos monocromos propios. Así no dependen de las fuentes o temas de iconos instalados en cada distribución.
+- Abrir una o varias pistas con el selector del escritorio. En Linux usa XDG Desktop Portal, de modo que el diálogo puede mostrar las ubicaciones fijadas en GTK/KDE y dar acceso a archivos elegidos fuera del espacio concedido directamente al Flatpak.
 - Mantener varias listas en pestañas, añadir/quitar pistas y conservar las listas entre sesiones en `$XDG_CONFIG_HOME/freeway-player/playlists.json` (o `~/.config/freeway-player/playlists.json`).
 - Reproducir, pausar, detener, avanzar y retroceder por la lista activa con controles de iconos.
 - Activar aleatorio y repetición por lista; aleatorio recorre las pistas en un orden mezclado antes de iniciar un nuevo ciclo. Las opciones se guardan junto a cada lista.
@@ -20,6 +23,7 @@ RavenRS es otro proyecto: una GUI nativa implementada en Rust con vistas declara
 - Mostrar la carátula de la pista en reproducción, con un distintivo genérico si no hay imagen. El menú contextual de cada pista abre el editor de título, artista, álbum, género, número de pista y carátula; los cambios se incrustan en el archivo.
 - Reproducción automática de la siguiente pista.
 - Interfaz XML recargable mientras se desarrolla: `FREEWAY_UI_FILE` permite elegir el fichero; si no existe, se usa `ui/main.xml` desde el directorio actual. El XML también se incluye dentro del ejecutable como respaldo.
+- El tema se configura en `ui/theme.xml`; `FREEWAY_THEME_FILE` permite cargar otro tema durante el desarrollo. Si no se encuentra un fichero, se usa el tema incrustado en el ejecutable.
 
 ## Compilar y ejecutar en Linux
 
@@ -59,9 +63,21 @@ flatpak-builder --user --install --install-deps-from=flathub --force-clean build
   packaging/io.github.freewayplayer.FreewayPlayer.yml
 ```
 
+Para generar un archivo `.flatpak` que puedas compartir con otros equipos Linux, primero asegúrate de tener Flathub configurado y exporta la compilación a un repositorio local:
+
+```sh
+flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak-builder --user --install-deps-from=flathub --force-clean --delete-build-dirs --repo=repo --default-branch=stable \
+  build-dir packaging/io.github.freewayplayer.FreewayPlayer.yml
+flatpak build-bundle repo freeway-player.flatpak io.github.freewayplayer.FreewayPlayer stable \
+  --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
+```
+
+En el equipo de destino se instala o actualiza con `flatpak install --user --bundle --or-update ./freeway-player.flatpak`. El bundle contiene la aplicación, no el runtime: el equipo necesita Flatpak y conexión a Flathub para descargar Freedesktop 25.08 si aún no está instalado. El paquete se compila para la arquitectura indicada por Flatpak Builder (por defecto, la del equipo que construye).
+
 El manifiesto requiere el runtime/SDK Freedesktop 25.08 y la extensión Rust estable de esa misma rama; `--install-deps-from=flathub` hace que Flatpak Builder los instale si faltan.
 
-El manifiesto concede acceso a `home` para que el selector integrado de Raven explore música local y el editor pueda guardar etiquetas en los archivos, además de Vulkan/DRI y el socket de audio. Esto permite leer y modificar archivos de la carpeta personal; una unidad montada fuera de ella requerirá conceder acceso a esa ruta o integrar un selector basado en el portal de archivos. `Cargo.lock` ya está incluido; para publicar en Flathub aún habrá que generar `cargo-sources.json` con Flatpak Builder Tools y quitar `--share=network` del módulo de Cargo, porque las compilaciones de Flathub deben resolver dependencias desde fuentes declaradas y fijadas.
+El manifiesto concede acceso de lectura/escritura a `home` para reproducir rutas guardadas y editar las etiquetas de los archivos, además de Vulkan/DRI y el socket de audio. Los selectores de pistas y carátulas usan XDG Desktop Portal: el diálogo del escritorio puede mostrar los marcadores del usuario y navegar enlaces a carpetas, y permite seleccionar archivos fuera de `home` sin añadir permisos globales de acceso. `Cargo.lock` ya está incluido; para publicar en Flathub aún habrá que generar `cargo-sources.json` con Flatpak Builder Tools y quitar `--share=network` del módulo de Cargo, porque las compilaciones de Flathub deben resolver dependencias desde fuentes declaradas y fijadas.
 
 ## RavenRS
 

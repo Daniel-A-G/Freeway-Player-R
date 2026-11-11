@@ -20,6 +20,11 @@ use rodio::Decoder;
 mod opus;
 
 const EMBEDDED_UI: &str = include_str!("../ui/main.xml");
+const EMBEDDED_THEME: &str = include_str!("../ui/theme.xml");
+const APP_ICON_PNG: &[u8] = include_bytes!("../icon.png");
+const ACTION_ICONS_PNG: &[u8] = include_bytes!("../data/action-icons.png");
+const SYMBOLS_2_FONT: &[u8] = include_bytes!("../data/fonts/NotoSansSymbols2-Regular.ttf");
+const SYMBOLS_FONT: &[u8] = include_bytes!("../data/fonts/NotoSansSymbols-Regular.ttf");
 const INITIAL_VOLUME: f32 = 0.8;
 
 struct AudioOutput {
@@ -1010,6 +1015,7 @@ fn create_audio_output() -> Result<AudioOutput, String> {
 
 #[derive(Clone, Copy)]
 struct Ui {
+    app_logo: Rid,
     playlist_tabs: Rid,
     playlist_name: Rid,
     playlist_summary: Rid,
@@ -1025,7 +1031,9 @@ struct Ui {
     total: Rid,
     seek: Rid,
     shuffle: Rid,
+    shuffle_icon: Rid,
     repeat: Rid,
+    repeat_icon: Rid,
     volume_value: Rid,
     meta_title: Rid,
     meta_artist: Rid,
@@ -1038,6 +1046,7 @@ struct Ui {
 impl Ui {
     fn from_window(window: Rid) -> Self {
         Self {
+            app_logo: widget_find(window, "app-logo"),
             playlist_tabs: widget_find(window, "playlist-tabs"),
             playlist_name: widget_find(window, "playlist-name"),
             playlist_summary: widget_find(window, "playlist-summary"),
@@ -1053,7 +1062,9 @@ impl Ui {
             total: widget_find(window, "total"),
             seek: widget_find(window, "seek"),
             shuffle: widget_find(window, "shuffle"),
+            shuffle_icon: widget_find(window, "shuffle-icon"),
             repeat: widget_find(window, "repeat"),
+            repeat_icon: widget_find(window, "repeat-icon"),
             volume_value: widget_find(window, "volume-value"),
             meta_title: widget_find(window, "meta-title"),
             meta_artist: widget_find(window, "meta-artist"),
@@ -1062,6 +1073,96 @@ impl Ui {
             meta_track: widget_find(window, "meta-track"),
             metadata_hint: widget_find(window, "metadata-hint"),
         }
+    }
+}
+
+fn load_symbol_fallbacks() -> (Rid, Rid) {
+    unsafe {
+        let symbols_2 = Rfont_create(SYMBOLS_2_FONT.as_ptr().cast(), SYMBOLS_2_FONT.len());
+        let symbols = Rfont_create(SYMBOLS_FONT.as_ptr().cast(), SYMBOLS_FONT.len());
+
+        if symbols_2 != R_INVALID_ID {
+            Rfont_set_fallback(Rfont_get_default(), symbols_2);
+            if symbols != R_INVALID_ID {
+                Rfont_set_fallback(symbols_2, symbols);
+            }
+        } else {
+            eprintln!("No se pudo cargar la fuente de símbolos Noto Sans Symbols 2");
+        }
+        if symbols == R_INVALID_ID {
+            eprintln!("No se pudo cargar la fuente de símbolos Noto Sans Symbols");
+        }
+
+        (symbols_2, symbols)
+    }
+}
+
+fn destroy_symbol_fallbacks(symbols_2: Rid, symbols: Rid) {
+    unsafe {
+        if symbols_2 != R_INVALID_ID {
+            Rfont_set_fallback(Rfont_get_default(), R_INVALID_ID);
+            Rfont_set_fallback(symbols_2, R_INVALID_ID);
+            Rfont_destroy(symbols_2);
+        }
+        if symbols != R_INVALID_ID {
+            Rfont_destroy(symbols);
+        }
+    }
+}
+
+fn load_action_icons(ui: Ui) -> Rid {
+    let texture = unsafe {
+        Rtexture_create(ACTION_ICONS_PNG.as_ptr().cast(), ACTION_ICONS_PNG.len())
+    };
+    if texture == R_INVALID_ID {
+        eprintln!("No se pudieron cargar los iconos de aleatorio y repetición");
+        return R_INVALID_ID;
+    }
+
+    unsafe {
+        for (image, min_u, max_u) in [
+            (ui.shuffle_icon, 0.0, 0.5),
+            (ui.repeat_icon, 0.5, 1.0),
+        ] {
+            if image != R_INVALID_ID {
+                Rimage_set_texture(image, texture);
+                Rimage_set_region(image, min_u, 0.0, max_u, 1.0);
+                Rimage_set_stretch(image, R_STRETCH_FIT);
+                Rimage_set_tint_text(image, R_TRUE);
+            }
+        }
+    }
+    texture
+}
+
+fn load_app_icon(window: Rid, ui: Ui) -> Rid {
+    let mut width = 0;
+    let mut height = 0;
+    let pixels = unsafe {
+        Rimage_decode(
+            APP_ICON_PNG.as_ptr().cast(),
+            APP_ICON_PNG.len(),
+            &mut width,
+            &mut height,
+        )
+    };
+    if pixels.is_null() {
+        return R_INVALID_ID;
+    }
+    if width <= 0 || height <= 0 {
+        unsafe { Rpixels_free(pixels) };
+        return R_INVALID_ID;
+    }
+
+    unsafe {
+        Rwindow_set_icon(window, pixels, width, height);
+        let texture = Rtexture_create_from_pixels(pixels, width, height);
+        Rpixels_free(pixels);
+        if texture != R_INVALID_ID && ui.app_logo != R_INVALID_ID {
+            Rimage_set_texture(ui.app_logo, texture);
+            Rimage_set_stretch(ui.app_logo, R_STRETCH_FIT);
+        }
+        texture
     }
 }
 
@@ -1361,53 +1462,22 @@ unsafe extern "C" fn close_playlist_tab(
     }
 }
 
-fn open_audio_files(window: Rid) -> Vec<PathBuf> {
-    let filter_name = cstr("Archivos de audio");
-    let filter_patterns = cstr("*.mp3;*.flac;*.wav;*.ogg;*.opus;*.m4a");
-    let title = cstr("Añadir pistas a la lista");
-    let filter = RFileFilter {
-        name: filter_name.as_ptr(),
-        patterns: filter_patterns.as_ptr(),
-    };
-    let mut description: RFileDialogDesc = unsafe { std::mem::zeroed() };
-    description.parent = window;
-    description.title = title.as_ptr();
-    description.filters = &filter;
-    description.filter_count = 1;
-    description.flags = (R_FILE_DIALOG_RAVEN | R_FILE_DIALOG_MULTIPLE) as Ruint;
-
-    let first = unsafe { Rfile_dialog_open(&description) };
-    if first.is_null() {
-        return Vec::new();
-    }
-
-    let count = unsafe { Rfile_dialog_get_result_count() };
-    if count > 0 {
-        (0..count)
-            .map(|index| PathBuf::from(unsafe { text(Rfile_dialog_get_result(index)) }))
-            .collect()
-    } else {
-        vec![PathBuf::from(unsafe { text(first) })]
-    }
+fn open_audio_files(_window: Rid) -> Vec<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Añadir pistas a la lista")
+        .add_filter(
+            "Archivos de audio",
+            &["mp3", "flac", "wav", "ogg", "opus", "m4a"],
+        )
+        .pick_files()
+        .unwrap_or_default()
 }
 
-fn open_cover_file(window: Rid) -> Option<PathBuf> {
-    let filter_name = cstr("Imágenes de carátula");
-    let filter_patterns = cstr("*.png;*.jpg;*.jpeg;*.bmp;*.gif");
-    let title = cstr("Seleccionar carátula");
-    let filter = RFileFilter {
-        name: filter_name.as_ptr(),
-        patterns: filter_patterns.as_ptr(),
-    };
-    let mut description: RFileDialogDesc = unsafe { std::mem::zeroed() };
-    description.parent = window;
-    description.title = title.as_ptr();
-    description.filters = &filter;
-    description.filter_count = 1;
-    description.flags = R_FILE_DIALOG_RAVEN as Ruint;
-
-    let selected = unsafe { Rfile_dialog_open(&description) };
-    (!selected.is_null()).then(|| PathBuf::from(unsafe { text(selected) }))
+fn open_cover_file(_window: Rid) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Seleccionar carátula")
+        .add_filter("Imágenes de carátula", &["png", "jpg", "jpeg", "bmp", "gif"])
+        .pick_file()
 }
 
 struct MetadataMenuContext {
@@ -1450,6 +1520,17 @@ fn ui_xml_path() -> Option<PathBuf> {
     local.is_file().then_some(local)
 }
 
+fn theme_xml_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("FREEWAY_THEME_FILE") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let local = PathBuf::from("ui/theme.xml");
+    local.is_file().then_some(local)
+}
+
 fn main() {
     unsafe {
         if Rinit(R_BACKEND_VULKAN) == 0 {
@@ -1457,6 +1538,15 @@ fn main() {
             std::process::exit(1);
         }
         Rlook_set(R_LOOK_RAVEN_DARK);
+        let theme_name = if let Some(path) = theme_xml_path() {
+            let path = cstr(&path.to_string_lossy());
+            Rtheme_load(path.as_ptr())
+        } else {
+            Rtheme_load_from_memory(EMBEDDED_THEME.as_ptr().cast(), EMBEDDED_THEME.len())
+        };
+        if theme_name.is_null() || Rtheme_use(theme_name) == R_FALSE {
+            eprintln!("No se pudo cargar el tema oscuro de Freeway Player");
+        }
     }
 
     let window = if let Some(path) = ui_xml_path() {
@@ -1472,6 +1562,9 @@ fn main() {
     }
 
     let ui = Ui::from_window(window);
+    let (symbols_2_font, symbols_font) = load_symbol_fallbacks();
+    let app_icon_texture = load_app_icon(window, ui);
+    let action_icons_texture = load_action_icons(ui);
     let state = Rc::new(RefCell::new(PlayerState::new()));
     let context_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
     let edit_metadata_text = cstr("Editar metadatos");
@@ -1689,9 +1782,17 @@ fn main() {
         Rwidget_destroy(context_menu);
         drop(Box::from_raw(context_data as *mut MetadataMenuContext));
         let cover_texture = state.borrow().cover_texture;
+        Rwindow_destroy(window);
         if cover_texture != R_INVALID_ID {
             Rtexture_destroy(cover_texture);
         }
+        if app_icon_texture != R_INVALID_ID {
+            Rtexture_destroy(app_icon_texture);
+        }
+        if action_icons_texture != R_INVALID_ID {
+            Rtexture_destroy(action_icons_texture);
+        }
+        destroy_symbol_fallbacks(symbols_2_font, symbols_font);
         Rshutdown();
     }
 }

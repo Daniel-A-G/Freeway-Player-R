@@ -27,7 +27,7 @@ modules:
   - name: raven
     buildsystem: simple
     build-commands:
-      - cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/app -DRAVEN_BUILD_SHARED=ON -DRAVEN_BUILD_EXAMPLES=OFF -DRAVEN_BUILD_TESTS=OFF -DRAVEN_BUILD_TOOLS=OFF -DRAVEN_BUILD_WEB=OFF -DRAVEN_PLATFORM=x11 -DRAVEN_VULKAN_INCLUDE_DIR=/app/include -DRAVEN_FETCH_VULKAN_HEADERS=OFF
+      - cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/app -DCMAKE_INSTALL_LIBDIR=lib -DRAVEN_BUILD_SHARED=ON -DRAVEN_BUILD_EXAMPLES=OFF -DRAVEN_BUILD_TESTS=OFF -DRAVEN_BUILD_TOOLS=OFF -DRAVEN_BUILD_WEB=OFF -DRAVEN_PLATFORM=x11 -DRAVEN_VULKAN_INCLUDE_DIR=/app/include -DRAVEN_FETCH_VULKAN_HEADERS=OFF
       - cmake --build build --parallel
       - cmake --install build
     sources:
@@ -50,7 +50,16 @@ modules:
       - install -Dm755 target/release/freeway-player /app/bin/freeway-player
       - install -Dm644 ui/main.xml /app/share/freeway-player/ui/main.xml
       - install -Dm644 data/io.github.freewayplayer.FreewayPlayer.desktop /app/share/applications/io.github.freewayplayer.FreewayPlayer.desktop
-      - install -Dm644 data/io.github.freewayplayer.FreewayPlayer.svg /app/share/icons/hicolor/scalable/apps/io.github.freewayplayer.FreewayPlayer.svg
+      - install -Dm644 icon.png /app/share/icons/hicolor/256x256/apps/io.github.freewayplayer.FreewayPlayer.png
+      - install -Dm644 data/fonts/LICENSE-Noto.txt /app/share/licenses/io.github.freewayplayer.FreewayPlayer/LICENSE-Noto.txt
     sources:
       - type: dir
         path: ..
+        skip:
+          - .flatpak-builder
+          - .git
+          - .local
+          - build-dir
+          - repo
+          - target
+          - freeway-player.flatpak

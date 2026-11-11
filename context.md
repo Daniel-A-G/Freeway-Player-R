@@ -1,12 +1,22 @@
 # Contexto del proyecto
 
-Resumen rápido para asistentes de IA. Actualizado el 2026-11-07.
+Resumen rápido para asistentes de IA. Actualizado el 2026-11-11.
 
 ## Estado actual
 
 - Freeway Player es un reproductor local de música para Linux escrito en Rust.
-- Se rediseñó la interfaz para organizar el uso alrededor de listas con pestañas, una biblioteca seleccionable, controles con símbolos y tooltips, barra de búsqueda de posición y un editor de etiquetas.
-- `cargo check` y `cargo build` terminaron correctamente después de los cambios. No se ejecutaron pruebas ni se abrió la ventana nueva para inspección visual.
+- La interfaz usa un tema oscuro opaco con acento lila suave, superficies planas y radios discretos. Biblioteca, carátula/editor y reproductor forman una composición continua separada por líneas sutiles; no se usan transparencias, desenfoques ni tarjetas independientes.
+- El rediseño conserva los nombres de widgets y las acciones existentes. Los cambios visuales no alteran la reproducción ni el comportamiento de listas, metadatos o controles.
+- `ui/theme.xml` define colores, métricas y estilos sobre RavenDark con material sólido. `src/main.rs` carga primero `FREEWAY_THEME_FILE`, luego `ui/theme.xml` desde el directorio de trabajo y finalmente usa el tema incrustado mediante `include_str!`.
+- Se mantienen las listas con pestañas, biblioteca seleccionable, controles con símbolos y tooltips, barra de búsqueda de posición y editor de etiquetas.
+- `icon.png` (256×256 RGBA) se incrusta en el binario y se usa en la ventana y el encabezado; el manifiesto Flatpak lo instala como icono de la aplicación.
+- Los símbolos Unicode usan Noto Sans Symbols 2 y Noto Sans Symbols como fuentes fallback incrustadas; los botones de aleatorio y repetición usan una pequeña textura de iconos propia. Esto evita depender de fuentes o temas de iconos del host, incluido Flatpak. El manifiesto instala también la licencia OFL de las fuentes.
+- El selector de pistas y carátulas usa `rfd` con backend XDG Desktop Portal (con Zenity como fallback si el portal no está disponible). El escritorio anfitrión presenta el diálogo; puede reflejar ubicaciones fijadas por el usuario y recorrer enlaces a directorios, incluidos destinos fuera de `home`, con acceso concedido por el portal. La compilación del bundle está verificada, pero falta comprobar visualmente el diálogo en CachyOS.
+- La compilación de Rust en modo release y la compilación Flatpak terminaron correctamente con los cambios de fuentes e iconos.
+- El bundle anterior x86_64 (5.6 MB) se instaló en el perfil Flatpak de usuario y arrancó en sandbox durante 8 segundos sin errores en stderr; esa comprobación visual no detectaba el fallo de glifos en CachyOS.
+- El bundle actualizado x86_64 `freeway-player.flatpak` (6.0 MB) incorpora las fuentes fallback, los iconos de aleatorio/repetición, la licencia OFL y el selector XDG Portal. SHA-256: `9518e5bcb236cbf518d6958fca8c4b8ef997fcce6056669af9b32ad2f8c14413`. La compilación y exportación terminaron; queda comprobar visualmente el selector en CachyOS.
+- El bundle depende de Freedesktop Platform 25.08. El otro equipo debe tener Flatpak y acceso a Flathub para obtener ese runtime si aún no lo tiene. El bundle actual está construido para x86_64.
+- El manifiesto excluye `.git`, `.local`, `.flatpak-builder`, `target`, `build-dir` y `repo` de la fuente local para evitar copiar artefactos. Raven se instala en `/app/lib` para coincidir con `RAVEN_LIB_DIR` y `LD_LIBRARY_PATH`.
 - El usuario confirmó que la versión anterior ya funcionaba en su equipo.
 - Raven está instalado localmente en `.local/raven`; existen enlaces simbólicos `libraven.so` y `libraven.so.0` hacia `libraven.so.0.2.1`.
 
@@ -20,6 +30,7 @@ Resumen rápido para asistentes de IA. Actualizado el 2026-11-07.
 - El panel lateral muestra la carátula de la pista actual o un distintivo genérico. El editor de metadatos se abre desde el menú contextual (clic derecho) de una pista y permite reemplazar o quitar la carátula incrustada con Lofty.
 - Lofty lee y escribe metadatos; la UI edita título, artista, álbum, género y número de pista. Guardar modifica el archivo de audio original. Algunos formatos/etiquetas pueden ser de solo lectura.
 - Raven se inicia con Vulkan. La UI busca `FREEWAY_UI_FILE`; si no existe, usa `ui/main.xml` desde el directorio actual y finalmente el XML embebido.
+- El tema no requiere imágenes ni efectos de composición adicionales; el acento, fondos y controles se dibujan con colores sólidos de Raven.
 
 ## Funciones
 
@@ -27,6 +38,8 @@ Resumen rápido para asistentes de IA. Actualizado el 2026-11-07.
 - Añadir archivos de audio a la lista activa, quitar pistas de la lista sin borrar los archivos y reproducir la pista seleccionada.
 - Las listas, sus rutas, selección y pestaña activa se guardan en `$XDG_CONFIG_HOME/freeway-player/playlists.json` o `~/.config/freeway-player/playlists.json`.
 - Los controles de transporte usan símbolos Unicode con tooltips; volumen y posición se pueden ajustar.
+- `rfd` abre el selector del portal para pistas y carátulas; el diálogo es el del escritorio y las rutas elegidas quedan disponibles al Flatpak mediante el permiso del portal.
+- `data/fonts/` contiene las fuentes fallback Noto y su licencia OFL; `data/action-icons.png` contiene los iconos monocromos de aleatorio y repetición.
 - Si una pista no se puede leer, el avance manual y automático intenta saltar a otra pista reproducible.
 
 ## Compilar y ejecutar en el entorno actual
@@ -44,10 +57,13 @@ Hay que pasar esas variables en cada invocación si no están exportadas en el s
 ## Archivos y mantenimiento
 
 - `src/main.rs`: estado de reproducción y listas, callbacks, persistencia JSON, lectura/escritura de metadatos y actualización de UI.
-- `ui/main.xml`: interfaz. Si se renombran controles, actualizar `Ui::from_window` y sus acciones.
-- `Cargo.toml` / `Cargo.lock`: dependencias Rust; Lofty, Serde y Serde JSON se añadieron para editor y persistencia.
+- `ui/main.xml`: estructura visual. Si se renombran controles, actualizar `Ui::from_window` y sus acciones en `src/main.rs`.
+- `ui/theme.xml`: paleta oscura lila y estilos opacos; se puede sustituir en desarrollo con `FREEWAY_THEME_FILE`.
+- `Cargo.toml` / `Cargo.lock`: dependencias Rust; Lofty, Serde y Serde JSON se añadieron para editor y persistencia, y `rfd` para el selector XDG Portal.
 - `vendor/raven-gui`: bindings locales de Raven.
-- `packaging/io.github.freewayplayer.FreewayPlayer.yml`: Flatpak Freedesktop 25.08. El acceso a `home` ahora es de lectura/escritura para que el selector funcione y se puedan guardar etiquetas; evaluar una integración con portal si se quiere limitar ese permiso. Para Flathub aún hay que generar `cargo-sources.json` y retirar `--share=network`.
+- `icon.png`: icono de la aplicación, incluido en el ejecutable y en el lanzador Flatpak (`hicolor/256x256`).
+- `packaging/io.github.freewayplayer.FreewayPlayer.yml`: manifiesto Flatpak Freedesktop 25.08. El acceso a `home` es de lectura/escritura para reproducir rutas guardadas y editar etiquetas; el selector usa el portal para abrir también ubicaciones externas seleccionadas por el usuario. Para publicar en Flathub aún hay que generar `cargo-sources.json` y retirar `--share=network`.
+- `freeway-player.flatpak`: bundle local x86_64 actualizado desde el repositorio Flatpak `repo/`; se puede instalar o actualizar con `flatpak install --user --bundle --or-update ./freeway-player.flatpak`. El bundle y `repo/` son artefactos locales ignorados por Git.
 - `.local/raven`: instalación local de Raven para desarrollo; Cargo no la descarga.
 - `README.md`: descripción, dependencias y pasos de compilación/empaquetado.
 
