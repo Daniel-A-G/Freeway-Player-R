@@ -1,0 +1,92 @@
+name: Flatpak release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-release:
+    name: Build x86_64 Flatpak and publish release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Flatpak tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y flatpak flatpak-builder
+
+      - name: Add Flathub remote
+        run: flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      - name: Check release tag against Cargo version
+        id: app-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          app_version="$(awk -F '"' '$1 ~ /^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)"
+          if [[ -z "$app_version" || "$tag_version" != "$app_version" ]]; then
+            echo "Tag $GITHUB_REF_NAME must match Cargo.toml version ($app_version), for example v$app_version." >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$app_version" >> "$GITHUB_OUTPUT"
+
+      - name: Build Flatpak repository
+        run: >-
+          flatpak-builder --user --install-deps-from=flathub --force-clean
+          --delete-build-dirs --repo=repo --default-branch=stable build-dir
+          packaging/io.github.freewayplayer.FreewayPlayer.yml
+
+      - name: Create bundle and build information
+        env:
+          APP_VERSION: ${{ steps.app-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          asset="freeway-player-${GITHUB_REF_NAME}-x86_64.flatpak"
+          flatpak build-bundle repo "dist/$asset" io.github.freewayplayer.FreewayPlayer stable \
+            --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
+          (
+            cd dist
+            sha256sum "$asset" > "$asset.sha256"
+          )
+          cat > dist/BUILD-INFO.txt <<EOF
+          release_tag=$GITHUB_REF_NAME
+          cargo_version=$APP_VERSION
+          commit=$GITHUB_SHA
+          architecture=x86_64
+          flatpak_id=io.github.freewayplayer.FreewayPlayer
+          flatpak_branch=stable
+          runtime=org.freedesktop.Platform//25.08
+          EOF
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          repo="$GITHUB_REPOSITORY"
+          asset="dist/freeway-player-${tag}-x86_64.flatpak"
+          assets=("$asset" "$asset.sha256" dist/BUILD-INFO.txt)
+          release_options=(
+            --repo "$repo"
+            --title "Freeway Player $tag"
+            --generate-notes
+            --verify-tag
+          )
+          if [[ "$tag" == *-* ]]; then
+            release_options+=(--prerelease)
+          fi
+          gh release create "$tag" "${assets[@]}" "${release_options[@]}"

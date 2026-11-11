@@ -75,6 +75,17 @@ flatpak build-bundle repo freeway-player.flatpak io.github.freewayplayer.Freeway
 
 En el equipo de destino se instala o actualiza con `flatpak install --user --bundle --or-update ./freeway-player.flatpak`. El bundle contiene la aplicación, no el runtime: el equipo necesita Flatpak y conexión a Flathub para descargar Freedesktop 25.08 si aún no está instalado. El paquete se compila para la arquitectura indicada por Flatpak Builder (por defecto, la del equipo que construye).
 
+### Releases automáticos en GitHub
+
+El workflow `.github/workflows/flatpak-release.yml` compila un bundle x86_64 y crea un GitHub Release al publicar un tag `v*`. El tag debe coincidir con la versión de `Cargo.toml`; por ejemplo, para la versión `0.1.0`:
+
+```sh
+git tag -a v0.1.0 -m "Freeway Player v0.1.0"
+git push origin v0.1.0
+```
+
+El Release incluye el `.flatpak`, su checksum SHA-256 y `BUILD-INFO.txt` con el tag y el commit exacto del código fuente. El bundle se construye en GitHub Actions y se adjunta al Release automáticamente; no hace falta configurar un token personal, porque el workflow usa `GITHUB_TOKEN` con permiso de contenido para publicar el Release.
+
 El manifiesto requiere el runtime/SDK Freedesktop 25.08 y la extensión Rust estable de esa misma rama; `--install-deps-from=flathub` hace que Flatpak Builder los instale si faltan.
 
 El manifiesto concede acceso de lectura/escritura a `home` para reproducir rutas guardadas y editar las etiquetas de los archivos, además de Vulkan/DRI y el socket de audio. Los selectores de pistas y carátulas usan XDG Desktop Portal: el diálogo del escritorio puede mostrar los marcadores del usuario y navegar enlaces a carpetas, y permite seleccionar archivos fuera de `home` sin añadir permisos globales de acceso. `Cargo.lock` ya está incluido; para publicar en Flathub aún habrá que generar `cargo-sources.json` con Flatpak Builder Tools y quitar `--share=network` del módulo de Cargo, porque las compilaciones de Flathub deben resolver dependencias desde fuentes declaradas y fijadas.

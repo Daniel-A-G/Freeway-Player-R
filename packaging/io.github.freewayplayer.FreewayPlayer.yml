@@ -57,9 +57,11 @@ modules:
         path: ..
         skip:
           - .flatpak-builder
+          - .github
           - .git
           - .local
           - build-dir
+          - dist
           - repo
           - target
           - freeway-player.flatpak
