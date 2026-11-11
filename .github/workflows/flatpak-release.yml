@@ -24,7 +24,7 @@ jobs:
       - name: Install Flatpak tools
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y flatpak flatpak-builder
+          sudo apt-get install --no-install-recommends -y flatpak flatpak-builder elfutils
 
       - name: Add Flathub remote
         run: flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
