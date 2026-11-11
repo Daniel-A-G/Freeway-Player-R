@@ -6,8 +6,8 @@ use raven::*;
 use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::hash_map::RandomState;
-use std::ffi::c_void;
+use std::collections::{hash_map::RandomState, HashSet};
+use std::ffi::{c_char, c_void, CString};
 use std::fs::{self, File};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -75,6 +75,12 @@ struct Playlist {
     order: Vec<usize>,
     order_position: Option<usize>,
     revision: u64,
+}
+
+#[derive(Default)]
+struct TrackListRows {
+    tracks: Vec<PathBuf>,
+    text: Vec<Option<CString>>,
 }
 
 impl Playlist {
@@ -309,8 +315,9 @@ impl PlayerState {
         let playlist_index = self.active_playlist;
         let playlist = &mut self.playlists[playlist_index];
         let first_added = playlist.tracks.len();
+        let mut existing: HashSet<_> = playlist.tracks.iter().cloned().collect();
         for path in paths {
-            if !playlist.tracks.contains(&path) {
+            if existing.insert(path.clone()) {
                 playlist.tracks.push(path);
             }
         }
@@ -1227,8 +1234,7 @@ fn previous_track_index(current: Option<usize>, playlist_len: usize) -> Option<u
     }))
 }
 
-fn track_row(path: &Path, index: usize) -> String {
-    let metadata = read_track_metadata(path);
+fn track_row(metadata: &TrackMetadata, index: usize) -> String {
     let duration = metadata
         .duration
         .map(format_time)
@@ -1247,7 +1253,40 @@ fn track_row(path: &Path, index: usize) -> String {
     )
 }
 
-fn update_track_list(state: &mut PlayerState, ui: Ui) {
+unsafe extern "C" fn track_list_row_text(
+    _list_view: Rid,
+    index: i32,
+    user_data: *mut c_void,
+) -> *const c_char {
+    const EMPTY: &[u8] = b"\0";
+
+    if user_data.is_null() || index < 0 {
+        return EMPTY.as_ptr().cast();
+    }
+    let rows = &*(user_data as *const RefCell<TrackListRows>);
+    let Ok(mut rows) = rows.try_borrow_mut() else {
+        return EMPTY.as_ptr().cast();
+    };
+    let index = index as usize;
+    if index >= rows.tracks.len() {
+        return EMPTY.as_ptr().cast();
+    }
+
+    if rows.text[index].is_none() {
+        let metadata = read_track_metadata(&rows.tracks[index]);
+        rows.text[index] = Some(cstr(&track_row(&metadata, index)));
+    }
+    rows.text[index]
+        .as_ref()
+        .map(|text| text.as_ptr())
+        .unwrap_or(EMPTY.as_ptr().cast())
+}
+
+fn update_track_list(
+    state: &mut PlayerState,
+    ui: Ui,
+    row_cache: &RefCell<TrackListRows>,
+) {
     let Some(playlist) = state.playlists.get(state.active_playlist) else {
         return;
     };
@@ -1257,15 +1296,27 @@ fn update_track_list(state: &mut PlayerState, ui: Ui) {
     }
 
     let name = playlist.name.clone();
-    let tracks: Vec<_> = playlist.tracks.clone();
+    let tracks = playlist.tracks.clone();
     let selected = playlist.selected;
-    unsafe { Rlist_view_clear_items(ui.track_list) };
-    for (index, path) in tracks.iter().enumerate() {
-        let row = cstr(&track_row(path, index));
-        unsafe { Rlist_view_add_item(ui.track_list, row.as_ptr()) };
+    let track_count = tracks.len();
+    {
+        let mut rows = row_cache.borrow_mut();
+        rows.tracks = tracks;
+        rows.text.clear();
+        rows.text.resize_with(track_count, || None);
     }
-    if let Some(index) = selected {
-        unsafe { Rlist_view_set_selected(ui.track_list, index as i32) };
+
+    let user_data = row_cache as *const RefCell<TrackListRows> as *mut c_void;
+    unsafe {
+        Rlist_view_set_virtual_items(
+            ui.track_list,
+            i32::try_from(track_count).unwrap_or(i32::MAX),
+            Some(track_list_row_text),
+            user_data,
+        );
+        if let Some(index) = selected {
+            Rlist_view_set_selected(ui.track_list, index as i32);
+        }
     }
     state.ui_rendered_playlist = Some(marker);
     state.editor_loaded_for = None;
@@ -1273,7 +1324,7 @@ fn update_track_list(state: &mut PlayerState, ui: Ui) {
     set_input(ui.playlist_name, &name);
     set_label(
         ui.playlist_summary,
-        &format!("{} pistas · {}", tracks.len(), name),
+        &format!("{} pistas · {}", track_count, name),
     );
 }
 
@@ -1340,9 +1391,9 @@ fn update_metadata_editor(state: &mut PlayerState, ui: Ui) {
     set_label(ui.cover_status, &state.cover_hint);
 }
 
-fn refresh_ui(state: &mut PlayerState, ui: Ui) {
+fn refresh_ui(state: &mut PlayerState, ui: Ui, row_cache: &RefCell<TrackListRows>) {
     state.update_after_frame();
-    update_track_list(state, ui);
+    update_track_list(state, ui, row_cache);
     update_metadata_editor(state, ui);
     update_cover_art(state, ui);
 
@@ -1565,6 +1616,7 @@ fn main() {
     let (symbols_2_font, symbols_font) = load_symbol_fallbacks();
     let app_icon_texture = load_app_icon(window, ui);
     let action_icons_texture = load_action_icons(ui);
+    let track_list_rows = Box::new(RefCell::new(TrackListRows::default()));
     let state = Rc::new(RefCell::new(PlayerState::new()));
     let context_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
     let edit_metadata_text = cstr("Editar metadatos");
@@ -1773,10 +1825,10 @@ fn main() {
         });
     }
 
-    refresh_ui(&mut state.borrow_mut(), ui);
+    refresh_ui(&mut state.borrow_mut(), ui, track_list_rows.as_ref());
     unsafe {
         while Rwait_frame(0.2) != 0 {
-            refresh_ui(&mut state.borrow_mut(), ui);
+            refresh_ui(&mut state.borrow_mut(), ui, track_list_rows.as_ref());
         }
         Rwidget_set_context_menu(ui.track_list, R_INVALID_ID);
         Rwidget_destroy(context_menu);
