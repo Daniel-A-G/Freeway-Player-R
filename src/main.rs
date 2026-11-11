@@ -12,12 +12,14 @@ use std::fs::{self, File};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
 #[cfg(test)]
 use rodio::Decoder;
 
 mod opus;
+mod updates;
 
 const EMBEDDED_UI: &str = include_str!("../ui/main.xml");
 const EMBEDDED_THEME: &str = include_str!("../ui/theme.xml");
@@ -159,6 +161,7 @@ struct PlayerState {
     volume: f32,
     playing: bool,
     status: String,
+    update_messages: Option<Receiver<updates::UpdateMessage>>,
     metadata_hint: String,
     cover_hint: String,
     ui_rendered_playlist: Option<(usize, u64)>,
@@ -196,6 +199,7 @@ impl PlayerState {
             volume: INITIAL_VOLUME,
             playing: false,
             status,
+            update_messages: None,
             metadata_hint: "Selecciona una pista para editar sus etiquetas".to_owned(),
             cover_hint: "No hay una carátula seleccionada".to_owned(),
             ui_rendered_playlist: None,
@@ -228,6 +232,53 @@ impl PlayerState {
 
         if let Err(error) = result {
             self.status = format!("No se pudieron guardar las listas: {error}");
+        }
+    }
+
+    fn start_update_check(&mut self) {
+        if self.update_messages.is_some() {
+            self.status = "La búsqueda de actualizaciones ya está en curso".to_owned();
+            return;
+        }
+        match updates::start_update_check() {
+            Ok(receiver) => {
+                self.update_messages = Some(receiver);
+                self.status = "Buscando actualizaciones en GitHub…".to_owned();
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
+    fn poll_update_check(&mut self) {
+        let message = self.update_messages.as_ref().map(Receiver::try_recv);
+        match message {
+            Some(Ok(updates::UpdateMessage::Downloading(tag))) => {
+                self.status = format!("Descargando la actualización {tag}…");
+            }
+            Some(Ok(updates::UpdateMessage::Finished(result))) => {
+                self.update_messages = None;
+                self.status = match result {
+                    Ok(updates::UpdateOutcome::UpToDate(tag)) => {
+                        format!("Ya tienes la última versión estable ({tag})")
+                    }
+                    Ok(updates::UpdateOutcome::InstalledIsNewer { latest_tag }) => {
+                        format!("La versión instalada es más reciente que {latest_tag}")
+                    }
+                    Ok(updates::UpdateOutcome::Downloaded { tag, path }) => {
+                        let filename = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy())
+                            .unwrap_or_default();
+                        format!("{tag} descargada ({filename}); ábrela para instalarla")
+                    }
+                    Err(error) => error,
+                };
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.update_messages = None;
+                self.status = "La comprobación de actualizaciones se interrumpió".to_owned();
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
         }
     }
 
@@ -1392,6 +1443,7 @@ fn update_metadata_editor(state: &mut PlayerState, ui: Ui) {
 }
 
 fn refresh_ui(state: &mut PlayerState, ui: Ui, row_cache: &RefCell<TrackListRows>) {
+    state.poll_update_check();
     state.update_after_frame();
     update_track_list(state, ui, row_cache);
     update_metadata_editor(state, ui);
@@ -1560,6 +1612,13 @@ unsafe extern "C" fn open_metadata_editor_from_context_menu(_item: Rid, user_dat
     update_metadata_editor(&mut state, context.ui);
 }
 
+unsafe extern "C" fn check_updates_from_app_menu(_item: Rid, user_data: *mut c_void) {
+    let state = &*(user_data as *const RefCell<PlayerState>);
+    if let Ok(mut state) = state.try_borrow_mut() {
+        state.start_update_check();
+    }
+}
+
 fn ui_xml_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("FREEWAY_UI_FILE") {
         let path = PathBuf::from(path);
@@ -1619,8 +1678,15 @@ fn main() {
     let track_list_rows = Box::new(RefCell::new(TrackListRows::default()));
     let state = Rc::new(RefCell::new(PlayerState::new()));
     let context_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
+    let update_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
     let edit_metadata_text = cstr("Editar metadatos");
     let edit_metadata_item = unsafe { Rmenu_add_item(context_menu, edit_metadata_text.as_ptr()) };
+    let check_updates_text = cstr("Buscar actualizaciones");
+    let check_updates_item = if update_menu != R_INVALID_ID {
+        unsafe { Rmenu_add_item(update_menu, check_updates_text.as_ptr()) }
+    } else {
+        R_INVALID_ID
+    };
     let context_data = Box::into_raw(Box::new(MetadataMenuContext {
         state: Rc::clone(&state),
         ui,
@@ -1635,6 +1701,13 @@ fn main() {
             Some(open_metadata_editor_from_context_menu),
             context_data,
         );
+        if check_updates_item != R_INVALID_ID {
+            Rmenu_item_set_clicked_callback(
+                check_updates_item,
+                Some(check_updates_from_app_menu),
+                Rc::as_ptr(&state) as *mut c_void,
+            );
+        }
         Rtab_view_set_documents(ui.playlist_tabs, R_TRUE);
         Rtab_view_set_close_callback(
             ui.playlist_tabs,
@@ -1658,6 +1731,19 @@ fn main() {
     }
     if !tabs.is_empty() {
         unsafe { Rtab_view_set_active(ui.playlist_tabs, active_playlist as i32) };
+    }
+
+    {
+        action_bind("player.open_app_menu", move |sender, _| {
+            if update_menu == R_INVALID_ID {
+                return;
+            }
+            let (mut x, mut y, mut width, mut height) = (0.0, 0.0, 0.0, 0.0);
+            unsafe {
+                Rwidget_get_rect(sender, &mut x, &mut y, &mut width, &mut height);
+                Rmenu_open(update_menu, window, x, y + height);
+            }
+        });
     }
 
     {
@@ -1830,8 +1916,12 @@ fn main() {
         while Rwait_frame(0.2) != 0 {
             refresh_ui(&mut state.borrow_mut(), ui, track_list_rows.as_ref());
         }
+        Rwindow_close_popups(window);
         Rwidget_set_context_menu(ui.track_list, R_INVALID_ID);
         Rwidget_destroy(context_menu);
+        if update_menu != R_INVALID_ID {
+            Rwidget_destroy(update_menu);
+        }
         drop(Box::from_raw(context_data as *mut MetadataMenuContext));
         let cover_texture = state.borrow().cover_texture;
         Rwindow_destroy(window);

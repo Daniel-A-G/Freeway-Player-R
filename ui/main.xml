@@ -1,7 +1,9 @@
 <Window Title="Freeway Player" Width="1180" Height="780">
     <VBox Spacing="0" Slot.Padding="20">
         <HBox Spacing="12">
-            <Image Name="app-logo" Width="32" Height="32" Slot.VAlign="Center"/>
+            <Button Name="app-menu-button" Width="40" Height="40" Style="Flat" Tooltip="Menú de Freeway Player" OnClicked="player.open_app_menu">
+                <Image Name="app-logo" Width="30" Height="30"/>
+            </Button>
             <VBox Spacing="1" Slot.VAlign="Center">
                 <Label Text="FREEWAY PLAYER" TextSize="17"/>
                 <Label Text="Tu música, en orden" TextSize="11" Color.Text="#8F8999"/>
