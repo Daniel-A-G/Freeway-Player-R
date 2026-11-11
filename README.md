@@ -8,8 +8,6 @@ Raven es la biblioteca C de la documentación indicada, con bindings oficiales p
 
 Los bindings se incluyen en `vendor/raven-gui` desde la etiqueta `v0.2.1` de Raven. El paquete homónimo publicado en crates.io pertenece a otro proyecto, así que la dependencia usa la copia local para mantenerla alineada con la biblioteca C.
 
-RavenRS es otro proyecto: una GUI nativa implementada en Rust con vistas declarativas y renderizado `wgpu`. Es una buena opción si se busca una interfaz completamente Rust, pero no carga el XML descrito en este proyecto. Para este requisito Raven encaja mejor; RavenRS no es una versión Rust del mismo API.
-
 ## Funciones
 
 - Interfaz oscura y opaca con acento lila, superficies planas y separadores sutiles; biblioteca, carátula/editor y controles forman una sola composición sin paneles tipo tarjeta.
@@ -89,7 +87,3 @@ El Release incluye el `.flatpak`, su checksum SHA-256 y `BUILD-INFO.txt` con el 
 El manifiesto requiere el runtime/SDK Freedesktop 25.08 y la extensión Rust estable de esa misma rama; `--install-deps-from=flathub` hace que Flatpak Builder los instale si faltan.
 
 El manifiesto concede acceso de lectura/escritura a `home` para reproducir rutas guardadas y editar las etiquetas de los archivos, además de Vulkan/DRI y el socket de audio. Los selectores de pistas y carátulas usan XDG Desktop Portal: el diálogo del escritorio puede mostrar los marcadores del usuario y navegar enlaces a carpetas, y permite seleccionar archivos fuera de `home` sin añadir permisos globales de acceso. `Cargo.lock` ya está incluido; para publicar en Flathub aún habrá que generar `cargo-sources.json` con Flatpak Builder Tools y quitar `--share=network` del módulo de Cargo, porque las compilaciones de Flathub deben resolver dependencias desde fuentes declaradas y fijadas.
-
-## RavenRS
-
-RavenRS no sustituye a `raven-gui`: es un proyecto independiente. Sus componentes se construyen con el API Rust y no se conectan a `ui/main.xml`. Esta app usa Raven para cumplir el requisito XML. Rodio tampoco elimina todos los requisitos de sistema: su decodificación es Rust, pero la salida Linux pasa por CPAL. La app intenta usar PulseAudio (incluido el servidor compatible de PipeWire) y luego ALSA; para compilar necesita las cabeceras ALSA y PulseAudio.
