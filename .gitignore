@@ -1,6 +1,23 @@
+# Rust build output
 /target/
+
+# Local Raven installation and Flatpak build artifacts
 /.local/
 /build-dir/
 /.flatpak-builder/
 /repo/
-/freeway-player.flatpak
+/*.flatpak
+
+# Notes specific to this checkout
+/context.md
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+
+# Editor and operating system files
+*.swp
+*~
+.DS_Store
+Thumbs.db
