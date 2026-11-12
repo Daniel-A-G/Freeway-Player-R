@@ -103,18 +103,295 @@ jobs:
           GPGKey=$public_key
           DefaultBranch=stable
           EOF
-          cat > repo/index.html <<'EOF'
+          cat > repo/index.html <<'HTMLEOF'
           <!doctype html>
           <html lang="es">
+          <head>
           <meta charset="utf-8">
           <meta name="viewport" content="width=device-width, initial-scale=1">
-          <title>Freeway Player — Flatpak</title>
-          <h1>Freeway Player</h1>
-          <p>Repositorio oficial de Flatpak para instalar y actualizar Freeway Player.</p>
-          <p><a href="freeway-player.flatpakrepo">Añadir el repositorio</a> · <a href="io.github.freewayplayer.FreewayPlayer.flatpakref">Instalar Freeway Player</a></p>
-          <p><a href="https://github.com/Daniel-A-G/Freeway-Player-R/releases">Ver releases</a></p>
+          <title>Freeway Player — Reproductor de música para Linux</title>
+          <meta name="description" content="Reproductor de música local para Linux con gestión de listas, edición de metadatos y carátulas. Escrito en Rust.">
+          <style>
+          :root {
+            --bg: #131118;
+            --bg-card: #1e1b27;
+            --bg-card-hover: #262233;
+            --text: #e8e4ef;
+            --text-muted: #8f8999;
+            --accent: #b9a3f5;
+            --accent-dim: #9678d9;
+            --border: #2e2a3a;
+            --radius: 12px;
+          }
+          *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+          html { scroll-behavior: smooth; }
+          body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            min-height: 100vh;
+          }
+          a { color: var(--accent); text-decoration: none; transition: color 0.2s; }
+          a:hover { color: #d4c4ff; }
+          .container { max-width: 1000px; margin: 0 auto; padding: 0 24px; }
+
+          /* NAV */
+          nav {
+            position: sticky; top: 0; z-index: 10;
+            background: rgba(19,17,24,0.85);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--border);
+          }
+          nav .container {
+            display: flex; align-items: center; justify-content: space-between;
+            height: 64px;
+          }
+          .nav-brand { display: flex; align-items: center; gap: 12px; font-size: 18px; font-weight: 700; color: var(--text); }
+          .nav-brand img { width: 36px; height: 36px; border-radius: 50%; }
+          .nav-links { display: flex; gap: 24px; }
+          .nav-links a { color: var(--text-muted); font-size: 14px; font-weight: 500; }
+          .nav-links a:hover { color: var(--text); }
+
+          /* HERO */
+          .hero {
+            text-align: center;
+            padding: 100px 24px 80px;
+            background: radial-gradient(ellipse at 50% 0%, rgba(185,163,245,0.12) 0%, transparent 60%);
+          }
+          .hero-icon { width: 120px; height: 120px; border-radius: 50%; margin-bottom: 32px; }
+          .hero h1 { font-size: 48px; font-weight: 800; letter-spacing: -1px; margin-bottom: 12px; }
+          .hero h1 span { color: var(--accent); }
+          .hero .tagline { font-size: 20px; color: var(--text-muted); margin-bottom: 40px; }
+          .hero-buttons { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+          .btn {
+            display: inline-flex; align-items: center; gap: 8px;
+            padding: 14px 28px; border-radius: 8px; font-size: 15px; font-weight: 600;
+            transition: background 0.2s, transform 0.15s;
+            cursor: pointer; border: none;
+          }
+          .btn:hover { transform: translateY(-1px); }
+          .btn-primary { background: var(--accent); color: #131118; }
+          .btn-primary:hover { background: #c9b8ff; }
+          .btn-secondary { background: var(--bg-card); color: var(--text); border: 1px solid var(--border); }
+          .btn-secondary:hover { background: var(--bg-card-hover); }
+
+          /* FEATURES */
+          .features { padding: 80px 0; }
+          .section-title { text-align: center; font-size: 32px; font-weight: 700; margin-bottom: 12px; }
+          .section-subtitle { text-align: center; color: var(--text-muted); font-size: 16px; margin-bottom: 48px; }
+          .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+          }
+          .feature-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 28px;
+            transition: background 0.2s, border-color 0.2s;
+          }
+          .feature-card:hover { background: var(--bg-card-hover); border-color: var(--accent-dim); }
+          .feature-icon { font-size: 32px; margin-bottom: 16px; }
+          .feature-card h3 { font-size: 17px; font-weight: 600; margin-bottom: 8px; }
+          .feature-card p { color: var(--text-muted); font-size: 14px; line-height: 1.6; }
+
+          /* INSTALL */
+          .install { padding: 80px 0; }
+          .install-box {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 40px;
+            text-align: center;
+          }
+          .install-box h2 { font-size: 28px; font-weight: 700; margin-bottom: 12px; }
+          .install-box p { color: var(--text-muted); margin-bottom: 32px; max-width: 600px; margin-left: auto; margin-right: auto; }
+          .install-buttons { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; margin-bottom: 32px; }
+          .terminal {
+            background: #0d0b12;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px 24px;
+            text-align: left;
+            font-family: "Fira Code", "Cascadia Code", "JetBrains Mono", monospace;
+            font-size: 13px;
+            color: var(--text-muted);
+            max-width: 600px;
+            margin: 0 auto;
+            overflow-x: auto;
+          }
+          .terminal code { color: var(--accent); }
+          .terminal .comment { color: #5a5468; }
+
+          /* TECH */
+          .tech { padding: 60px 0 80px; }
+          .tech-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+          }
+          .tech-item {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+          }
+          .tech-item h4 { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+          .tech-item p { color: var(--text-muted); font-size: 13px; }
+
+          /* FOOTER */
+          footer {
+            border-top: 1px solid var(--border);
+            padding: 32px 0;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 13px;
+          }
+          footer a { color: var(--accent); }
+
+          @media (max-width: 640px) {
+            .hero h1 { font-size: 32px; }
+            .hero .tagline { font-size: 16px; }
+            .nav-links { display: none; }
+          }
+          </style>
+          </head>
+          <body>
+
+          <nav>
+            <div class="container">
+              <a href="#" class="nav-brand">
+                <img src="icon.png" alt="Freeway Player">
+                Freeway Player
+              </a>
+              <div class="nav-links">
+                <a href="#funciones">Funciones</a>
+                <a href="#instalar">Instalar</a>
+                <a href="#tecnologia">Tecnología</a>
+                <a href="https://github.com/Daniel-A-G/Freeway-Player-R">GitHub</a>
+              </div>
+            </div>
+          </nav>
+
+          <section class="hero">
+            <div class="container">
+              <img src="icon.png" alt="Freeway Player" class="hero-icon">
+              <h1>Freeway <span>Player</span></h1>
+              <p class="tagline">Tu música, en orden. Reproductor local para Linux con gestión de listas, edición de metadatos y actualizaciones automáticas.</p>
+              <div class="hero-buttons">
+                <a href="io.github.freewayplayer.FreewayPlayer.flatpakref" class="btn btn-primary">⬇ Instalar ahora</a>
+                <a href="https://github.com/Daniel-A-G/Freeway-Player-R/releases" class="btn btn-secondary">Ver releases</a>
+              </div>
+            </div>
+          </section>
+
+          <section class="features" id="funciones">
+            <div class="container">
+              <h2 class="section-title">Funciones</h2>
+              <p class="section-subtitle">Todo lo que necesitas para organizar y disfrutar tu biblioteca de música.</p>
+              <div class="features-grid">
+                <div class="feature-card">
+                  <div class="feature-icon">🎵</div>
+                  <h3>Listas con pestañas</h3>
+                  <p>Crea, renombra y organiza múltiples listas de reproducción. Cambia entre ellas con pestañas y persiste todo automáticamente.</p>
+                </div>
+                <div class="feature-card">
+                  <div class="feature-icon">🖼️</div>
+                  <h3>Editor de carátulas</h3>
+                  <p>Añade o reemplaza la carátula de cualquier pista. Soporta PNG, JPEG y WebP (conversión automática a PNG para metadatos).</p>
+                </div>
+                <div class="feature-card">
+                  <div class="feature-icon">✏️</div>
+                  <h3>Edición de metadatos</h3>
+                  <p>Edita título, artista, álbum, género y número de pista directamente desde el programa. Lectura y escritura con Lofty.</p>
+                </div>
+                <div class="feature-card">
+                  <div class="feature-icon">🔀</div>
+                  <h3>Aleatorio y repetición</h3>
+                  <p>Activa la reproducción aleatoria o repite la lista actual. La configuración se guarda por lista de forma independiente.</p>
+                </div>
+                <div class="feature-card">
+                  <div class="feature-icon">📂</div>
+                  <h3>Arrastrar y soltar</h3>
+                  <p>Añade canciones arrastrándolas desde el gestor de archivos. Reordena la lista arrastrando las pistas a la posición deseada.</p>
+                </div>
+                <div class="feature-card">
+                  <div class="feature-icon">🔄</div>
+                  <h3>Actualizaciones automáticas</h3>
+                  <p>El programa comprueba actualizaciones al iniciar y las instala directamente mediante el portal Flatpak sin intervención manual.</p>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="install" id="instalar">
+            <div class="container">
+              <div class="install-box">
+                <h2>Instalar</h2>
+                <p>Freeway Player se distribuye como Flatpak. Instala desde el repositorio oficial o descarga el bundle directamente.</p>
+                <div class="install-buttons">
+                  <a href="io.github.freewayplayer.FreewayPlayer.flatpakref" class="btn btn-primary">⬇ Instalar desde repositorio</a>
+                  <a href="freeway-player.flatpakrepo" class="btn btn-secondary">Añadir repositorio</a>
+                </div>
+                <div class="terminal">
+                  <span class="comment"># Añadir el repositorio e instalar</span><br>
+                  <code>flatpak remote-add --if-not-exists freeway-player https://daniel-a-g.github.io/Freeway-Player-R/freeway-player.flatpakrepo</code><br>
+                  <code>flatpak install freeway-player io.github.freewayplayer.FreewayPlayer</code><br><br>
+                  <span class="comment"># O instalar directamente con el bundle</span><br>
+                  <code>flatpak install --user --bundle freeway-player-*.flatpak</code>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="tech" id="tecnologia">
+            <div class="container">
+              <h2 class="section-title">Tecnología</h2>
+              <p class="section-subtitle">Construido con herramientas modernas y de código abierto.</p>
+              <div class="tech-grid">
+                <div class="tech-item">
+                  <h4>Rust</h4>
+                  <p>Escrito en Rust para rendimiento y seguridad</p>
+                </div>
+                <div class="tech-item">
+                  <h4>Raven</h4>
+                  <p>Interfaz gráfica con Vulkan</p>
+                </div>
+                <div class="tech-item">
+                  <h4>rodio</h4>
+                  <p>Reproducción de audio multiplataforma</p>
+                </div>
+                <div class="tech-item">
+                  <h4>Lofty</h4>
+                  <p>Lectura y escritura de metadatos de audio</p>
+                </div>
+                <div class="tech-item">
+                  <h4>Flatpak</h4>
+                  <p>Distribución sandbox con actualizaciones</p>
+                </div>
+                <div class="tech-item">
+                  <h4>GPL v3.0</h4>
+                  <p>Software libre y de código abierto</p>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <footer>
+            <div class="container">
+              <p>Creado por <a href="https://github.com/Daniel-A-G">Daniel Álvarez</a> · Licencia <a href="https://www.gnu.org/licenses/gpl-3.0.html">GNU GPL v3.0</a> · <a href="https://github.com/Daniel-A-G/Freeway-Player-R">Código fuente</a></p>
+            </div>
+          </footer>
+
+          </body>
           </html>
-          EOF
+          HTMLEOF
+
+          # Copy the app icon to the Pages directory
+          cp icon.png repo/icon.png
 
           mkdir -p dist
           asset="freeway-player-${GITHUB_REF_NAME}-x86_64.flatpak"
