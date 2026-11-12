@@ -1,6 +1,6 @@
 use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
-use lofty::picture::{Picture, PictureType};
+use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::tag::{Accessor, Tag};
 use raven::*;
 use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, Source};
@@ -172,6 +172,7 @@ struct PlayerState {
     pending_cover: Option<((usize, usize), CoverChange)>,
     cover_rendered_for: Option<(usize, usize, u64)>,
     cover_texture: Rid,
+    last_cover_dir: Option<PathBuf>,
 }
 
 impl PlayerState {
@@ -212,6 +213,7 @@ impl PlayerState {
             pending_cover: None,
             cover_rendered_for: None,
             cover_texture: R_INVALID_ID,
+            last_cover_dir: None,
         }
     }
 
@@ -1040,15 +1042,29 @@ fn write_track_metadata(
     }
     match cover_change {
         Some(CoverChange::Replace(image_path)) => {
-            let mut image_file = File::open(&image_path)
+            let image_data = fs::read(&image_path)
                 .map_err(|error| format!("No se pudo abrir la carátula: {error}"))?;
-            let mut picture = Picture::from_reader(&mut image_file)
-                .map_err(|error| format!("La imagen no es compatible: {error}"))?;
+            
+            let picture = if image_path.extension().and_then(|e| e.to_str()) == Some("webp") {
+                // WebP no es soportado por lofy, convertir a PNG
+                let img = image::load_from_memory(&image_data)
+                    .map_err(|error| format!("La imagen no es compatible: {error}"))?;
+                let mut png_buffer = Vec::new();
+                img.write_to(&mut std::io::Cursor::new(&mut png_buffer), image::ImageFormat::Png)
+                    .map_err(|error| format!("No se pudo convertir la imagen: {error}"))?;
+                Picture::unchecked(png_buffer).mime_type(MimeType::Png).build()
+            } else {
+                let mut image_file = std::io::Cursor::new(&image_data);
+                Picture::from_reader(&mut image_file)
+                    .map_err(|error| format!("La imagen no es compatible: {error}"))?
+            };
+            
+            let mut picture = picture;
             picture.set_pic_type(PictureType::CoverFront);
             if let Some(index) = tag
                 .pictures()
                 .iter()
-                .position(|picture| picture.pic_type() == PictureType::CoverFront)
+                .position(|p| p.pic_type() == PictureType::CoverFront)
             {
                 tag.set_picture(index, picture);
             } else {
@@ -1604,11 +1620,14 @@ fn open_audio_files(_window: Rid) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn open_cover_file(_window: Rid) -> Option<PathBuf> {
-    rfd::FileDialog::new()
+fn open_cover_file(_window: Rid, last_dir: &Option<PathBuf>) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new()
         .set_title("Seleccionar carátula")
-        .add_filter("Imágenes de carátula", &["png", "jpg", "jpeg", "bmp", "gif"])
-        .pick_file()
+        .add_filter("Imágenes de carátula", &["png", "jpg", "jpeg", "bmp", "gif", "webp"]);
+    if let Some(ref dir) = last_dir {
+        dialog = dialog.set_directory(dir);
+    }
+    dialog.pick_file()
 }
 
 struct MetadataMenuContext {
@@ -2016,7 +2035,11 @@ fn main() {
         let state = Rc::clone(&state);
         let ui = ui;
         action_bind("player.choose_cover", move |_, _| {
-            let Some(path) = open_cover_file(window) else {
+            let state_ref = state.borrow();
+            let last_dir = state_ref.last_cover_dir.clone();
+            drop(state_ref);
+
+            let Some(path) = open_cover_file(window, &last_dir) else {
                 return;
             };
             let mut state = state.borrow_mut();
@@ -2024,6 +2047,9 @@ fn main() {
                 state.status = "Abre el editor desde una pista para cambiar la carátula".to_owned();
                 return;
             };
+            if let Some(parent) = path.parent() {
+                state.last_cover_dir = Some(parent.to_path_buf());
+            }
             state.pending_cover = Some((location, CoverChange::Replace(path)));
             state.cover_hint = cover_hint_for_location(&state, Some(location));
             set_label(ui.cover_status, &state.cover_hint);
