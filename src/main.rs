@@ -175,6 +175,7 @@ struct PlayerState {
     last_cover_dir: Option<PathBuf>,
     dragging_track: Option<usize>,
     drag_start_y: f32,
+    drag_drop_index: Option<usize>,
 }
 
 impl PlayerState {
@@ -218,6 +219,7 @@ impl PlayerState {
             last_cover_dir: None,
             dragging_track: None,
             drag_start_y: 0.0,
+            drag_drop_index: None,
         }
     }
 
@@ -1693,6 +1695,13 @@ unsafe extern "C" fn open_metadata_editor_from_context_menu(_item: Rid, user_dat
     update_metadata_editor(&mut state, context.ui);
 }
 
+unsafe extern "C" fn remove_from_list_from_context_menu(_item: Rid, user_data: *mut c_void) {
+    let state = &*(user_data as *const RefCell<PlayerState>);
+    if let Ok(mut state) = state.try_borrow_mut() {
+        state.remove_selected_track();
+    }
+}
+
 unsafe extern "C" fn check_updates_from_app_menu(_item: Rid, user_data: *mut c_void) {
     let state = &*(user_data as *const RefCell<PlayerState>);
     if let Ok(mut state) = state.try_borrow_mut() {
@@ -1816,6 +1825,8 @@ unsafe extern "C" fn window_drop_callback(
             continue;
         }
         let path_str = std::ffi::CStr::from_ptr(path_c).to_string_lossy().into_owned();
+        // Strip file:// URI scheme if present (file managers may drop URIs)
+        let path_str = path_str.strip_prefix("file://").unwrap_or(&path_str);
         let path = PathBuf::from(path_str);
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             let ext_lower = ext.to_lowercase();
@@ -1887,6 +1898,24 @@ unsafe extern "C" fn track_list_event_callback(
                 playlist.selected = Some(clamped);
                 state.ui_selection_dirty = true;
             }
+            // Highlight the drop position with a stronger selection color
+            if state.drag_drop_index.is_none() {
+                // First time entering drag mode — set a brighter selection color
+                Rwidget_set_color(
+                    _widget,
+                    R_COLOR_SELECTION,
+                    0.55, 0.35, 1.0, 0.5,
+                );
+            }
+            let row_height = Rtheme_get_metric(R_METRIC_ROW_HEIGHT);
+            if row_height > 0.0 {
+                let drop_index = (local_y / row_height).floor() as usize;
+                let playlist_index = state.active_playlist;
+                if let Some(playlist) = state.playlists.get(playlist_index) {
+                    let clamped = drop_index.min(playlist.tracks.len());
+                    state.drag_drop_index = Some(clamped);
+                }
+            }
         }
         R_EVENT_MOUSE_UP => {
             if (*event).button != R_MOUSE_LEFT {
@@ -1900,6 +1929,9 @@ unsafe extern "C" fn track_list_event_callback(
             };
             state.dragging_track = None;
             state.drag_start_y = 0.0;
+            state.drag_drop_index = None;
+            // Restore the original selection color
+            Rwidget_clear_color(_widget, R_COLOR_SELECTION);
 
             let row_height = Rtheme_get_metric(R_METRIC_ROW_HEIGHT);
             if row_height <= 0.0 {
@@ -1912,6 +1944,15 @@ unsafe extern "C" fn track_list_event_callback(
                 if from_index != clamped {
                     state.move_track(from_index, clamped);
                 }
+            }
+        }
+        R_EVENT_KEY_DOWN => {
+            if (*event).key == R_KEY_DELETE {
+                let Ok(mut state) = state.try_borrow_mut() else {
+                    return R_FALSE;
+                };
+                state.remove_selected_track();
+                return R_TRUE;
             }
         }
         _ => {}
@@ -1981,6 +2022,8 @@ fn main() {
     let update_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
     let edit_metadata_text = cstr("Editar metadatos");
     let edit_metadata_item = unsafe { Rmenu_add_item(context_menu, edit_metadata_text.as_ptr()) };
+    let remove_from_list_text = cstr("Eliminar de la lista");
+    let remove_from_list_item = unsafe { Rmenu_add_item(context_menu, remove_from_list_text.as_ptr()) };
     let check_updates_text = cstr("Buscar actualizaciones");
     let check_updates_item = if update_menu != R_INVALID_ID {
         unsafe { Rmenu_add_item(update_menu, check_updates_text.as_ptr()) }
@@ -2006,6 +2049,11 @@ fn main() {
             edit_metadata_item,
             Some(open_metadata_editor_from_context_menu),
             context_data,
+        );
+        Rmenu_item_set_clicked_callback(
+            remove_from_list_item,
+            Some(remove_from_list_from_context_menu),
+            Rc::as_ptr(&state) as *mut c_void,
         );
         if check_updates_item != R_INVALID_ID {
             Rmenu_item_set_clicked_callback(
