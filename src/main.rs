@@ -12,7 +12,7 @@ use std::fs::{self, File};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
 #[cfg(test)]
@@ -162,6 +162,8 @@ struct PlayerState {
     playing: bool,
     status: String,
     update_messages: Option<Receiver<updates::UpdateMessage>>,
+    update_decision: Option<Sender<bool>>,
+    restart_requested: bool,
     metadata_hint: String,
     cover_hint: String,
     ui_rendered_playlist: Option<(usize, u64)>,
@@ -200,6 +202,8 @@ impl PlayerState {
             playing: false,
             status,
             update_messages: None,
+            update_decision: None,
+            restart_requested: false,
             metadata_hint: "Selecciona una pista para editar sus etiquetas".to_owned(),
             cover_hint: "No hay una carátula seleccionada".to_owned(),
             ui_rendered_playlist: None,
@@ -241,22 +245,45 @@ impl PlayerState {
             return;
         }
         match updates::start_update_check() {
-            Ok(receiver) => {
-                self.update_messages = Some(receiver);
+            Ok(task) => {
+                self.update_messages = Some(task.messages);
+                self.update_decision = Some(task.decision);
                 self.status = "Buscando actualizaciones en GitHub…".to_owned();
             }
             Err(error) => self.status = error,
         }
     }
 
-    fn poll_update_check(&mut self) {
+    fn poll_update_check(&mut self, window: Rid) {
         let message = self.update_messages.as_ref().map(Receiver::try_recv);
         match message {
-            Some(Ok(updates::UpdateMessage::Downloading(tag))) => {
-                self.status = format!("Descargando la actualización {tag}…");
+            Some(Ok(updates::UpdateMessage::Available(tag))) => {
+                let title = cstr("Actualización disponible");
+                let text = cstr(&format!(
+                    "Se encontró una nueva versión ({tag}). ¿Quieres instalarla ahora?"
+                ));
+                let answer = unsafe {
+                    Rmessage_box(window, title.as_ptr(), text.as_ptr(), R_MESSAGE_YES_NO)
+                };
+                let should_install = answer == R_MESSAGE_RESULT_YES;
+                if let Some(decision) = self.update_decision.as_ref() {
+                    let _ = decision.send(should_install);
+                }
+                self.status = if should_install {
+                    format!("Preparando la instalación de {tag}…")
+                } else {
+                    format!("Instalación de {tag} cancelada")
+                };
+            }
+            Some(Ok(updates::UpdateMessage::Installing(tag))) => {
+                self.status = format!("Instalando {tag} desde Flatpak…");
+            }
+            Some(Ok(updates::UpdateMessage::Progress { tag, percent })) => {
+                self.status = format!("Instalando {tag}… {percent}%");
             }
             Some(Ok(updates::UpdateMessage::Finished(result))) => {
                 self.update_messages = None;
+                self.update_decision = None;
                 self.status = match result {
                     Ok(updates::UpdateOutcome::UpToDate(tag)) => {
                         format!("Ya tienes la última versión estable ({tag})")
@@ -264,18 +291,19 @@ impl PlayerState {
                     Ok(updates::UpdateOutcome::InstalledIsNewer { latest_tag }) => {
                         format!("La versión instalada es más reciente que {latest_tag}")
                     }
-                    Ok(updates::UpdateOutcome::Downloaded { tag, path }) => {
-                        let filename = path
-                            .file_name()
-                            .map(|name| name.to_string_lossy())
-                            .unwrap_or_default();
-                        format!("{tag} descargada ({filename}); ábrela para instalarla")
+                    Ok(updates::UpdateOutcome::Declined(tag)) => {
+                        format!("Instalación de {tag} cancelada")
+                    }
+                    Ok(updates::UpdateOutcome::InstalledAndRestarting(tag)) => {
+                        self.restart_requested = true;
+                        format!("{tag} instalada; reiniciando Freeway Player…")
                     }
                     Err(error) => error,
                 };
             }
             Some(Err(TryRecvError::Disconnected)) => {
                 self.update_messages = None;
+                self.update_decision = None;
                 self.status = "La comprobación de actualizaciones se interrumpió".to_owned();
             }
             Some(Err(TryRecvError::Empty)) | None => {}
@@ -1442,8 +1470,8 @@ fn update_metadata_editor(state: &mut PlayerState, ui: Ui) {
     set_label(ui.cover_status, &state.cover_hint);
 }
 
-fn refresh_ui(state: &mut PlayerState, ui: Ui, row_cache: &RefCell<TrackListRows>) {
-    state.poll_update_check();
+fn refresh_ui(state: &mut PlayerState, ui: Ui, row_cache: &RefCell<TrackListRows>, window: Rid) {
+    state.poll_update_check(window);
     state.update_after_frame();
     update_track_list(state, ui, row_cache);
     update_metadata_editor(state, ui);
@@ -1911,10 +1939,13 @@ fn main() {
         });
     }
 
-    refresh_ui(&mut state.borrow_mut(), ui, track_list_rows.as_ref());
+    refresh_ui(&mut state.borrow_mut(), ui, track_list_rows.as_ref(), window);
     unsafe {
         while Rwait_frame(0.2) != 0 {
-            refresh_ui(&mut state.borrow_mut(), ui, track_list_rows.as_ref());
+            refresh_ui(&mut state.borrow_mut(), ui, track_list_rows.as_ref(), window);
+            if state.borrow().restart_requested {
+                break;
+            }
         }
         Rwindow_close_popups(window);
         Rwidget_set_context_menu(ui.track_list, R_INVALID_ID);

@@ -10,10 +10,15 @@ permissions:
 
 jobs:
   build-and-release:
-    name: Build x86_64 Flatpak and publish release
+    name: Build, publish Flatpak repository, and release
     runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: https://daniel-a-g.github.io/Freeway-Player-R/
     permissions:
       contents: write
+      pages: write
+      id-token: write
 
     steps:
       - name: Check out tagged source
@@ -24,7 +29,7 @@ jobs:
       - name: Install Flatpak tools
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y flatpak flatpak-builder elfutils
+          sudo apt-get install --no-install-recommends -y flatpak flatpak-builder elfutils gnupg
 
       - name: Add Flathub remote
         run: flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
@@ -48,15 +53,75 @@ jobs:
           --delete-build-dirs --repo=repo --default-branch=stable build-dir
           packaging/io.github.freewayplayer.FreewayPlayer.yml
 
-      - name: Create bundle and build information
+      - name: Sign repository and create installable bundle
         env:
           APP_VERSION: ${{ steps.app-version.outputs.version }}
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+        shell: bash
         run: |
           set -euo pipefail
+          if [[ -z "$FLATPAK_GPG_PRIVATE_KEY" || -z "$FLATPAK_GPG_KEY_ID" ]]; then
+            echo "Configure FLATPAK_GPG_PRIVATE_KEY and FLATPAK_GPG_KEY_ID in repository Actions secrets." >&2
+            exit 1
+          fi
+
+          export GNUPGHOME="$RUNNER_TEMP/flatpak-gnupg"
+          install -d -m 700 "$GNUPGHOME"
+          printf '%s' "$FLATPAK_GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --batch --export "$FLATPAK_GPG_KEY_ID" > "$RUNNER_TEMP/freeway-player-public.gpg"
+          if [[ ! -s "$RUNNER_TEMP/freeway-player-public.gpg" ]]; then
+            echo "FLATPAK_GPG_KEY_ID does not identify the imported signing key." >&2
+            exit 1
+          fi
+
+          flatpak build-sign --gpg-sign="$FLATPAK_GPG_KEY_ID" repo io.github.freewayplayer.FreewayPlayer stable
+          flatpak build-update-repo --gpg-sign="$FLATPAK_GPG_KEY_ID" --generate-static-deltas --prune repo
+
+          repo_url="https://daniel-a-g.github.io/Freeway-Player-R/"
+          runtime_repo="https://dl.flathub.org/repo/flathub.flatpakrepo"
+          public_key="$(base64 --wrap=0 "$RUNNER_TEMP/freeway-player-public.gpg")"
+          cat > repo/io.github.freewayplayer.FreewayPlayer.flatpakref <<EOF
+          [Flatpak Ref]
+          Name=io.github.freewayplayer.FreewayPlayer
+          Branch=stable
+          Title=Freeway Player
+          Url=$repo_url
+          IsRuntime=false
+          RuntimeRepo=$runtime_repo
+          SuggestRemoteName=freeway-player
+          GPGKey=$public_key
+          EOF
+          cat > repo/freeway-player.flatpakrepo <<EOF
+          [Flatpak Repo]
+          Version=1
+          Title=Freeway Player
+          Url=$repo_url
+          Homepage=https://github.com/Daniel-A-G/Freeway-Player-R
+          Comment=Repositorio oficial de Freeway Player
+          Description=Actualizaciones de Freeway Player para Flatpak.
+          GPGKey=$public_key
+          DefaultBranch=stable
+          EOF
+          cat > repo/index.html <<'EOF'
+          <!doctype html>
+          <html lang="es">
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Freeway Player — Flatpak</title>
+          <h1>Freeway Player</h1>
+          <p>Repositorio oficial de Flatpak para instalar y actualizar Freeway Player.</p>
+          <p><a href="freeway-player.flatpakrepo">Añadir el repositorio</a> · <a href="io.github.freewayplayer.FreewayPlayer.flatpakref">Instalar Freeway Player</a></p>
+          <p><a href="https://github.com/Daniel-A-G/Freeway-Player-R/releases">Ver releases</a></p>
+          </html>
+          EOF
+
           mkdir -p dist
           asset="freeway-player-${GITHUB_REF_NAME}-x86_64.flatpak"
           flatpak build-bundle repo "dist/$asset" io.github.freewayplayer.FreewayPlayer stable \
-            --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
+            --repo-url="$repo_url" \
+            --gpg-keys="$RUNNER_TEMP/freeway-player-public.gpg" \
+            --runtime-repo="$runtime_repo"
           (
             cd dist
             sha256sum "$asset" > "$asset.sha256"
@@ -68,8 +133,18 @@ jobs:
           architecture=x86_64
           flatpak_id=io.github.freewayplayer.FreewayPlayer
           flatpak_branch=stable
+          flatpak_repository=$repo_url
           runtime=org.freedesktop.Platform//25.08
           EOF
+
+      - name: Upload Flatpak repository to GitHub Pages
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: repo
+
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
 
       - name: Publish GitHub Release
         env:
