@@ -176,6 +176,8 @@ struct PlayerState {
     dragging_track: Option<usize>,
     drag_start_y: f32,
     drag_drop_index: Option<usize>,
+    drop_line_widget: Rid,
+    track_list_widget: Rid,
 }
 
 impl PlayerState {
@@ -220,6 +222,8 @@ impl PlayerState {
             dragging_track: None,
             drag_start_y: 0.0,
             drag_drop_index: None,
+            drop_line_widget: R_INVALID_ID,
+            track_list_widget: R_INVALID_ID,
         }
     }
 
@@ -1801,6 +1805,26 @@ unsafe extern "C" fn about_dialog_close(widget: Rid, _user_data: *mut c_void) {
     Rdialog_close(widget, R_MESSAGE_RESULT_OK);
 }
 
+// Percent-decoder that handles multi-byte UTF-8 (e.g., %C3%A1 -> á)
+fn decode_uri_path(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = &s[i + 1..i + 3];
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                result.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&result).into_owned()
+}
+
 // Drop callback: receive files dragged from the file manager into the window
 unsafe extern "C" fn window_drop_callback(
     _target: Rid,
@@ -1824,10 +1848,12 @@ unsafe extern "C" fn window_drop_callback(
         if path_c.is_null() {
             continue;
         }
-        let path_str = std::ffi::CStr::from_ptr(path_c).to_string_lossy().into_owned();
+        let raw = std::ffi::CStr::from_ptr(path_c).to_string_lossy().into_owned();
         // Strip file:// URI scheme if present (file managers may drop URIs)
-        let path_str = path_str.strip_prefix("file://").unwrap_or(&path_str);
-        let path = PathBuf::from(path_str);
+        let raw = raw.strip_prefix("file://").unwrap_or(&raw);
+        // Decode percent-encoded characters (e.g., %20 -> space, %C3%A1 -> á)
+        let decoded = decode_uri_path(raw);
+        let path = PathBuf::from(decoded);
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             let ext_lower = ext.to_lowercase();
             if audio_extensions.iter().any(|&e| e == ext_lower) {
@@ -1841,6 +1867,58 @@ unsafe extern "C" fn window_drop_callback(
         }
     }
     R_TRUE
+}
+
+// Measure callback for the drop indicator line overlay
+unsafe extern "C" fn drop_line_measure(
+    _widget: Rid,
+    width: *mut f32,
+    height: *mut f32,
+    _user_data: *mut c_void,
+) {
+    // The overlay line widget fills the entire window
+    if !width.is_null() {
+        *width = f32::MAX;
+    }
+    if !height.is_null() {
+        *height = f32::MAX;
+    }
+}
+
+// Paint callback for the drop indicator line
+// Draws a thin horizontal line at the drop position over the track list
+unsafe extern "C" fn drop_line_paint(
+    _widget: Rid,
+    painter: *mut RPainter,
+    _width: f32,
+    _height: f32,
+    user_data: *mut c_void,
+) {
+    let state = &*(user_data as *const RefCell<PlayerState>);
+    let Ok(state) = state.try_borrow() else {
+        return;
+    };
+    let Some(drop_index) = state.drag_drop_index else {
+        return;
+    };
+    let row_height = Rtheme_get_metric(R_METRIC_ROW_HEIGHT);
+    if row_height <= 0.0 {
+        return;
+    }
+    // Get the track list position in window coordinates
+    let list_widget = state.track_list_widget;
+    if list_widget == R_INVALID_ID {
+        return;
+    }
+    let (mut list_x, mut list_y, mut list_w, mut _list_h) = (0.0, 0.0, 0.0, 0.0);
+    Rwidget_get_rect(list_widget, &mut list_x, &mut list_y, &mut list_w, &mut _list_h);
+    // Calculate the line Y position: track list top + (drop_index * row_height)
+    let line_y = list_y + (drop_index as f32) * row_height;
+    let r = 0.75;
+    let g = 0.55;
+    let b = 1.0;
+    let a = 0.8;
+    Rdraw_line(painter, list_x, line_y, list_x + list_w, line_y, 2.0, r, g, b, a);
 }
 
 // Event callback for track list: handle drag-to-reorder
@@ -1898,22 +1976,31 @@ unsafe extern "C" fn track_list_event_callback(
                 playlist.selected = Some(clamped);
                 state.ui_selection_dirty = true;
             }
-            // Highlight the drop position with a stronger selection color
-            if state.drag_drop_index.is_none() {
-                // First time entering drag mode — set a brighter selection color
-                Rwidget_set_color(
-                    _widget,
-                    R_COLOR_SELECTION,
-                    0.55, 0.35, 1.0, 0.5,
-                );
-            }
-            let row_height = Rtheme_get_metric(R_METRIC_ROW_HEIGHT);
-            if row_height > 0.0 {
-                let drop_index = (local_y / row_height).floor() as usize;
-                let playlist_index = state.active_playlist;
-                if let Some(playlist) = state.playlists.get(playlist_index) {
-                    let clamped = drop_index.min(playlist.tracks.len());
-                    state.drag_drop_index = Some(clamped);
+            // Show the drop indicator line at the correct position
+            if let Some(playlist) = state.playlists.get(playlist_index) {
+                let drop_index = index.min(playlist.tracks.len());
+                state.drag_drop_index = Some(drop_index);
+                // Move the drop line widget to the correct position in the VBox
+                if state.drop_line_widget != R_INVALID_ID {
+                    let parent = Rwidget_get_parent(_widget);
+                    if parent != R_INVALID_ID {
+                        // Remove the line from its current position
+                        Rwidget_remove_child(parent, state.drop_line_widget);
+                        // Find the track list index and insert the line after the drop target row
+                        // The line should appear at the position where the track will be dropped
+                        let child_count = Rwidget_get_child_count(parent);
+                        for i in 0..child_count {
+                            let child = Rwidget_get_child(parent, i);
+                            if child == _widget {
+                                // Insert the line right after the ListView
+                                // The ListView itself shows the selection, so the line
+                                // appears below it at the drop position
+                                Rwidget_insert_child(parent, state.drop_line_widget, (i + 1) as c_int);
+                                break;
+                            }
+                        }
+                        Rwidget_set_visibility(state.drop_line_widget, R_VISIBLE);
+                    }
                 }
             }
         }
@@ -1930,8 +2017,10 @@ unsafe extern "C" fn track_list_event_callback(
             state.dragging_track = None;
             state.drag_start_y = 0.0;
             state.drag_drop_index = None;
-            // Restore the original selection color
-            Rwidget_clear_color(_widget, R_COLOR_SELECTION);
+            // Hide the drop indicator line
+            if state.drop_line_widget != R_INVALID_ID {
+                Rwidget_set_visibility(state.drop_line_widget, R_COLLAPSED);
+            }
 
             let row_height = Rtheme_get_metric(R_METRIC_ROW_HEIGHT);
             if row_height <= 0.0 {
@@ -2087,6 +2176,28 @@ fn main() {
             Some(track_list_event_callback),
             Rc::as_ptr(&state) as *mut c_void,
         );
+        // Create the drop indicator line as an overlay on the window
+        // The line is a Custom widget that draws a thin horizontal line at the drop position
+        let drop_line = Rwidget_create(R_WIDGET_CUSTOM);
+        Rcustom_set_paint_callback(drop_line, Some(drop_line_paint), Rc::as_ptr(&state) as *mut c_void);
+        Rcustom_set_measure_callback(drop_line, Some(drop_line_measure), std::ptr::null_mut());
+        Rslot_set_size(drop_line, 0.0, 2.0);
+        Rwidget_set_visibility(drop_line, R_COLLAPSED);
+        // Add the drop line as an overlay on the window (on top of all content)
+        let overlay = Rwidget_create(R_WIDGET_OVERLAY);
+        // Get the current window content and move it into the overlay
+        let content = Rwindow_get_content(window);
+        if content != R_INVALID_ID {
+            Rwidget_remove_child(window, content);
+            Rwidget_add_child(overlay, content);
+            Rwidget_add_child(overlay, drop_line);
+            Rwindow_set_content(window, overlay);
+        }
+        // Store the drop line widget and track list widget in state
+        let mut s = state.borrow_mut();
+        s.drop_line_widget = drop_line;
+        s.track_list_widget = ui.track_list;
+        drop(s);
     }
     let (tabs, active_playlist) = {
         let state = state.borrow();
