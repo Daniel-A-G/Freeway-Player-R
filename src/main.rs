@@ -7,7 +7,7 @@ use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{hash_map::RandomState, HashSet};
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{c_char, c_int, c_void, CString};
 use std::fs::{self, File};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -173,6 +173,8 @@ struct PlayerState {
     cover_rendered_for: Option<(usize, usize, u64)>,
     cover_texture: Rid,
     last_cover_dir: Option<PathBuf>,
+    dragging_track: Option<usize>,
+    drag_start_y: f32,
 }
 
 impl PlayerState {
@@ -214,6 +216,8 @@ impl PlayerState {
             cover_rendered_for: None,
             cover_texture: R_INVALID_ID,
             last_cover_dir: None,
+            dragging_track: None,
+            drag_start_y: 0.0,
         }
     }
 
@@ -424,6 +428,36 @@ impl PlayerState {
                 self.status = error;
             }
         }
+    }
+
+    fn move_track(&mut self, from_index: usize, to_index: usize) {
+        let playlist_index = self.active_playlist;
+        let Some(playlist) = self.playlists.get_mut(playlist_index) else {
+            return;
+        };
+        if from_index == to_index || to_index >= playlist.tracks.len() {
+            return;
+        }
+        let track = playlist.tracks.remove(from_index);
+        playlist.tracks.insert(to_index, track);
+
+        // Adjust current track if needed
+        if let Some((pl, tr)) = self.current {
+            if pl == playlist_index {
+                if tr == from_index && tr != to_index {
+                    self.current = Some((pl, to_index));
+                } else if from_index < to_index && tr > from_index && tr <= to_index {
+                    self.current = Some((pl, tr - 1));
+                } else if to_index < from_index && tr >= to_index && tr < from_index {
+                    self.current = Some((pl, tr + 1));
+                }
+            }
+        }
+
+        playlist.selected = Some(to_index);
+        playlist.revision += 1;
+        self.ui_selection_dirty = true;
+        self.save_playlists();
     }
 
     fn remove_selected_track(&mut self) {
@@ -1758,6 +1792,133 @@ unsafe extern "C" fn about_dialog_close(widget: Rid, _user_data: *mut c_void) {
     Rdialog_close(widget, R_MESSAGE_RESULT_OK);
 }
 
+// Drop callback: receive files dragged from the file manager into the window
+unsafe extern "C" fn window_drop_callback(
+    _target: Rid,
+    event: *const RDropEvent,
+    user_data: *mut c_void,
+) -> c_int {
+    if (*event).phase != R_DROP_DROPPED {
+        return R_TRUE;
+    }
+    let state = &*(user_data as *const RefCell<PlayerState>);
+    let path_count = (*event).path_count;
+    let paths_ptr = (*event).paths;
+    if path_count <= 0 || paths_ptr.is_null() {
+        return R_TRUE;
+    }
+
+    let audio_extensions = ["mp3", "flac", "wav", "ogg", "opus", "m4a"];
+    let mut tracks = Vec::new();
+    for i in 0..path_count {
+        let path_c = *paths_ptr.add(i as usize);
+        if path_c.is_null() {
+            continue;
+        }
+        let path_str = std::ffi::CStr::from_ptr(path_c).to_string_lossy().into_owned();
+        let path = PathBuf::from(path_str);
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            let ext_lower = ext.to_lowercase();
+            if audio_extensions.iter().any(|&e| e == ext_lower) {
+                tracks.push(path);
+            }
+        }
+    }
+    if !tracks.is_empty() {
+        if let Ok(mut state) = state.try_borrow_mut() {
+            state.add_tracks(tracks);
+        }
+    }
+    R_TRUE
+}
+
+// Event callback for track list: handle drag-to-reorder
+unsafe extern "C" fn track_list_event_callback(
+    _widget: Rid,
+    event: *const REvent,
+    user_data: *mut c_void,
+) -> c_int {
+    let state = &*(user_data as *const RefCell<PlayerState>);
+    let event_type = (*event).type_;
+    let local_y = (*event).local_y;
+
+    match event_type {
+        R_EVENT_MOUSE_DOWN => {
+            // Only left button, and only if not in a control area (right panel)
+            if (*event).button != R_MOUSE_LEFT {
+                return R_FALSE;
+            }
+            let Ok(mut state) = state.try_borrow_mut() else {
+                return R_FALSE;
+            };
+            let row_height = Rtheme_get_metric(R_METRIC_ROW_HEIGHT);
+            if row_height <= 0.0 {
+                return R_FALSE;
+            }
+            let index = (local_y / row_height) as usize;
+            let playlist_index = state.active_playlist;
+            if let Some(playlist) = state.playlists.get(playlist_index) {
+                if index < playlist.tracks.len() {
+                    state.dragging_track = Some(index);
+                    state.drag_start_y = local_y;
+                }
+            }
+        }
+        R_EVENT_MOUSE_MOVE => {
+            let Ok(mut state) = state.try_borrow_mut() else {
+                return R_FALSE;
+            };
+            if state.dragging_track.is_none() {
+                return R_FALSE;
+            }
+            // Check if mouse moved enough to start dragging (slop threshold)
+            let slop = 10.0;
+            if (local_y - state.drag_start_y).abs() < slop {
+                return R_FALSE;
+            }
+            let row_height = Rtheme_get_metric(R_METRIC_ROW_HEIGHT);
+            if row_height <= 0.0 {
+                return R_FALSE;
+            }
+            let index = (local_y / row_height).floor() as usize;
+            let playlist_index = state.active_playlist;
+            if let Some(playlist) = state.playlists.get_mut(playlist_index) {
+                let clamped = index.min(playlist.tracks.len());
+                playlist.selected = Some(clamped);
+                state.ui_selection_dirty = true;
+            }
+        }
+        R_EVENT_MOUSE_UP => {
+            if (*event).button != R_MOUSE_LEFT {
+                return R_FALSE;
+            }
+            let Ok(mut state) = state.try_borrow_mut() else {
+                return R_FALSE;
+            };
+            let Some(from_index) = state.dragging_track else {
+                return R_FALSE;
+            };
+            state.dragging_track = None;
+            state.drag_start_y = 0.0;
+
+            let row_height = Rtheme_get_metric(R_METRIC_ROW_HEIGHT);
+            if row_height <= 0.0 {
+                return R_FALSE;
+            }
+            let to_index = (local_y / row_height).floor() as usize;
+            let playlist_index = state.active_playlist;
+            if let Some(playlist) = state.playlists.get(playlist_index) {
+                let clamped = to_index.min(playlist.tracks.len());
+                if from_index != clamped {
+                    state.move_track(from_index, clamped);
+                }
+            }
+        }
+        _ => {}
+    }
+    R_FALSE
+}
+
 fn ui_xml_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("FREEWAY_UI_FILE") {
         let path = PathBuf::from(path);
@@ -1864,6 +2025,18 @@ fn main() {
         Rtab_view_set_close_callback(
             ui.playlist_tabs,
             Some(close_playlist_tab),
+            Rc::as_ptr(&state) as *mut c_void,
+        );
+        // Allow dropping audio files from the file manager into the window
+        Rwindow_set_drop_callback(
+            window,
+            Some(window_drop_callback),
+            Rc::as_ptr(&state) as *mut c_void,
+        );
+        // Allow dragging tracks to reorder them in the list
+        Rwidget_set_event_callback(
+            ui.track_list,
+            Some(track_list_event_callback),
             Rc::as_ptr(&state) as *mut c_void,
         );
     }
