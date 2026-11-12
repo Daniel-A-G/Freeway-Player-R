@@ -1,8 +1,8 @@
 <Window Title="Freeway Player" Width="1180" Height="780">
     <VBox Spacing="0" Slot.Padding="20">
         <HBox Spacing="12">
-            <Button Name="app-menu-button" Width="40" Height="40" Style="Flat" Tooltip="Menú de Freeway Player" OnClicked="player.open_app_menu">
-                <Image Name="app-logo" Width="30" Height="30"/>
+            <Button Name="app-menu-button" Width="56" Height="48" Style="Flat" Tooltip="Menú de Freeway Player" OnClicked="player.open_app_menu">
+                <Image Name="app-logo" Width="32" Height="32"/>
             </Button>
             <VBox Spacing="1" Slot.VAlign="Center">
                 <Label Text="FREEWAY PLAYER" TextSize="17"/>
@@ -115,23 +115,33 @@
                 <Label Name="total" Text="--:--" Width="44" TextSize="10" Color.Text="#8F8999" TextAlign="Right" Slot.VAlign="Center"/>
             </HBox>
 
-            <HBox Spacing="8">
-                <Spacer Slot.Fill="1"/>
-                <Button Name="shuffle" Style="Flat" Tooltip="Activar reproducción aleatoria para esta lista" OnClicked="player.shuffle">
-                    <Image Name="shuffle-icon" Width="18" Height="18" TintText="true"/>
-                </Button>
-                <Button Text="⏮" Style="Flat" Tooltip="Pista anterior" OnClicked="player.previous"/>
-                <Button Text="▶" Style="Primary" Tooltip="Reproducir" OnClicked="player.play"/>
-                <Button Text="⏸" Style="Flat" Tooltip="Pausar" OnClicked="player.pause"/>
-                <Button Text="■" Style="Flat" Tooltip="Detener" OnClicked="player.stop"/>
-                <Button Text="⏭" Style="Flat" Tooltip="Pista siguiente" OnClicked="player.next"/>
-                <Button Name="repeat" Style="Flat" Tooltip="Repetir esta lista al terminar" OnClicked="player.repeat">
-                    <Image Name="repeat-icon" Width="18" Height="18" TintText="true"/>
-                </Button>
-                <Spacer Slot.Fill="1"/>
-                <Label Text="◖" Tooltip="Volumen" Slot.VAlign="Center"/>
-                <Slider Name="volume" Min="0" Max="1" Value="0.8" Step="0.01" Width="130" OnChanged="player.volume" Slot.VAlign="Center"/>
-                <Label Name="volume-value" Text="80%" Width="38" TextAlign="Right" TextSize="11" Color.Text="#8F8999" Slot.VAlign="Center"/>
+            <HBox Spacing="0">
+                <HBox Spacing="0" Width="272">
+                    <!-- Espacio reservado para una futura acción en la esquina inferior izquierda. -->
+                    <Spacer Width="64"/>
+                    <Spacer Slot.Fill="1"/>
+                </HBox>
+                <HBox Spacing="8" Slot.Fill="1">
+                    <Spacer Slot.Fill="1"/>
+                    <Button Name="shuffle" Style="Flat" Tooltip="Activar reproducción aleatoria para esta lista" OnClicked="player.shuffle">
+                        <Image Name="shuffle-icon" Width="18" Height="18" TintText="true"/>
+                    </Button>
+                    <Button Text="⏮" Style="Flat" Tooltip="Pista anterior" OnClicked="player.previous"/>
+                    <Button Text="▶" Style="Primary" Tooltip="Reproducir" OnClicked="player.play"/>
+                    <Button Text="⏸" Style="Flat" Tooltip="Pausar" OnClicked="player.pause"/>
+                    <Button Text="■" Style="Flat" Tooltip="Detener" OnClicked="player.stop"/>
+                    <Button Text="⏭" Style="Flat" Tooltip="Pista siguiente" OnClicked="player.next"/>
+                    <Button Name="repeat" Style="Flat" Tooltip="Repetir esta lista al terminar" OnClicked="player.repeat">
+                        <Image Name="repeat-icon" Width="18" Height="18" TintText="true"/>
+                    </Button>
+                    <Spacer Slot.Fill="1"/>
+                </HBox>
+                <HBox Spacing="6" Width="272" Slot.HAlign="Right">
+                    <Spacer Slot.Fill="1"/>
+                    <Label Text="◖" Tooltip="Volumen" Slot.VAlign="Center"/>
+                    <Slider Name="volume" Min="0" Max="1" Value="0.8" Step="0.01" Width="130" OnChanged="player.volume" Slot.VAlign="Center"/>
+                    <Label Name="volume-value" Text="80%" Width="38" TextAlign="Right" TextSize="11" Color.Text="#8F8999" Slot.VAlign="Center"/>
+                </HBox>
             </HBox>
         </VBox>
     </VBox>
