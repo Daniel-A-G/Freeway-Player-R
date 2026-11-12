@@ -1647,6 +1647,98 @@ unsafe extern "C" fn check_updates_from_app_menu(_item: Rid, user_data: *mut c_v
     }
 }
 
+unsafe extern "C" fn open_about_dialog(_item: Rid, user_data: *mut c_void) {
+    let window = user_data as Rid;
+
+    // Build a VBox container for the dialog content
+    let container = Rwidget_create(R_WIDGET_VBOX);
+    Rpanel_set_spacing(container, 12.0);
+
+    // App icon image
+    let icon_image = Rwidget_create(R_WIDGET_IMAGE);
+    Rslot_set_size(icon_image, 64.0, 64.0);
+    Rslot_set_halign(icon_image, R_HALIGN_CENTER);
+    if APP_ICON_PNG.len() > 0 {
+        let texture = Rtexture_create(APP_ICON_PNG.as_ptr().cast(), APP_ICON_PNG.len());
+        if texture != R_INVALID_ID {
+            Rimage_set_texture(icon_image, texture);
+            Rimage_set_stretch(icon_image, R_STRETCH_FIT);
+        }
+    }
+    Rwidget_add_child(container, icon_image);
+
+    // Title: "Freeway Player"
+    let title = Rlabel_create(cstr("Freeway Player").as_ptr());
+    Rlabel_set_text_size(title, 20.0);
+    Rlabel_set_text_align(title, R_TEXT_ALIGN_CENTER);
+    Rwidget_add_child(container, title);
+
+    // Version
+    let version_text = format!("Versión {}", env!("CARGO_PKG_VERSION"));
+    let version_label = Rlabel_create(cstr(&version_text).as_ptr());
+    Rlabel_set_text_size(version_label, 13.0);
+    Rlabel_set_text_align(version_label, R_TEXT_ALIGN_CENTER);
+    Rwidget_add_child(container, version_label);
+
+    // Separator
+    let sep = Rwidget_create(R_WIDGET_SEPARATOR);
+    Rslot_set_padding(sep, 20.0, 0.0, 20.0, 0.0);
+    Rwidget_add_child(container, sep);
+
+    // Author
+    let author = Rlabel_create(cstr("Creado por Daniel Álvarez").as_ptr());
+    Rlabel_set_text_size(author, 13.0);
+    Rlabel_set_text_align(author, R_TEXT_ALIGN_CENTER);
+    Rwidget_add_child(container, author);
+
+    // GitHub link
+    let github = Rlabel_create(cstr("github.com/Daniel-A-G/Freeway-Player-R").as_ptr());
+    Rlabel_set_text_size(github, 12.0);
+    Rlabel_set_text_align(github, R_TEXT_ALIGN_CENTER);
+    Rwidget_add_child(container, github);
+
+    // Technology
+    let tech = Rlabel_create(cstr("Escrito en Rust con Raven y rodio").as_ptr());
+    Rlabel_set_text_size(tech, 12.0);
+    Rlabel_set_text_align(tech, R_TEXT_ALIGN_CENTER);
+    Rwidget_add_child(container, tech);
+
+    // Separator
+    let sep2 = Rwidget_create(R_WIDGET_SEPARATOR);
+    Rslot_set_padding(sep2, 20.0, 0.0, 20.0, 0.0);
+    Rwidget_add_child(container, sep2);
+
+    // License info
+    let license = Rlabel_create(
+        cstr("Licencia GNU GPL v3.0\nCopyright (C) 2026 Daniel Álvarez\n\nEste programa es software libre: puede redistribuirlo y/o modificarlo bajo los términos de la GNU General Public License versión 3.").as_ptr()
+    );
+    Rlabel_set_text_size(license, 11.0);
+    Rlabel_set_text_align(license, R_TEXT_ALIGN_CENTER);
+    Rlabel_set_wrap(license, R_TRUE);
+    Rwidget_add_child(container, license);
+
+    // Spacer
+    let spacer = Rwidget_create(R_WIDGET_SPACER);
+    Rslot_set_size(spacer, 0.0, 4.0);
+    Rwidget_add_child(container, spacer);
+
+    // OK button
+    let ok_button = Rbutton_create(cstr("Aceptar").as_ptr());
+    Rbutton_set_style(ok_button, R_BUTTON_PRIMARY);
+    Rslot_set_halign(ok_button, R_HALIGN_CENTER);
+    Rwidget_add_child(container, ok_button);
+
+    // Clicking OK closes the dialog
+    Rbutton_set_clicked_callback(ok_button, Some(about_dialog_close), std::ptr::null_mut());
+
+    // Open the dialog (modal, no closed callback needed)
+    Rdialog_open(window, container, None, std::ptr::null_mut());
+}
+
+unsafe extern "C" fn about_dialog_close(widget: Rid, _user_data: *mut c_void) {
+    Rdialog_close(widget, R_MESSAGE_RESULT_OK);
+}
+
 fn ui_xml_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("FREEWAY_UI_FILE") {
         let path = PathBuf::from(path);
@@ -1715,6 +1807,12 @@ fn main() {
     } else {
         R_INVALID_ID
     };
+    let about_text = cstr("Acerca de");
+    let about_item = if update_menu != R_INVALID_ID {
+        unsafe { Rmenu_add_item(update_menu, about_text.as_ptr()) }
+    } else {
+        R_INVALID_ID
+    };
     let context_data = Box::into_raw(Box::new(MetadataMenuContext {
         state: Rc::clone(&state),
         ui,
@@ -1734,6 +1832,13 @@ fn main() {
                 check_updates_item,
                 Some(check_updates_from_app_menu),
                 Rc::as_ptr(&state) as *mut c_void,
+            );
+        }
+        if about_item != R_INVALID_ID {
+            Rmenu_item_set_clicked_callback(
+                about_item,
+                Some(open_about_dialog),
+                window as *mut c_void,
             );
         }
         Rtab_view_set_documents(ui.playlist_tabs, R_TRUE);
