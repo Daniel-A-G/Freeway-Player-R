@@ -13,6 +13,7 @@ finish-args:
   - --device=dri
   - --socket=pulseaudio
   - --filesystem=home
+  - --filesystem=/run/media
   - --env=FREEWAY_UI_FILE=/app/share/freeway-player/ui/main.xml
   - --env=LD_LIBRARY_PATH=/app/lib
 modules:
