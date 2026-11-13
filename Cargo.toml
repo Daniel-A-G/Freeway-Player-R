@@ -1,6 +1,6 @@
 [package]
 name = "freeway-player"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2021"
 description = "Reproductor de música para Linux con Raven y rodio"
 license = "MIT"
