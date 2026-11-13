@@ -1848,8 +1848,8 @@ unsafe extern "C" fn window_drop_callback(
         // Decode percent-encoded characters (e.g., %20 -> space, %C3%A1 -> á)
         let decoded = decode_uri_path(raw);
         let path = PathBuf::from(decoded);
-        // Resolve symlinks in the path so files in symlinked directories work correctly
-        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        // Use the path as provided by the file manager; do not canonicalize
+        // because symlinks may point outside the sandbox or to inaccessible locations.
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             let ext_lower = ext.to_lowercase();
             if audio_extensions.iter().any(|&e| e == ext_lower) {
