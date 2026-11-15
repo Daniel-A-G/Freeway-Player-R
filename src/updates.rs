@@ -15,6 +15,10 @@ use ureq::Agent;
 const OWNER: &str = "Daniel-A-G";
 const REPOSITORY: &str = "Freeway-Player-R";
 
+pub const APPSTREAM_URI: &str = "appstream://io.github.freewayplayer.FreewayPlayer";
+pub const GITHUB_RELEASES_URL: &str = "https://github.com/Daniel-A-G/Freeway-Player-R/releases/latest";
+pub const PROJECT_WEBSITE_URL: &str = "https://daniel-a-g.github.io/Freeway-Player-R/";
+
 #[derive(Debug)]
 pub enum UpdateMessage {
     Available(String),
@@ -28,6 +32,7 @@ pub enum UpdateOutcome {
     UpToDate(String),
     InstalledIsNewer { latest_tag: String },
     Declined(String),
+    ManualRequired { tag: String, has_remote: bool },
     InstalledAndRestarting(String),
 }
 
@@ -40,9 +45,54 @@ pub struct UpdateTask {
 struct GithubRelease {
     tag_name: String,
     #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
     prerelease: bool,
     #[serde(default)]
     draft: bool,
+}
+
+/// Comprueba si el texto de la release indica que se requiere actualización manual
+pub fn is_manual_update_required(body: Option<&str>) -> bool {
+    body.map(|b| {
+        let lower = b.to_lowercase();
+        lower.contains("[manual-update]")
+            || lower.contains("manual-update")
+            || lower.contains("[actualizacion-manual]")
+            || lower.contains("[actualización-manual]")
+    })
+    .unwrap_or(false)
+}
+
+/// Extrae el nombre del repositorio remoto desde el contenido de /.flatpak-info
+pub fn parse_flatpak_origin(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(origin) = line.strip_prefix("origin=") {
+            let origin = origin.trim();
+            if !origin.is_empty() {
+                return Some(origin.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Comprueba si la aplicación se instaló desde un repositorio remoto de Flatpak (p. ej. mediante .flatpakref)
+pub fn has_flatpak_remote() -> bool {
+    let path = Path::new("/.flatpak-info");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|c| parse_flatpak_origin(&c))
+        .is_some()
+}
+
+/// Abre una URL o URI en el sistema anfitrión (usando xdg-open a través del portal de Flatpak o directamente)
+pub fn open_external_uri(uri: &str) -> bool {
+    std::process::Command::new("xdg-open")
+        .arg(uri)
+        .spawn()
+        .is_ok()
 }
 
 pub fn start_update_check() -> Result<UpdateTask, String> {
@@ -108,6 +158,15 @@ fn check_and_install(
         Ordering::Greater => {}
     }
 
+    // Comprobar si la versión requiere actualización manual (p. ej. por cambios de permisos de Flatpak)
+    if is_manual_update_required(release.body.as_deref()) {
+        let has_remote = has_flatpak_remote();
+        return Ok(UpdateOutcome::ManualRequired {
+            tag: release.tag_name,
+            has_remote,
+        });
+    }
+
     let _ = sender.send(UpdateMessage::Available(release.tag_name.clone()));
     let should_install = decision_receiver
         .recv()
@@ -121,8 +180,25 @@ fn check_and_install(
         .enable_all()
         .build()
         .map_err(|error| format!("No se pudo iniciar el cliente del portal Flatpak: {error}"))?;
-    runtime.block_on(install_through_flatpak_portal(sender, &release.tag_name))?;
-    Ok(UpdateOutcome::InstalledAndRestarting(release.tag_name))
+
+    let install_result = runtime.block_on(install_through_flatpak_portal(sender, &release.tag_name));
+    match install_result {
+        Ok(()) => Ok(UpdateOutcome::InstalledAndRestarting(release.tag_name)),
+        Err(error) => {
+            let is_permission_or_manual = error.contains("NotSupported")
+                || error.to_lowercase().contains("permission")
+                || error.to_lowercase().contains("permiso");
+            if is_permission_or_manual {
+                let has_remote = has_flatpak_remote();
+                Ok(UpdateOutcome::ManualRequired {
+                    tag: release.tag_name,
+                    has_remote,
+                })
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 
 async fn install_through_flatpak_portal(
@@ -201,4 +277,31 @@ async fn install_through_flatpak_portal(
         .map_err(|error| format!("La actualización quedó instalada, pero no se pudo reiniciar Freeway Player: {error}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_manual_update_flags() {
+        assert!(is_manual_update_required(Some("This release has [manual-update] due to permissions")));
+        assert!(is_manual_update_required(Some("Includes manual-update requirement")));
+        assert!(is_manual_update_required(Some("Requiere [actualización-manual] por cambios de permisos")));
+        assert!(is_manual_update_required(Some("[ACTUALIZACION-MANUAL]")));
+        assert!(!is_manual_update_required(Some("Regular bug fix release")));
+        assert!(!is_manual_update_required(None));
+    }
+
+    #[test]
+    fn parses_flatpak_origin() {
+        let info_with_remote = "[Application]\nname=io.github.freewayplayer.FreewayPlayer\n\n[Instance]\norigin=freeway-player\nbranch=stable\n";
+        assert_eq!(parse_flatpak_origin(info_with_remote), Some("freeway-player".to_owned()));
+
+        let info_with_empty_origin = "[Instance]\norigin=\n";
+        assert_eq!(parse_flatpak_origin(info_with_empty_origin), None);
+
+        let info_without_origin = "[Application]\nname=io.github.freewayplayer.FreewayPlayer\n";
+        assert_eq!(parse_flatpak_origin(info_without_origin), None);
+    }
 }

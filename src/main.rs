@@ -15,8 +15,7 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
-#[cfg(test)]
-use rodio::Decoder;
+
 
 mod opus;
 mod updates;
@@ -299,6 +298,10 @@ impl PlayerState {
                     }
                     Ok(updates::UpdateOutcome::Declined(tag)) => {
                         format!("Instalación de {tag} cancelada")
+                    }
+                    Ok(updates::UpdateOutcome::ManualRequired { tag, has_remote }) => {
+                        open_manual_update_dialog(window, &tag, has_remote);
+                        format!("Actualización {tag} requiere intervención manual")
                     }
                     Ok(updates::UpdateOutcome::InstalledAndRestarting(tag)) => {
                         self.restart_requested = true;
@@ -2043,6 +2046,116 @@ unsafe extern "C" fn open_about_dialog(_item: Rid, user_data: *mut c_void) {
 
 unsafe extern "C" fn about_dialog_close(widget: Rid, _user_data: *mut c_void) {
     Rdialog_close(widget, R_MESSAGE_RESULT_OK);
+}
+
+unsafe extern "C" fn manual_update_dialog_close(widget: Rid, _user_data: *mut c_void) {
+    Rdialog_close(widget, R_MESSAGE_RESULT_CANCEL);
+}
+
+unsafe extern "C" fn open_store_and_close(widget: Rid, _user_data: *mut c_void) {
+    updates::open_external_uri(updates::APPSTREAM_URI);
+    Rdialog_close(widget, R_MESSAGE_RESULT_OK);
+}
+
+unsafe extern "C" fn open_github_and_close(widget: Rid, _user_data: *mut c_void) {
+    updates::open_external_uri(updates::GITHUB_RELEASES_URL);
+    Rdialog_close(widget, R_MESSAGE_RESULT_OK);
+}
+
+unsafe extern "C" fn open_website_and_close(widget: Rid, _user_data: *mut c_void) {
+    updates::open_external_uri(updates::PROJECT_WEBSITE_URL);
+    Rdialog_close(widget, R_MESSAGE_RESULT_OK);
+}
+
+fn open_manual_update_dialog(window: Rid, tag: &str, has_remote: bool) {
+    unsafe {
+        let container = Rwidget_create(R_WIDGET_VBOX);
+        Rpanel_set_spacing(container, 12.0);
+
+        // App icon
+        let icon_image = Rwidget_create(R_WIDGET_IMAGE);
+        Rslot_set_size(icon_image, 64.0, 64.0);
+        Rslot_set_halign(icon_image, R_HALIGN_CENTER);
+        if !APP_ICON_PNG.is_empty() {
+            let texture = Rtexture_create(APP_ICON_PNG.as_ptr().cast(), APP_ICON_PNG.len());
+            if texture != R_INVALID_ID {
+                Rimage_set_texture(icon_image, texture);
+                Rimage_set_stretch(icon_image, R_STRETCH_FIT);
+            }
+        }
+        Rwidget_add_child(container, icon_image);
+
+        // Title
+        let title = Rlabel_create(cstr("Actualización disponible").as_ptr());
+        Rlabel_set_text_size(title, 19.0);
+        Rlabel_set_text_align(title, R_TEXT_ALIGN_CENTER);
+        Rwidget_add_child(container, title);
+
+        // Version tag
+        let version_text = format!("Nueva versión {tag}");
+        let version_label = Rlabel_create(cstr(&version_text).as_ptr());
+        Rlabel_set_text_size(version_label, 13.0);
+        Rlabel_set_text_align(version_label, R_TEXT_ALIGN_CENTER);
+        Rwidget_add_child(container, version_label);
+
+        // Separator
+        let sep = Rwidget_create(R_WIDGET_SEPARATOR);
+        Rslot_set_padding(sep, 20.0, 0.0, 20.0, 0.0);
+        Rwidget_add_child(container, sep);
+
+        // Explanation text
+        let explanation_text = if has_remote {
+            "Esta versión introduce cambios en los permisos de la aplicación (o configuración del sistema) y requiere autorización manual.\n\nTienes el repositorio Flatpak configurado. Puedes actualizarla fácilmente abriendo la tienda de aplicaciones de tu sistema (Discover / Software) para revisar y autorizar los nuevos permisos."
+        } else {
+            "Esta versión requiere actualización manual.\n\nNo se ha detectado el repositorio Flatpak añadido en tu sistema. Puedes descargar el nuevo paquete .flatpak desde GitHub o añadir el repositorio oficial (.flatpakref) para recibir futuras actualizaciones directamente."
+        };
+        let label = Rlabel_create(cstr(explanation_text).as_ptr());
+        Rlabel_set_text_size(label, 12.0);
+        Rlabel_set_text_align(label, R_TEXT_ALIGN_CENTER);
+        Rlabel_set_wrap(label, R_TRUE);
+        Rwidget_add_child(container, label);
+
+        // Spacer
+        let spacer = Rwidget_create(R_WIDGET_SPACER);
+        Rslot_set_size(spacer, 0.0, 6.0);
+        Rwidget_add_child(container, spacer);
+
+        // Buttons in HBox
+        let button_row = Rwidget_create(R_WIDGET_HBOX);
+        Rpanel_set_spacing(button_row, 10.0);
+        Rslot_set_halign(button_row, R_HALIGN_CENTER);
+
+        if has_remote {
+            let store_button = Rbutton_create(cstr("Abrir tienda de software").as_ptr());
+            Rbutton_set_style(store_button, R_BUTTON_PRIMARY);
+            Rbutton_set_clicked_callback(store_button, Some(open_store_and_close), std::ptr::null_mut());
+            Rwidget_add_child(button_row, store_button);
+
+            let github_button = Rbutton_create(cstr("Ver en GitHub").as_ptr());
+            Rbutton_set_style(github_button, R_BUTTON_FLAT);
+            Rbutton_set_clicked_callback(github_button, Some(open_github_and_close), std::ptr::null_mut());
+            Rwidget_add_child(button_row, github_button);
+        } else {
+            let github_button = Rbutton_create(cstr("Descargar desde GitHub").as_ptr());
+            Rbutton_set_style(github_button, R_BUTTON_PRIMARY);
+            Rbutton_set_clicked_callback(github_button, Some(open_github_and_close), std::ptr::null_mut());
+            Rwidget_add_child(button_row, github_button);
+
+            let web_button = Rbutton_create(cstr("Web del proyecto (.flatpakref)").as_ptr());
+            Rbutton_set_style(web_button, R_BUTTON_FLAT);
+            Rbutton_set_clicked_callback(web_button, Some(open_website_and_close), std::ptr::null_mut());
+            Rwidget_add_child(button_row, web_button);
+        }
+
+        let close_button = Rbutton_create(cstr("Cerrar").as_ptr());
+        Rbutton_set_style(close_button, R_BUTTON_FLAT);
+        Rbutton_set_clicked_callback(close_button, Some(manual_update_dialog_close), std::ptr::null_mut());
+        Rwidget_add_child(button_row, close_button);
+
+        Rwidget_add_child(container, button_row);
+
+        Rdialog_open(window, container, None, std::ptr::null_mut());
+    }
 }
 
 // Percent-decoder that handles multi-byte UTF-8 (e.g., %C3%A1 -> á)
