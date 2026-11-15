@@ -875,6 +875,54 @@ impl PlayerState {
             }
         }
     }
+
+    fn export_playlist(&mut self, path: &Path) {
+        let Some(playlist) = self.playlists.get(self.active_playlist) else {
+            self.status = "No hay lista activa para exportar".to_owned();
+            return;
+        };
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("m3u8")
+            .to_lowercase();
+        let result = match ext.as_str() {
+            "xspf" => export_playlist_xspf(playlist, path),
+            _ => export_playlist_m3u8(playlist, path),
+        };
+        match result {
+            Ok(()) => self.status = format!("Lista exportada a {}", path.display()),
+            Err(e) => self.status = e,
+        }
+    }
+
+    fn import_playlist(&mut self, path: &Path) {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("m3u8")
+            .to_lowercase();
+        let result = match ext.as_str() {
+            "xspf" => import_playlist_xspf(path),
+            _ => import_playlist_m3u8(path),
+        };
+        match result {
+            Ok((name, tracks)) => {
+                if tracks.is_empty() {
+                    self.status = "La lista importada no contiene pistas".to_owned();
+                    return;
+                }
+                let mut playlist = Playlist::new(name.clone());
+                playlist.tracks = tracks;
+                playlist.rebuild_order(None);
+                self.playlists.push(playlist);
+                self.active_playlist = self.playlists.len() - 1;
+                self.ui_rendered_playlist = None;
+                self.editor_loaded_for = None;
+                self.status = format!("Lista importada: {} ({} pistas)", name, self.playlists[self.active_playlist].tracks.len());
+                self.save_playlists();
+            }
+            Err(e) => self.status = e,
+        }
+    }
 }
 
 fn playlist_store_path() -> PathBuf {
@@ -1170,6 +1218,8 @@ struct Ui {
     shuffle_icon: Rid,
     repeat: Rid,
     repeat_icon: Rid,
+    import_icon: Rid,
+    export_icon: Rid,
     volume_value: Rid,
     meta_title: Rid,
     meta_artist: Rid,
@@ -1201,6 +1251,8 @@ impl Ui {
             shuffle_icon: widget_find(window, "shuffle-icon"),
             repeat: widget_find(window, "repeat"),
             repeat_icon: widget_find(window, "repeat-icon"),
+            import_icon: widget_find(window, "import-icon"),
+            export_icon: widget_find(window, "export-icon"),
             volume_value: widget_find(window, "volume-value"),
             meta_title: widget_find(window, "meta-title"),
             meta_artist: widget_find(window, "meta-artist"),
@@ -1257,8 +1309,10 @@ fn load_action_icons(ui: Ui) -> Rid {
 
     unsafe {
         for (image, min_u, max_u) in [
-            (ui.shuffle_icon, 0.0, 0.5),
-            (ui.repeat_icon, 0.5, 1.0),
+            (ui.shuffle_icon, 0.0, 0.25),
+            (ui.repeat_icon, 0.25, 0.5),
+            (ui.import_icon, 0.5, 0.75),
+            (ui.export_icon, 0.75, 1.0),
         ] {
             if image != R_INVALID_ID {
                 Rimage_set_texture(image, texture);
@@ -1664,6 +1718,198 @@ fn open_cover_file(_window: Rid, last_dir: &Option<PathBuf>) -> Option<PathBuf> 
     dialog.pick_file()
 }
 
+fn open_playlist_export_file(_window: Rid) -> Option<PathBuf> {
+    let path = rfd::FileDialog::new()
+        .set_title("Exportar lista")
+        .add_filter("Lista M3U8 (UTF-8)", &["m3u8"])
+        .add_filter("Lista M3U", &["m3u"])
+        .add_filter("Lista XSPF", &["xspf"])
+        .save_file()?;
+    // Ensure the file has an extension; default to .m3u8 if missing
+    if path.extension().is_none() {
+        let mut path = path;
+        path.set_extension("m3u8");
+        Some(path)
+    } else {
+        Some(path)
+    }
+}
+
+fn open_playlist_import_file(_window: Rid) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Importar lista")
+        .add_filter("Listas de reproducción", &["m3u8", "m3u", "xspf"])
+        .pick_file()
+}
+
+fn export_playlist_m3u8(playlist: &Playlist, path: &Path) -> Result<(), String> {
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut content = String::from("#EXTM3U\n");
+    // Save playlist name as a comment so it can be recovered on import
+    content.push_str(&format!("#PLAYLIST:{}\n", playlist.name));
+    for track in &playlist.tracks {
+        let relative = pathdiff_diff(track, base_dir);
+        let title = read_track_metadata(track).title;
+        let artist = read_track_metadata(track).artist;
+        let display = if artist.is_empty() {
+            title.clone()
+        } else {
+            format!("{} - {}", artist, title)
+        };
+        content.push_str(&format!("#EXTINF:-1,{}\n", display));
+        content.push_str(&relative);
+        content.push('\n');
+    }
+    std::fs::write(path, content).map_err(|e| format!("No se pudo escribir el archivo: {}", e))
+}
+
+fn export_playlist_xspf(playlist: &Playlist, path: &Path) -> Result<(), String> {
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut content = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    content.push_str("<playlist version=\"1\" xmlns=\"http://xspf.org/ns/0/\">\n");
+    content.push_str(&format!("  <title>{}</title>\n", xml_escape(&playlist.name)));
+    content.push_str("  <trackList>\n");
+    for track in &playlist.tracks {
+        let relative = pathdiff_diff(track, base_dir);
+        let metadata = read_track_metadata(track);
+        content.push_str("    <track>\n");
+        content.push_str(&format!("      <location>file://{}</location>\n", xml_escape(&relative)));
+        if !metadata.title.is_empty() {
+            content.push_str(&format!("      <title>{}</title>\n", xml_escape(&metadata.title)));
+        }
+        if !metadata.artist.is_empty() {
+            content.push_str(&format!("      <creator>{}</creator>\n", xml_escape(&metadata.artist)));
+        }
+        if !metadata.album.is_empty() {
+            content.push_str(&format!("      <album>{}</album>\n", xml_escape(&metadata.album)));
+        }
+        content.push_str("    </track>\n");
+    }
+    content.push_str("  </trackList>\n");
+    content.push_str("</playlist>\n");
+    std::fs::write(path, content).map_err(|e| format!("No se pudo escribir el archivo: {}", e))
+}
+
+fn import_playlist_m3u8(path: &Path) -> Result<(String, Vec<PathBuf>), String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("No se pudo leer el archivo: {}", e))?;
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    // Try to read the playlist name from a #PLAYLIST: comment; fall back to file name
+    let mut name = None;
+    let mut tracks = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("#EXTM3U") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("#PLAYLIST:") {
+            name = Some(rest.to_owned());
+            continue;
+        }
+        if line.starts_with("#EXTINF:") {
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        let track_path = if Path::new(line).is_absolute() {
+            PathBuf::from(line)
+        } else {
+            base_dir.join(line)
+        };
+        tracks.push(track_path);
+    }
+    let name = name.unwrap_or_else(|| {
+        path.file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Lista importada".to_owned())
+    });
+    Ok((name, tracks))
+}
+
+fn import_playlist_xspf(path: &Path) -> Result<(String, Vec<PathBuf>), String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("No se pudo leer el archivo: {}", e))?;
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut name = path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Lista importada".to_owned());
+    let mut tracks = Vec::new();
+    let mut in_track = false;
+    let mut current_tag = String::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("<title>") && !in_track {
+            if let Some(start) = trimmed.find('>') {
+                if let Some(end) = trimmed.rfind('<') {
+                    if end > start {
+                        name = xml_unescape(&trimmed[start + 1..end]);
+                    }
+                }
+            }
+        }
+        if trimmed.starts_with("<track>") {
+            in_track = true;
+            current_tag.clear();
+        }
+        if trimmed.starts_with("</track>") {
+            in_track = false;
+        }
+        if in_track && trimmed.starts_with("<location>") {
+            if let Some(start) = trimmed.find('>') {
+                if let Some(end) = trimmed.rfind('<') {
+                    if end > start {
+                        let loc = xml_unescape(&trimmed[start + 1..end]);
+                        let loc = loc.strip_prefix("file://").unwrap_or(&loc);
+                        let track_path = if Path::new(loc).is_absolute() {
+                            PathBuf::from(loc)
+                        } else {
+                            base_dir.join(loc)
+                        };
+                        tracks.push(track_path);
+                    }
+                }
+            }
+        }
+    }
+    Ok((name, tracks))
+}
+
+fn pathdiff_diff(path: &Path, base: &Path) -> String {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    let path_components: Vec<_> = path.components().collect();
+    let base_components: Vec<_> = base.components().collect();
+    let common = path_components.iter()
+        .zip(base_components.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut result = PathBuf::new();
+    for _ in common..base_components.len() {
+        result.push("..");
+    }
+    for component in &path_components[common..] {
+        result.push(component);
+    }
+    result.to_string_lossy().into_owned()
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
 struct MetadataMenuContext {
     state: Rc<RefCell<PlayerState>>,
     ui: Ui,
@@ -1842,12 +2088,18 @@ unsafe extern "C" fn window_drop_callback(
         if path_c.is_null() {
             continue;
         }
-        let raw = std::ffi::CStr::from_ptr(path_c).to_string_lossy().into_owned();
+        // Print raw bytes for debugging
+        let raw_bytes = std::ffi::CStr::from_ptr(path_c).to_bytes();
+        eprintln!("[DROP DEBUG] raw path bytes: {:?}", raw_bytes);
+        let raw = String::from_utf8_lossy(raw_bytes).into_owned();
+        eprintln!("[DROP DEBUG] raw string: {:?}", raw);
         // Strip file:// URI scheme if present (file managers may drop URIs)
         let raw = raw.strip_prefix("file://").unwrap_or(&raw);
         // Decode percent-encoded characters (e.g., %20 -> space, %C3%A1 -> á)
         let decoded = decode_uri_path(raw);
-        let path = PathBuf::from(decoded);
+        eprintln!("[DROP DEBUG] decoded: {:?}", decoded);
+        let path = PathBuf::from(&decoded);
+        eprintln!("[DROP DEBUG] path: {:?}", path);
         // Use the path as provided by the file manager; do not canonicalize
         // because symlinks may point outside the sandbox or to inaccessible locations.
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -2136,6 +2388,32 @@ fn main() {
         action_bind("player.add_playlist", move |_, _| {
             let (_, name) = state.borrow_mut().create_playlist();
             add_playlist_tab(tabs, &name, true);
+        });
+    }
+    {
+        let state = Rc::clone(&state);
+        let tabs = ui.playlist_tabs;
+        action_bind("player.import_playlist", move |_, _| {
+            let Some(path) = open_playlist_import_file(window) else {
+                return;
+            };
+            let mut state = state.borrow_mut();
+            let previous_count = state.playlists.len();
+            state.import_playlist(&path);
+            if state.playlists.len() > previous_count {
+                let new_index = state.playlists.len() - 1;
+                let name = state.playlists[new_index].name.clone();
+                add_playlist_tab(tabs, &name, true);
+            }
+        });
+    }
+    {
+        let state = Rc::clone(&state);
+        action_bind("player.export_playlist", move |_, _| {
+            let Some(path) = open_playlist_export_file(window) else {
+                return;
+            };
+            state.borrow_mut().export_playlist(&path);
         });
     }
     {

@@ -26,6 +26,12 @@
                     </VBox>
                     <Button Text="+ Añadir pistas" Style="Primary" Tooltip="Añadir archivos de audio a esta lista" OnClicked="player.open" Slot.VAlign="Center"/>
                     <Button Text="-" Style="Flat" Tooltip="Quitar la pista seleccionada de esta lista" OnClicked="player.remove_track" Slot.VAlign="Center"/>
+                    <Button Name="import-button" Style="Flat" Tooltip="Importar lista desde archivo M3U/XSPF" OnClicked="player.import_playlist" Slot.VAlign="Center">
+                        <Image Name="import-icon" Width="18" Height="18" TintText="true"/>
+                    </Button>
+                    <Button Name="export-button" Style="Flat" Tooltip="Exportar lista activa a archivo M3U/XSPF" OnClicked="player.export_playlist" Slot.VAlign="Center">
+                        <Image Name="export-icon" Width="18" Height="18" TintText="true"/>
+                    </Button>
                 </HBox>
 
                 <ListView Name="track-list" Color.Panel="#131118" OnActivated="player.play_selected" Slot.Fill="1"/>
