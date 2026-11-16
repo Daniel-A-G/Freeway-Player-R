@@ -171,6 +171,7 @@ struct PlayerState {
     pending_cover: Option<((usize, usize), CoverChange)>,
     cover_rendered_for: Option<(usize, usize, u64)>,
     cover_texture: Rid,
+    track_list_widget: Rid,
     last_cover_dir: Option<PathBuf>,
     dragging_track: Option<usize>,
     drag_start_y: f32,
@@ -214,6 +215,7 @@ impl PlayerState {
             pending_cover: None,
             cover_rendered_for: None,
             cover_texture: R_INVALID_ID,
+            track_list_widget: R_INVALID_ID,
             last_cover_dir: None,
             dragging_track: None,
             drag_start_y: 0.0,
@@ -2231,6 +2233,8 @@ unsafe extern "C" fn window_drop_callback(
 }
 
 
+
+
 // Event callback for track list: handle drag-to-reorder
 unsafe extern "C" fn track_list_event_callback(
     _widget: Rid,
@@ -2253,11 +2257,20 @@ unsafe extern "C" fn track_list_event_callback(
             if row_height <= 0.0 {
                 return R_FALSE;
             }
-            let index = (local_y / row_height) as usize;
+            // Índice real de la pista bajo el ratón. Usamos Rlist_view_get_selected
+            // que devuelve el índice del modelo para el ListView virtual, con
+            // fallback al cálculo visual basado en local_y. Esto es importante
+            // porque con scroll, local_y / row_height da la fila visual en
+            // pantalla, no el índice real en el vector de pistas.
+            let mut start_index = unsafe { Rlist_view_get_selected(st.track_list_widget) };
+            if start_index < 0 {
+                start_index = (local_y / row_height) as i32;
+            }
+            let start_index = start_index as usize;
             let playlist_index = st.active_playlist;
             if let Some(playlist) = st.playlists.get(playlist_index) {
-                if index < playlist.tracks.len() {
-                    st.dragging_track = Some(index);
+                if start_index < playlist.tracks.len() {
+                    st.dragging_track = Some(start_index);
                     st.drag_start_y = local_y;
                 }
             }
@@ -2278,10 +2291,21 @@ unsafe extern "C" fn track_list_event_callback(
             if row_height <= 0.0 {
                 return R_FALSE;
             }
-            let index = (local_y / row_height).floor() as usize;
+            let Some(start_index) = st.dragging_track else {
+                return R_FALSE;
+            };
+            // Movimiento relativo desde el índice inicial: cuántas filas se ha
+            // desplazado el ratón desde que empezó el arrastre. Esto funciona
+            // correctamente con scroll porque ambos extremos están en el mismo
+            // espacio de coordenadas (índices del modelo).
+            let delta_y = local_y - st.drag_start_y;
+            let delta_rows = (delta_y / row_height).round() as isize;
+            let target = start_index as isize + delta_rows;
+            let index = target.max(0) as usize;
             let playlist_index = st.active_playlist;
             if let Some(playlist) = st.playlists.get_mut(playlist_index) {
-                let clamped = index.min(playlist.tracks.len());
+                let last = playlist.tracks.len().saturating_sub(1);
+                let clamped = index.min(last);
                 playlist.selected = Some(clamped);
                 st.ui_selection_dirty = true;
             }
@@ -2296,6 +2320,9 @@ unsafe extern "C" fn track_list_event_callback(
             let Some(from_index) = st.dragging_track else {
                 return R_FALSE;
             };
+            // Guardar drag_start_y ANTES de resetarlo, para calcular el
+            // desplazamiento relativo correctamente.
+            let drag_start_y = st.drag_start_y;
             st.dragging_track = None;
             st.drag_start_y = 0.0;
 
@@ -2303,10 +2330,14 @@ unsafe extern "C" fn track_list_event_callback(
             if row_height <= 0.0 {
                 return R_FALSE;
             }
-            let to_index = (local_y / row_height).floor() as usize;
+            let delta_y = local_y - drag_start_y;
+            let delta_rows = (delta_y / row_height).round() as isize;
+            let target = from_index as isize + delta_rows;
+            let to_index = target.max(0) as usize;
             let playlist_index = st.active_playlist;
             if let Some(playlist) = st.playlists.get(playlist_index) {
-                let clamped = to_index.min(playlist.tracks.len());
+                let last = playlist.tracks.len().saturating_sub(1);
+                let clamped = to_index.min(last);
                 if from_index != clamped {
                     st.move_track(from_index, clamped);
                 }
@@ -2384,6 +2415,10 @@ fn main() {
     let action_icons_texture = load_action_icons(ui);
     let track_list_rows = Box::new(RefCell::new(TrackListRows::default()));
     let state = Rc::new(RefCell::new(PlayerState::new()));
+    {
+        let mut st = state.borrow_mut();
+        st.track_list_widget = ui.track_list;
+    }
     let context_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
     let update_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
     let edit_metadata_text = cstr("Editar metadatos");
