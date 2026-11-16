@@ -3,7 +3,7 @@ name = "freeway-player"
 version = "0.2.2"
 edition = "2021"
 description = "Reproductor de música para Linux con Raven y rodio"
-license = "MIT"
+license = "GPL-3.0"
 
 [[bin]]
 name = "freeway-player"
