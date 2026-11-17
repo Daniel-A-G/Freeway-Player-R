@@ -13,7 +13,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 
 
@@ -204,6 +204,7 @@ struct PlayerState {
 /// clic) y pasamos a `Dragging`. El destino se calcula siempre desde `start_y`,
 /// sin reescribir la selección del modelo durante el gesto. `target` es la fila
 /// donde quedará la pista y también ancla la guía visual entre filas.
+/// `last_scroll` limita el auto-scroll en los bordes a una fila cada cierto tiempo.
 #[derive(Clone, Copy, Debug)]
 enum DragState {
     Idle,
@@ -212,6 +213,7 @@ enum DragState {
         from: usize,
         start_y: f32,
         target: usize,
+        last_scroll: Option<Instant>,
     },
 }
 
@@ -2323,8 +2325,9 @@ unsafe extern "C" fn window_drop_callback(
 
 /// Índice de destino a partir del desplazamiento del ratón desde el clic.
 ///
-/// Se usa siempre `start_y` como ancla: mientras dura el gesto el scroll está
-/// congelado, así que píxeles e índices del modelo permanecen alineados.
+/// Se usa siempre `start_y` como ancla. La rueda está congelada durante el
+/// gesto; si el auto-scroll desplaza la vista, `start_y` se reancla para que
+/// píxeles e índices del modelo sigan alineados.
 fn drag_target(from: usize, start_y: f32, y: f32, row_height: f32, len: usize) -> usize {
     let last = len.saturating_sub(1);
     if len == 0 || row_height <= 0.0 {
@@ -2332,6 +2335,36 @@ fn drag_target(from: usize, start_y: f32, y: f32, row_height: f32, len: usize) -
     }
     let delta_rows = ((y - start_y) / row_height).round() as isize;
     (from as isize + delta_rows).clamp(0, last as isize) as usize
+}
+
+/// Paso de auto-scroll cuando el cursor toca un borde de la lista.
+///
+/// Devuelve el nuevo ancla, el destino recalculado y el índice que debe hacer
+/// visible `Rlist_view_scroll_to_item`. Al desplazarse una fila hacia abajo,
+/// el contenido sube `row_height` píxeles y el ancla baja la misma cantidad;
+/// hacia arriba ocurre al revés. Así la pista agarrada sigue bajo el cursor.
+fn auto_scroll_step(
+    from: usize,
+    start_y: f32,
+    local_y: f32,
+    list_h: f32,
+    row_height: f32,
+    target: usize,
+    len: usize,
+    edge: f32,
+) -> Option<(f32, usize, i32)> {
+    if len == 0 || row_height <= 0.0 || list_h <= 0.0 {
+        return None;
+    }
+    let (new_start_y, scroll_to) = if local_y >= list_h - edge && target + 1 < len {
+        (start_y - row_height, target + 1)
+    } else if local_y <= edge && target > 0 {
+        (start_y + row_height, target - 1)
+    } else {
+        return None;
+    };
+    let new_target = drag_target(from, new_start_y, local_y, row_height, len);
+    Some((new_start_y, new_target, scroll_to as i32))
 }
 
 /// Hueco entre filas donde quedará la pista, relativo al rect de la lista.
@@ -2371,6 +2404,7 @@ unsafe extern "C" fn drop_guide_paint(
         from,
         start_y,
         target,
+        ..
     } = st.drag
     else {
         return;
@@ -2459,6 +2493,7 @@ unsafe extern "C" fn track_list_event_callback(
     let event_type = (*event).type_;
     let local_y = (*event).local_y;
     const DRAG_SLOP: f32 = 10.0;
+    const AUTO_SCROLL_INTERVAL: Duration = Duration::from_millis(90);
 
     match event_type {
         R_EVENT_MOUSE_DOWN => {
@@ -2528,11 +2563,44 @@ unsafe extern "C" fn track_list_event_callback(
                 DragState::Dragging { from, .. } => from,
                 DragState::Idle => unreachable!("ya descartado al leer start_y"),
             };
-            let target = drag_target(from, start_y, local_y, row_height, len);
+            let mut start_y = start_y;
+            let mut target = drag_target(from, start_y, local_y, row_height, len);
+
+            // Auto-scroll en los bordes: Raven no expone el offset del ListView,
+            // así que pedimos una fila más con `scroll_to_item` y reanclamos
+            // `start_y` para que el destino siga correspondiéndose con el cursor.
+            let (mut list_x, mut list_y, mut list_w, mut list_h) = (0.0, 0.0, 0.0, 0.0);
+            Rwidget_get_rect(
+                st.track_list_widget,
+                &mut list_x,
+                &mut list_y,
+                &mut list_w,
+                &mut list_h,
+            );
+            let now = Instant::now();
+            let mut last_scroll = match st.drag {
+                DragState::Dragging { last_scroll, .. } => last_scroll,
+                DragState::Pressed { .. } | DragState::Idle => None,
+            };
+            let mut scroll_to = None;
+            if last_scroll.map_or(true, |instant| {
+                now.duration_since(instant) >= AUTO_SCROLL_INTERVAL
+            }) {
+                let edge = row_height.max(24.0);
+                if let Some((new_start_y, new_target, index)) = auto_scroll_step(
+                    from, start_y, local_y, list_h, row_height, target, len, edge,
+                ) {
+                    start_y = new_start_y;
+                    target = new_target;
+                    scroll_to = Some(index);
+                    last_scroll = Some(now);
+                }
+            }
             st.drag = DragState::Dragging {
                 from,
                 start_y,
                 target,
+                last_scroll,
             };
 
             // El resaltado de Raven acompaña a la fila de destino y la línea
@@ -2541,6 +2609,9 @@ unsafe extern "C" fn track_list_event_callback(
             // para evitar bucles de realimentación.
             let list = st.track_list_widget;
             drop(st);
+            if let Some(index) = scroll_to {
+                Rlist_view_scroll_to_item(list, index);
+            }
             Rlist_view_set_selected(list, target as i32);
             R_TRUE
         }
@@ -3079,7 +3150,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        drag_guide_y, drag_target, format_time, next_track_index, previous_track_index,
+        auto_scroll_step, drag_guide_y, drag_target, format_time, next_track_index,
+        previous_track_index,
     };
     use rodio::{Decoder, Source};
     use std::io::Cursor;
@@ -3108,6 +3180,45 @@ mod tests {
         assert_eq!(drag_guide_y(2, 100.0, 4, 40.0), 200.0);
         // Sin cambio de destino no se dibuja; el valor no importa.
         assert_eq!(drag_guide_y(2, 100.0, 2, 40.0), 100.0);
+    }
+
+    #[test]
+    fn auto_scroll_steps_one_row_and_reanchors() {
+        let (height, row_height, len) = (400.0, 40.0, 20);
+
+        // Borde inferior: se pide la fila siguiente y el ancla baja una fila.
+        let target = drag_target(2, 100.0, 390.0, row_height, len);
+        let (start_y, new_target, scroll_to) =
+            auto_scroll_step(2, 100.0, 390.0, height, row_height, target, len, row_height)
+                .unwrap();
+        assert_eq!(target, 9);
+        assert_eq!(start_y, 60.0);
+        assert_eq!(new_target, 10);
+        assert_eq!(scroll_to, 10);
+
+        // Borde superior: se pide la fila anterior y el ancla sube una fila.
+        let target = drag_target(10, 100.0, 10.0, row_height, len);
+        let (start_y, new_target, scroll_to) =
+            auto_scroll_step(10, 100.0, 10.0, height, row_height, target, len, row_height)
+                .unwrap();
+        assert_eq!(target, 8);
+        assert_eq!(start_y, 140.0);
+        assert_eq!(new_target, 7);
+        assert_eq!(scroll_to, 7);
+
+        // En el centro no hay scroll, y tampoco en los extremos del modelo.
+        assert!(auto_scroll_step(
+            2, 100.0, 200.0, height, row_height, 5, len, row_height
+        )
+        .is_none());
+        assert!(auto_scroll_step(
+            2, 100.0, 390.0, height, row_height, 19, len, row_height
+        )
+        .is_none());
+        assert!(auto_scroll_step(
+            2, 100.0, 10.0, height, row_height, 0, len, row_height
+        )
+        .is_none());
     }
 
     #[test]
