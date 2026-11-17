@@ -202,7 +202,8 @@ struct PlayerState {
 /// `Pressed` guarda la posición del clic. Cuando el ratón supera el umbral de
 /// movimiento se captura el índice real del modelo (Raven ya ha procesado el
 /// clic) y pasamos a `Dragging`. El destino se calcula siempre desde `start_y`,
-/// sin reescribir la selección del modelo durante el gesto.
+/// sin reescribir la selección del modelo durante el gesto. `target` es la fila
+/// donde quedará la pista y también ancla la guía visual entre filas.
 #[derive(Clone, Copy, Debug)]
 enum DragState {
     Idle,
@@ -210,7 +211,7 @@ enum DragState {
     Dragging {
         from: usize,
         start_y: f32,
-        pointer_y: f32,
+        target: usize,
     },
 }
 
@@ -2333,11 +2334,25 @@ fn drag_target(from: usize, start_y: f32, y: f32, row_height: f32, len: usize) -
     (from as isize + delta_rows).clamp(0, last as isize) as usize
 }
 
-/// Dibuja la línea de inserción en la posición del cursor dentro de la lista.
+/// Hueco entre filas donde quedará la pista, relativo al rect de la lista.
+///
+/// `move_track` quita la pista y la inserta en `target`: al arrastrar hacia
+/// abajo el hueco es después de la fila `target`; hacia arriba, antes de ella.
+/// El límite de la fila agarrada se estima media fila por encima del clic, así
+/// que la guía salta de un hueco a otro en lugar de seguir al cursor.
+fn drag_guide_y(from: usize, start_y: f32, target: usize, row_height: f32) -> f32 {
+    let delta = target as isize - from as isize;
+    if delta == 0 {
+        return start_y;
+    }
+    start_y + (delta as f32 + delta.signum() as f32 * 0.5) * row_height
+}
+
+/// Dibuja la línea de inserción en el hueco entre dos pistas.
 ///
 /// El widget de guía cubre toda la ventana, así que sus coordenadas locales son
-/// las de la ventana. Se usa el rect de la lista más `pointer_y` (relativo a la
-/// lista), no `índice * row_height`, que ignoraría el scroll.
+/// las de la ventana. Se usa el rect de la lista más la posición calculada desde
+/// el ancla del clic; `índice * row_height` directo ignoraría el scroll.
 unsafe extern "C" fn drop_guide_paint(
     _widget: Rid,
     painter: *mut RPainter,
@@ -2352,9 +2367,22 @@ unsafe extern "C" fn drop_guide_paint(
     let Ok(st) = state.try_borrow() else {
         return;
     };
-    let DragState::Dragging { pointer_y, .. } = st.drag else {
+    let DragState::Dragging {
+        from,
+        start_y,
+        target,
+    } = st.drag
+    else {
         return;
     };
+    if from == target {
+        // Sin movimiento no hay hueco que indicar.
+        return;
+    }
+    let row_height = Rtheme_get_metric(R_METRIC_ROW_HEIGHT);
+    if row_height <= 0.0 {
+        return;
+    }
     let list = st.track_list_widget;
     if list == R_INVALID_ID {
         return;
@@ -2365,7 +2393,8 @@ unsafe extern "C" fn drop_guide_paint(
     if list_w <= 0.0 || list_h <= 0.0 {
         return;
     }
-    let line_y = list_y + pointer_y.clamp(0.0, list_h);
+    let guide_y = drag_guide_y(from, start_y, target, row_height);
+    let line_y = list_y + guide_y.clamp(0.0, list_h);
     Rdraw_line(
         painter,
         list_x,
@@ -2503,12 +2532,13 @@ unsafe extern "C" fn track_list_event_callback(
             st.drag = DragState::Dragging {
                 from,
                 start_y,
-                pointer_y: local_y,
+                target,
             };
 
-            // La guía provisional es el resaltado de la fila de destino. Solo
-            // escribimos la selección de Raven; `playlist.selected` no se toca
-            // hasta que se suelte el ratón, para evitar bucles de realimentación.
+            // El resaltado de Raven acompaña a la fila de destino y la línea
+            // dibujada salta al hueco entre filas. Solo escribimos la selección
+            // de Raven; `playlist.selected` no se toca hasta soltar el ratón,
+            // para evitar bucles de realimentación.
             let list = st.track_list_widget;
             drop(st);
             Rlist_view_set_selected(list, target as i32);
@@ -3048,7 +3078,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{drag_target, format_time, next_track_index, previous_track_index};
+    use super::{
+        drag_guide_y, drag_target, format_time, next_track_index, previous_track_index,
+    };
     use rodio::{Decoder, Source};
     use std::io::Cursor;
     use std::time::Duration;
@@ -3063,6 +3095,19 @@ mod tests {
         assert_eq!(drag_target(5, 100.0, 1000.0, 40.0, 10), 9);
         assert_eq!(drag_target(5, 100.0, -1000.0, 40.0, 10), 0);
         assert_eq!(drag_target(5, 100.0, 185.0, 0.0, 10), 5);
+    }
+
+    #[test]
+    fn drag_guide_snaps_between_rows() {
+        // Con clic en el centro de la fila 2 (start_y = 100, filas de 40 px),
+        // bajar una fila deja la pista después de la fila 3: hueco en 160.
+        assert_eq!(drag_guide_y(2, 100.0, 3, 40.0), 160.0);
+        // Subir una fila la deja antes de la fila 1: hueco en 40.
+        assert_eq!(drag_guide_y(2, 100.0, 1, 40.0), 40.0);
+        // Dos filas hacia abajo: hueco en 200.
+        assert_eq!(drag_guide_y(2, 100.0, 4, 40.0), 200.0);
+        // Sin cambio de destino no se dibuja; el valor no importa.
+        assert_eq!(drag_guide_y(2, 100.0, 2, 40.0), 100.0);
     }
 
     #[test]
