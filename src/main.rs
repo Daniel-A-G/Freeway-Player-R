@@ -59,6 +59,8 @@ struct SavedPlaylist {
     shuffle: bool,
     #[serde(default)]
     repeat: bool,
+    #[serde(default)]
+    is_temporal: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -76,6 +78,7 @@ struct Playlist {
     order: Vec<usize>,
     order_position: Option<usize>,
     revision: u64,
+    is_temporal: bool,
 }
 
 #[derive(Default)]
@@ -86,6 +89,7 @@ struct TrackListRows {
 
 impl Playlist {
     fn new(name: String) -> Self {
+        let is_temporal = name == "temp";
         Self {
             name,
             tracks: Vec::new(),
@@ -95,6 +99,21 @@ impl Playlist {
             order: Vec::new(),
             order_position: None,
             revision: 0,
+            is_temporal,
+        }
+    }
+
+    fn new_temporal() -> Self {
+        Self {
+            name: "temp".to_owned(),
+            tracks: Vec::new(),
+            selected: None,
+            shuffle: false,
+            repeat: false,
+            order: Vec::new(),
+            order_position: None,
+            revision: 0,
+            is_temporal: true,
         }
     }
 
@@ -109,6 +128,7 @@ impl Playlist {
             order: Vec::new(),
             order_position: None,
             revision: 0,
+            is_temporal: saved.is_temporal,
         };
         playlist.rebuild_order(selected);
         playlist
@@ -121,6 +141,7 @@ impl Playlist {
             selected: self.selected,
             shuffle: self.shuffle,
             repeat: self.repeat,
+            is_temporal: self.is_temporal,
         }
     }
 
@@ -173,8 +194,30 @@ struct PlayerState {
     cover_texture: Rid,
     track_list_widget: Rid,
     last_cover_dir: Option<PathBuf>,
-    dragging_track: Option<usize>,
-    drag_start_y: f32,
+    drag: DragState,
+}
+
+/// Estado del gesto de reordenación por arrastre.
+///
+/// `Pressed` guarda la posición del clic. Cuando el ratón supera el umbral de
+/// movimiento se captura el índice real del modelo (Raven ya ha procesado el
+/// clic) y pasamos a `Dragging`. El destino se calcula siempre desde `start_y`,
+/// sin reescribir la selección del modelo durante el gesto.
+#[derive(Clone, Copy, Debug)]
+enum DragState {
+    Idle,
+    Pressed { y: f32 },
+    Dragging {
+        from: usize,
+        start_y: f32,
+        pointer_y: f32,
+    },
+}
+
+impl DragState {
+    fn is_dragging(&self) -> bool {
+        matches!(self, DragState::Dragging { .. })
+    }
 }
 
 impl PlayerState {
@@ -217,8 +260,7 @@ impl PlayerState {
             cover_texture: R_INVALID_ID,
             track_list_widget: R_INVALID_ID,
             last_cover_dir: None,
-            dragging_track: None,
-            drag_start_y: 0.0,
+            drag: DragState::Idle,
         }
     }
 
@@ -228,8 +270,15 @@ impl PlayerState {
             self.status = "No se pudo guardar la ubicación de las listas".to_owned();
             return;
         };
+        // No guardar listas temporales (se borran al cerrar)
+        let non_temporal: Vec<_> = self
+            .playlists
+            .iter()
+            .filter(|p| !p.is_temporal)
+            .map(Playlist::saved)
+            .collect();
         let store = PlaylistStore {
-            playlists: self.playlists.iter().map(Playlist::saved).collect(),
+            playlists: non_temporal,
             active_playlist: self.active_playlist,
         };
 
@@ -361,6 +410,10 @@ impl PlayerState {
         }
         let playlist = self.playlists.get_mut(self.active_playlist)?;
         playlist.name = name.clone();
+        // Si la lista era temporal y se le cambia el nombre, deja de ser temporal
+        if playlist.is_temporal && name != "temp" {
+            playlist.is_temporal = false;
+        }
         self.status = format!("Lista renombrada: {name}");
         self.save_playlists();
         Some((self.active_playlist, name))
@@ -1517,24 +1570,29 @@ fn update_track_list(
 }
 
 fn update_metadata_editor(state: &mut PlayerState, ui: Ui) {
-    if state.ui_selection_dirty {
-        let selected = state
-            .playlists
-            .get(state.active_playlist)
-            .and_then(|playlist| playlist.selected)
-            .map(|index| index as i32)
-            .unwrap_or(-1);
-        unsafe { Rlist_view_set_selected(ui.track_list, selected) };
-        state.ui_selection_dirty = false;
-    }
-    let selected = unsafe { Rlist_view_get_selected(ui.track_list) };
-    if selected >= 0 {
-        if let Some(playlist) = state.playlists.get_mut(state.active_playlist) {
-            let selected = selected as usize;
-            if selected < playlist.tracks.len() && playlist.selected != Some(selected) {
-                playlist.selected = Some(selected);
-                state.editor_loaded_for = None;
-                state.save_playlists();
+    // Durante un arrastre la selección de Raven es la guía visual del destino.
+    // Sincronizarla de vuelta al modelo aquí provocaría un bucle que movía la
+    // selección sin sentido; al soltar, `move_track` ya fija el estado final.
+    if !state.drag.is_dragging() {
+        if state.ui_selection_dirty {
+            let selected = state
+                .playlists
+                .get(state.active_playlist)
+                .and_then(|playlist| playlist.selected)
+                .map(|index| index as i32)
+                .unwrap_or(-1);
+            unsafe { Rlist_view_set_selected(ui.track_list, selected) };
+            state.ui_selection_dirty = false;
+        }
+        let selected = unsafe { Rlist_view_get_selected(ui.track_list) };
+        if selected >= 0 {
+            if let Some(playlist) = state.playlists.get_mut(state.active_playlist) {
+                let selected = selected as usize;
+                if selected < playlist.tracks.len() && playlist.selected != Some(selected) {
+                    playlist.selected = Some(selected);
+                    state.editor_loaded_for = None;
+                    state.save_playlists();
+                }
             }
         }
     }
@@ -1579,7 +1637,13 @@ fn update_metadata_editor(state: &mut PlayerState, ui: Ui) {
     set_label(ui.cover_status, &state.cover_hint);
 }
 
-fn refresh_ui(state: &mut PlayerState, ui: Ui, row_cache: &RefCell<TrackListRows>, window: Rid) {
+fn refresh_ui(
+    state: &mut PlayerState,
+    ui: Ui,
+    row_cache: &RefCell<TrackListRows>,
+    window: Rid,
+    guide: Rid,
+) {
     state.poll_update_check(window);
     state.update_after_frame();
     update_track_list(state, ui, row_cache);
@@ -1663,12 +1727,29 @@ fn refresh_ui(state: &mut PlayerState, ui: Ui, row_cache: &RefCell<TrackListRows
     unsafe {
         Rslider_set_range(ui.seek, 0.0, duration_seconds.max(1.0));
         Rslider_set_value(ui.seek, position.min(duration_seconds));
+        if guide != R_INVALID_ID {
+            Rwidget_set_visibility(
+                guide,
+                if state.drag.is_dragging() {
+                    R_VISIBLE
+                } else {
+                    R_COLLAPSED
+                },
+            );
+        }
     }
 }
 
-fn add_playlist_tab(tabs: Rid, title: &str, make_active: bool) {
+fn add_playlist_tab(tabs: Rid, title: &str, make_active: bool, is_temporal: bool) {
     let page = unsafe { Rwidget_create(R_WIDGET_VBOX) };
-    let title = cstr(title);
+    // Las listas temporales se marcan con un emoji en la pestaña para
+    // indicar que no son una lista normal y se borrarán al cerrar
+    let display_title = if is_temporal {
+        format!("🔴 {}", title)
+    } else {
+        title.to_owned()
+    };
+    let title = cstr(&display_title);
     let index = unsafe { Rtab_view_add_tab(tabs, title.as_ptr(), page) };
     if index < 0 {
         return;
@@ -1700,6 +1781,13 @@ unsafe extern "C" fn close_playlist_tab(
     } else {
         R_FALSE
     }
+}
+
+fn is_audio_file(path: &Path) -> bool {
+    const EXTENSIONS: [&str; 6] = ["mp3", "flac", "wav", "ogg", "opus", "m4a"];
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
 }
 
 fn open_audio_files(_window: Rid) -> Vec<PathBuf> {
@@ -2232,8 +2320,105 @@ unsafe extern "C" fn window_drop_callback(
     R_TRUE
 }
 
+/// Índice de destino a partir del desplazamiento del ratón desde el clic.
+///
+/// Se usa siempre `start_y` como ancla: mientras dura el gesto el scroll está
+/// congelado, así que píxeles e índices del modelo permanecen alineados.
+fn drag_target(from: usize, start_y: f32, y: f32, row_height: f32, len: usize) -> usize {
+    let last = len.saturating_sub(1);
+    if len == 0 || row_height <= 0.0 {
+        return from.min(last);
+    }
+    let delta_rows = ((y - start_y) / row_height).round() as isize;
+    (from as isize + delta_rows).clamp(0, last as isize) as usize
+}
 
+/// Dibuja la línea de inserción en la posición del cursor dentro de la lista.
+///
+/// El widget de guía cubre toda la ventana, así que sus coordenadas locales son
+/// las de la ventana. Se usa el rect de la lista más `pointer_y` (relativo a la
+/// lista), no `índice * row_height`, que ignoraría el scroll.
+unsafe extern "C" fn drop_guide_paint(
+    _widget: Rid,
+    painter: *mut RPainter,
+    _width: f32,
+    _height: f32,
+    user_data: *mut c_void,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    let state = &*(user_data as *const RefCell<PlayerState>);
+    let Ok(st) = state.try_borrow() else {
+        return;
+    };
+    let DragState::Dragging { pointer_y, .. } = st.drag else {
+        return;
+    };
+    let list = st.track_list_widget;
+    if list == R_INVALID_ID {
+        return;
+    }
 
+    let (mut list_x, mut list_y, mut list_w, mut list_h) = (0.0, 0.0, 0.0, 0.0);
+    Rwidget_get_rect(list, &mut list_x, &mut list_y, &mut list_w, &mut list_h);
+    if list_w <= 0.0 || list_h <= 0.0 {
+        return;
+    }
+    let line_y = list_y + pointer_y.clamp(0.0, list_h);
+    Rdraw_line(
+        painter,
+        list_x,
+        line_y,
+        list_x + list_w,
+        line_y,
+        2.0,
+        0.725,
+        0.639,
+        0.961,
+        0.9,
+    );
+}
+
+/// Crea un canvas sobre la ventana con el widget de dibujo de la guía.
+///
+/// El canvas se añade como contenido de la ventana después del contenido XML,
+/// así que la guía pinta encima. El contenido original se reparénta una sola vez
+/// y se estira con anclas: moverlo en cada frame era lo que rompía el layout.
+fn create_drop_guide(window: Rid, state: &Rc<RefCell<PlayerState>>) -> Rid {
+    unsafe {
+        let content = Rwindow_get_content(window);
+        if content == R_INVALID_ID {
+            return R_INVALID_ID;
+        }
+        let canvas = Rwidget_create(R_WIDGET_CANVAS);
+        if canvas == R_INVALID_ID {
+            return R_INVALID_ID;
+        }
+        let guide = Rwidget_create(R_WIDGET_CUSTOM);
+        if guide == R_INVALID_ID {
+            Rwidget_destroy(canvas);
+            return R_INVALID_ID;
+        }
+
+        Rwidget_remove_child(window, content);
+        Rwidget_add_child(canvas, content);
+        Rslot_set_anchors(content, 0.0, 0.0, 1.0, 1.0);
+        Rwidget_add_child(canvas, guide);
+        Rslot_set_anchors(guide, 0.0, 0.0, 1.0, 1.0);
+        // La guía no debe robar eventos: el clic y el arrastre siguen en la lista.
+        Rwidget_set_hit_testable(canvas, R_FALSE);
+        Rwidget_set_hit_testable(guide, R_FALSE);
+        Rcustom_set_paint_callback(
+            guide,
+            Some(drop_guide_paint),
+            Rc::as_ptr(state) as *mut c_void,
+        );
+        Rwidget_set_visibility(guide, R_COLLAPSED);
+        Rwindow_set_content(window, canvas);
+        guide
+    }
+}
 
 // Event callback for track list: handle drag-to-reorder
 unsafe extern "C" fn track_list_event_callback(
@@ -2244,6 +2429,7 @@ unsafe extern "C" fn track_list_event_callback(
     let state = &*(user_data as *const RefCell<PlayerState>);
     let event_type = (*event).type_;
     let local_y = (*event).local_y;
+    const DRAG_SLOP: f32 = 10.0;
 
     match event_type {
         R_EVENT_MOUSE_DOWN => {
@@ -2253,62 +2439,80 @@ unsafe extern "C" fn track_list_event_callback(
             let Ok(mut st) = state.try_borrow_mut() else {
                 return R_FALSE;
             };
-            let row_height = Rtheme_get_metric(R_METRIC_ROW_HEIGHT);
-            if row_height <= 0.0 {
+            // Un clic nuevo cancela cualquier gesto anterior. Dejamos pasar el
+            // evento (R_FALSE) para que Raven seleccione la fila pulsada: nuestro
+            // callback se ejecuta ANTES del widget, así que leer la selección aquí
+            // daría la fila anterior, no la que el usuario ha pulsado.
+            st.drag = DragState::Pressed { y: local_y };
+            R_FALSE
+        }
+        R_EVENT_MOUSE_WHEEL => {
+            // Congelar el viewport mientras haya un clic o arrastre en curso.
+            // Si la lista scrollea a mitad del gesto, `local_y` deja de corresponder
+            // al índice capturado y el destino salta filas.
+            let Ok(st) = state.try_borrow() else {
                 return R_FALSE;
-            }
-            // Índice real de la pista bajo el ratón. Usamos Rlist_view_get_selected
-            // que devuelve el índice del modelo para el ListView virtual, con
-            // fallback al cálculo visual basado en local_y. Esto es importante
-            // porque con scroll, local_y / row_height da la fila visual en
-            // pantalla, no el índice real en el vector de pistas.
-            let mut start_index = unsafe { Rlist_view_get_selected(st.track_list_widget) };
-            if start_index < 0 {
-                start_index = (local_y / row_height) as i32;
-            }
-            let start_index = start_index as usize;
-            let playlist_index = st.active_playlist;
-            if let Some(playlist) = st.playlists.get(playlist_index) {
-                if start_index < playlist.tracks.len() {
-                    st.dragging_track = Some(start_index);
-                    st.drag_start_y = local_y;
-                }
+            };
+            if matches!(st.drag, DragState::Idle) {
+                R_FALSE
+            } else {
+                R_TRUE
             }
         }
         R_EVENT_MOUSE_MOVE => {
             let Ok(mut st) = state.try_borrow_mut() else {
                 return R_FALSE;
             };
-            if st.dragging_track.is_none() {
-                return R_FALSE;
-            }
-            // Check if mouse moved enough to start dragging (slop threshold)
-            let slop = 10.0;
-            if (local_y - st.drag_start_y).abs() < slop {
+            let start_y = match st.drag {
+                DragState::Pressed { y } => y,
+                DragState::Dragging { start_y, .. } => start_y,
+                DragState::Idle => return R_FALSE,
+            };
+            if (local_y - start_y).abs() < DRAG_SLOP {
                 return R_FALSE;
             }
             let row_height = Rtheme_get_metric(R_METRIC_ROW_HEIGHT);
             if row_height <= 0.0 {
                 return R_FALSE;
             }
-            let Some(start_index) = st.dragging_track else {
-                return R_FALSE;
-            };
-            // Movimiento relativo desde el índice inicial: cuántas filas se ha
-            // desplazado el ratón desde que empezó el arrastre. Esto funciona
-            // correctamente con scroll porque ambos extremos están en el mismo
-            // espacio de coordenadas (índices del modelo).
-            let delta_y = local_y - st.drag_start_y;
-            let delta_rows = (delta_y / row_height).round() as isize;
-            let target = start_index as isize + delta_rows;
-            let index = target.max(0) as usize;
             let playlist_index = st.active_playlist;
-            if let Some(playlist) = st.playlists.get_mut(playlist_index) {
-                let last = playlist.tracks.len().saturating_sub(1);
-                let clamped = index.min(last);
-                playlist.selected = Some(clamped);
-                st.ui_selection_dirty = true;
+            let len = st
+                .playlists
+                .get(playlist_index)
+                .map_or(0, |playlist| playlist.tracks.len());
+            if len == 0 {
+                st.drag = DragState::Idle;
+                return R_FALSE;
             }
+
+            let from = match st.drag {
+                DragState::Pressed { .. } => {
+                    // Raven ya ha procesado MOUSE_DOWN: ahora la selección sí es
+                    // la fila real sobre la que se pulsó.
+                    let selected = Rlist_view_get_selected(st.track_list_widget);
+                    if selected < 0 || selected as usize >= len {
+                        st.drag = DragState::Idle;
+                        return R_FALSE;
+                    }
+                    selected as usize
+                }
+                DragState::Dragging { from, .. } => from,
+                DragState::Idle => unreachable!("ya descartado al leer start_y"),
+            };
+            let target = drag_target(from, start_y, local_y, row_height, len);
+            st.drag = DragState::Dragging {
+                from,
+                start_y,
+                pointer_y: local_y,
+            };
+
+            // La guía provisional es el resaltado de la fila de destino. Solo
+            // escribimos la selección de Raven; `playlist.selected` no se toca
+            // hasta que se suelte el ratón, para evitar bucles de realimentación.
+            let list = st.track_list_widget;
+            drop(st);
+            Rlist_view_set_selected(list, target as i32);
+            R_TRUE
         }
         R_EVENT_MOUSE_UP => {
             if (*event).button != R_MOUSE_LEFT {
@@ -2317,31 +2521,37 @@ unsafe extern "C" fn track_list_event_callback(
             let Ok(mut st) = state.try_borrow_mut() else {
                 return R_FALSE;
             };
-            let Some(from_index) = st.dragging_track else {
+            match st.drag {
+                DragState::Dragging { from, start_y, .. } => {
+                    let row_height = Rtheme_get_metric(R_METRIC_ROW_HEIGHT);
+                    let len = st
+                        .playlists
+                        .get(st.active_playlist)
+                        .map_or(0, |playlist| playlist.tracks.len());
+                    let target = drag_target(from, start_y, local_y, row_height, len);
+                    st.drag = DragState::Idle;
+                    if from != target {
+                        st.move_track(from, target);
+                    }
+                    // Dejamos que Raven cierre el clic: consumir el MOUSE_UP
+                    // podría dejar su estado de pulsación colgado.
+                    R_FALSE
+                }
+                DragState::Pressed { .. } => {
+                    // Clic sin arrastre: que Raven lo termine con normalidad.
+                    st.drag = DragState::Idle;
+                    R_FALSE
+                }
+                DragState::Idle => R_FALSE,
+            }
+        }
+        R_EVENT_FOCUS_LOST => {
+            // Evita dejar un arrastre colgado si la ventana pierde el foco.
+            let Ok(mut st) = state.try_borrow_mut() else {
                 return R_FALSE;
             };
-            // Guardar drag_start_y ANTES de resetarlo, para calcular el
-            // desplazamiento relativo correctamente.
-            let drag_start_y = st.drag_start_y;
-            st.dragging_track = None;
-            st.drag_start_y = 0.0;
-
-            let row_height = Rtheme_get_metric(R_METRIC_ROW_HEIGHT);
-            if row_height <= 0.0 {
-                return R_FALSE;
-            }
-            let delta_y = local_y - drag_start_y;
-            let delta_rows = (delta_y / row_height).round() as isize;
-            let target = from_index as isize + delta_rows;
-            let to_index = target.max(0) as usize;
-            let playlist_index = st.active_playlist;
-            if let Some(playlist) = st.playlists.get(playlist_index) {
-                let last = playlist.tracks.len().saturating_sub(1);
-                let clamped = to_index.min(last);
-                if from_index != clamped {
-                    st.move_track(from_index, clamped);
-                }
-            }
+            st.drag = DragState::Idle;
+            R_FALSE
         }
         R_EVENT_KEY_DOWN => {
             if (*event).key == R_KEY_DELETE {
@@ -2351,10 +2561,10 @@ unsafe extern "C" fn track_list_event_callback(
                 st.remove_selected_track();
                 return R_TRUE;
             }
+            R_FALSE
         }
-        _ => {}
+        _ => R_FALSE,
     }
-    R_FALSE
 }
 
 fn ui_xml_path() -> Option<PathBuf> {
@@ -2419,6 +2629,7 @@ fn main() {
         let mut st = state.borrow_mut();
         st.track_list_widget = ui.track_list;
     }
+    let guide = create_drop_guide(window, &state);
     let context_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
     let update_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
     let edit_metadata_text = cstr("Editar metadatos");
@@ -2501,11 +2712,84 @@ fn main() {
             state.active_playlist,
         )
     };
-    for (index, title) in tabs.iter().enumerate() {
-        add_playlist_tab(ui.playlist_tabs, title, index == active_playlist);
+    for (index, playlist) in state.borrow().playlists.iter().enumerate() {
+        add_playlist_tab(
+            ui.playlist_tabs,
+            &playlist.name,
+            index == active_playlist,
+            playlist.is_temporal,
+        );
     }
     if !tabs.is_empty() {
         unsafe { Rtab_view_set_active(ui.playlist_tabs, active_playlist as i32) };
+    }
+
+    // Abrir archivos pasados como argumentos de línea de comandos
+    // (por ejemplo, al abrir un MP3 con "Abrir con Freeway Player")
+    let audio_args: Vec<PathBuf> = std::env::args()
+        .skip(1)
+        .filter_map(|arg| {
+            let path = PathBuf::from(arg);
+            if is_audio_file(&path) {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if !audio_args.is_empty() {
+        let mut st = state.borrow_mut();
+        // Crear lista temporal "temp" si no existe ya
+        let temp_index = st
+            .playlists
+            .iter()
+            .position(|p| p.name == "temp");
+        let playlist_index = match temp_index {
+            Some(i) => i,
+            None => {
+                let mut temp = Playlist::new_temporal();
+                temp.tracks = audio_args.clone();
+                if !audio_args.is_empty() {
+                    temp.selected = Some(0);
+                    temp.rebuild_order(Some(0));
+                }
+                st.playlists.push(temp);
+                st.playlists.len() - 1
+            }
+        };
+
+        // Si la lista temporal ya existía, añadir los archivos sin duplicar
+        if temp_index.is_some() {
+            let playlist = &mut st.playlists[playlist_index];
+            let mut existing: HashSet<_> = playlist.tracks.iter().cloned().collect();
+            for path in audio_args {
+                if existing.insert(path.clone()) {
+                    playlist.tracks.push(path);
+                }
+            }
+            playlist.revision += 1;
+            st.save_playlists();
+        }
+
+        st.active_playlist = playlist_index;
+        st.ui_rendered_playlist = None;
+
+        // Añadir pestaña para la lista temporal
+        add_playlist_tab(
+            ui.playlist_tabs,
+            &st.playlists[playlist_index].name,
+            true,
+            st.playlists[playlist_index].is_temporal,
+        );
+        unsafe { Rtab_view_set_active(ui.playlist_tabs, playlist_index as i32) };
+
+        // Reproducir el primer archivo si no hay nada reproduciendo
+        if st.current.is_none() {
+            if let Err(error) = st.play_track(playlist_index, 0, true) {
+                st.status = error;
+            }
+        }
     }
 
     {
@@ -2535,7 +2819,7 @@ fn main() {
         let tabs = ui.playlist_tabs;
         action_bind("player.add_playlist", move |_, _| {
             let (_, name) = state.borrow_mut().create_playlist();
-            add_playlist_tab(tabs, &name, true);
+            add_playlist_tab(tabs, &name, true, false);
         });
     }
     {
@@ -2551,7 +2835,7 @@ fn main() {
             if state.playlists.len() > previous_count {
                 let new_index = state.playlists.len() - 1;
                 let name = state.playlists[new_index].name.clone();
-                add_playlist_tab(tabs, &name, true);
+                add_playlist_tab(tabs, &name, true, false);
             }
         });
     }
@@ -2719,10 +3003,22 @@ fn main() {
         });
     }
 
-    refresh_ui(&mut state.borrow_mut(), ui, track_list_rows.as_ref(), window);
+    refresh_ui(
+        &mut state.borrow_mut(),
+        ui,
+        track_list_rows.as_ref(),
+        window,
+        guide,
+    );
     unsafe {
         while Rwait_frame(0.2) != 0 {
-            refresh_ui(&mut state.borrow_mut(), ui, track_list_rows.as_ref(), window);
+            refresh_ui(
+                &mut state.borrow_mut(),
+                ui,
+                track_list_rows.as_ref(),
+                window,
+                guide,
+            );
             if state.borrow().restart_requested {
                 break;
             }
@@ -2752,10 +3048,22 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_time, next_track_index, previous_track_index};
+    use super::{drag_target, format_time, next_track_index, previous_track_index};
     use rodio::{Decoder, Source};
     use std::io::Cursor;
     use std::time::Duration;
+
+    #[test]
+    fn drag_target_moves_rows_and_clamps_to_list() {
+        // Con el viewport congelado, el destino es la fila de partida más las
+        // filas que se ha movido el ratón, limitadas a la lista.
+        assert_eq!(drag_target(5, 100.0, 100.0, 40.0, 10), 5);
+        assert_eq!(drag_target(5, 100.0, 185.0, 40.0, 10), 7);
+        assert_eq!(drag_target(5, 100.0, 20.0, 40.0, 10), 3);
+        assert_eq!(drag_target(5, 100.0, 1000.0, 40.0, 10), 9);
+        assert_eq!(drag_target(5, 100.0, -1000.0, 40.0, 10), 0);
+        assert_eq!(drag_target(5, 100.0, 185.0, 0.0, 10), 5);
+    }
 
     #[test]
     fn formats_short_and_long_times() {
