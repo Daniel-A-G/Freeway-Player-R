@@ -18,10 +18,10 @@ Los bindings se incluyen en `vendor/raven-gui` desde la etiqueta `v0.2.1` de Rav
 - Mantener varias listas en pestañas, añadir/quitar pistas y conservar las listas entre sesiones en `$XDG_CONFIG_HOME/freeway-player/playlists.json` (o `~/.config/freeway-player/playlists.json`).
 - Reordenar pistas arrastrándolas dentro de la lista: una línea guía salta entre huecos para mostrar el destino, la lista se desplaza sola al arrastrar contra los bordes y la pista queda en el hueco indicado al soltar.
 - Reordenar las listas arrastrando sus pestañas: una guía vertical marca el hueco de destino y el nuevo orden se conserva entre sesiones.
-- Reproducir, pausar, detener, avanzar y retroceder por la lista activa con controles de iconos.
+- Reproducir, pausar, detener, avanzar y retroceder por la lista activa con controles de iconos. Play arranca la pista seleccionada (también si suena otra) y detener reinicia la barra de tiempo a cero, dejando la vista como recién abierta.
 - Activar aleatorio y repetición por lista (icono de infinito); aleatorio recorre las pistas en un orden mezclado antes de iniciar un nuevo ciclo. Las opciones se guardan junto a cada lista.
 - Cambiar volumen y posición desde la barra de progreso, con tiempo transcurrido y duración.
-- Mostrar la carátula de la pista en reproducción, con un distintivo genérico si no hay imagen. El menú contextual de cada pista abre el editor de título, artista, álbum, género, número de pista y carátula; los cambios se incrustan en el archivo. El selector de carátula recuerda la última carpeta usada entre sesiones en `$XDG_CONFIG_HOME/freeway-player/settings.json`; si el portal de documentos entrega una ruta efímera (`/run/user/<uid>/doc/…`), se guarda la carpeta real del archivo.
+- Mostrar la carátula de la pista en reproducción, con un distintivo genérico si no hay imagen. Al detener, el panel vuelve al estado inicial y muestra la carátula de la pista seleccionada, de modo que se puede explorar la lista con sus imágenes sin reproducirlas. El menú contextual de cada pista abre el editor de título, artista, álbum, género, número de pista y carátula; los cambios se incrustan en el archivo. El selector de carátula recuerda la última carpeta usada entre sesiones en `$XDG_CONFIG_HOME/freeway-player/settings.json`; si el portal de documentos entrega una ruta efímera (`/run/user/<uid>/doc/…`), se guarda la carpeta real del archivo.
 - Reparar archivos de audio con etiquetas corruptas: si guardar los metadatos falla, la aplicación ofrece repararlos con `ffmpeg` (remux con `-c copy`, sin recodificar) en la misma ruta. Antes guarda una copia del original en `$XDG_CACHE_HOME/freeway-player/repairs/` y deja la pista pendiente, marcada con `⚠` en todas las listas. El editor muestra entonces un aviso con dos acciones: restaurar el original o confirmar la versión reparada como definitiva. Las listas conservan el orden porque el archivo no cambia de ruta.
 - Reproducción automática de la siguiente pista.
 - Interfaz XML recargable mientras se desarrolla: `FREEWAY_UI_FILE` permite elegir el fichero; si no existe, se usa `ui/main.xml` desde el directorio actual. El XML también se incluye dentro del ejecutable como respaldo.
@@ -79,11 +79,11 @@ En el equipo de destino se instala o actualiza con `flatpak install --user --bun
 
 ### Releases automáticos en GitHub
 
-El workflow `.github/workflows/flatpak-release.yml` compila un bundle x86_64 y crea un GitHub Release al publicar un tag `v*`. El tag debe coincidir con la versión de `Cargo.toml`; por ejemplo, para la versión `0.2.9`:
+El workflow `.github/workflows/flatpak-release.yml` compila un bundle x86_64 y crea un GitHub Release al publicar un tag `v*`. El tag debe coincidir con la versión de `Cargo.toml`; por ejemplo, para la versión `0.3.0`:
 
 ```sh
-git tag -a v0.2.9 -m "Freeway Player v0.2.9"
-git push origin main v0.2.9
+git tag -a v0.3.0 -m "Freeway Player v0.3.0"
+git push origin main v0.3.0
 ```
 
 Conviene subir `main` junto con el tag para que la rama remota quede alineada con el Release.
