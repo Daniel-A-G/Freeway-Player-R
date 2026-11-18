@@ -2443,34 +2443,36 @@ unsafe extern "C" fn drop_guide_paint(
     );
 }
 
-/// Crea un canvas sobre la ventana con el widget de dibujo de la guía.
+/// Crea un overlay sobre la ventana con el widget de dibujo de la guía.
 ///
-/// El canvas se añade como contenido de la ventana después del contenido XML,
-/// así que la guía pinta encima. El contenido original se reparénta una sola vez
-/// y se estira con anclas: moverlo en cada frame era lo que rompía el layout.
+/// El contenido XML se reparénta una sola vez dentro del overlay, que sí
+/// respeta `padding`, a diferencia de un Canvas. La guía se añade después para
+/// pintar encima y no robar eventos.
 fn create_drop_guide(window: Rid, state: &Rc<RefCell<PlayerState>>) -> Rid {
     unsafe {
         let content = Rwindow_get_content(window);
         if content == R_INVALID_ID {
             return R_INVALID_ID;
         }
-        let canvas = Rwidget_create(R_WIDGET_CANVAS);
-        if canvas == R_INVALID_ID {
+        let overlay = Rwidget_create(R_WIDGET_OVERLAY);
+        if overlay == R_INVALID_ID {
             return R_INVALID_ID;
         }
         let guide = Rwidget_create(R_WIDGET_CUSTOM);
         if guide == R_INVALID_ID {
-            Rwidget_destroy(canvas);
+            Rwidget_destroy(overlay);
             return R_INVALID_ID;
         }
 
+        // El slot pertenece al nuevo padre: restauramos el `Slot.Padding="20"`
+        // que el VBox raíz tenía en ui/main.xml. Un Canvas lo ignoraba y dejaba
+        // la interfaz pegada a los bordes de la ventana.
         Rwidget_remove_child(window, content);
-        Rwidget_add_child(canvas, content);
-        Rslot_set_anchors(content, 0.0, 0.0, 1.0, 1.0);
-        Rwidget_add_child(canvas, guide);
-        Rslot_set_anchors(guide, 0.0, 0.0, 1.0, 1.0);
+        Rwidget_add_child(overlay, content);
+        Rslot_set_padding(content, 20.0, 20.0, 20.0, 20.0);
+        Rwidget_add_child(overlay, guide);
+        Rslot_set_padding(guide, 0.0, 0.0, 0.0, 0.0);
         // La guía no debe robar eventos: el clic y el arrastre siguen en la lista.
-        Rwidget_set_hit_testable(canvas, R_FALSE);
         Rwidget_set_hit_testable(guide, R_FALSE);
         Rcustom_set_paint_callback(
             guide,
@@ -2478,7 +2480,7 @@ fn create_drop_guide(window: Rid, state: &Rc<RefCell<PlayerState>>) -> Rid {
             Rc::as_ptr(state) as *mut c_void,
         );
         Rwidget_set_visibility(guide, R_COLLAPSED);
-        Rwindow_set_content(window, canvas);
+        Rwindow_set_content(window, overlay);
         guide
     }
 }
