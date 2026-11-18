@@ -16,6 +16,7 @@ Los bindings se incluyen en `vendor/raven-gui` desde la etiqueta `v0.2.1` de Rav
 - Los símbolos de controles y las notas musicales usan fuentes Noto incluidas en el programa; aleatorio y repetición usan iconos monocromos propios. Así no dependen de las fuentes o temas de iconos instalados en cada distribución.
 - Abrir una o varias pistas con el selector del escritorio. En Linux usa XDG Desktop Portal, de modo que el diálogo puede mostrar las ubicaciones fijadas en GTK/KDE y dar acceso a archivos elegidos fuera del espacio concedido directamente al Flatpak.
 - Mantener varias listas en pestañas, añadir/quitar pistas y conservar las listas entre sesiones en `$XDG_CONFIG_HOME/freeway-player/playlists.json` (o `~/.config/freeway-player/playlists.json`).
+- Reordenar pistas arrastrándolas dentro de la lista: una línea guía salta entre huecos para mostrar el destino, la lista se desplaza sola al arrastrar contra los bordes y la pista queda en el hueco indicado al soltar.
 - Reproducir, pausar, detener, avanzar y retroceder por la lista activa con controles de iconos.
 - Activar aleatorio y repetición por lista; aleatorio recorre las pistas en un orden mezclado antes de iniciar un nuevo ciclo. Las opciones se guardan junto a cada lista.
 - Cambiar volumen y posición desde la barra de progreso, con tiempo transcurrido y duración.
@@ -76,12 +77,14 @@ En el equipo de destino se instala o actualiza con `flatpak install --user --bun
 
 ### Releases automáticos en GitHub
 
-El workflow `.github/workflows/flatpak-release.yml` compila un bundle x86_64 y crea un GitHub Release al publicar un tag `v*`. El tag debe coincidir con la versión de `Cargo.toml`; por ejemplo, para la versión `0.1.0`:
+El workflow `.github/workflows/flatpak-release.yml` compila un bundle x86_64 y crea un GitHub Release al publicar un tag `v*`. El tag debe coincidir con la versión de `Cargo.toml`; por ejemplo, para la versión `0.2.4`:
 
 ```sh
-git tag -a v0.1.0 -m "Freeway Player v0.1.0"
-git push origin v0.1.0
+git tag -a v0.2.4 -m "Freeway Player v0.2.4"
+git push origin main v0.2.4
 ```
+
+Conviene subir `main` junto con el tag para que la rama remota quede alineada con el Release.
 
 El Release incluye el `.flatpak`, su checksum SHA-256 y `BUILD-INFO.txt` con el tag y el commit exacto del código fuente. El bundle se construye en GitHub Actions y se adjunta al Release automáticamente; no hace falta configurar un token personal, porque el workflow usa `GITHUB_TOKEN` con permiso de contenido para publicar el Release.
 
