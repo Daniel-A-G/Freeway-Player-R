@@ -193,6 +193,7 @@ struct PlayerState {
     cover_rendered_for: Option<(usize, usize, u64)>,
     cover_texture: Rid,
     track_list_widget: Rid,
+    playlist_tabs_widget: Rid,
     last_cover_dir: Option<PathBuf>,
     drag: DragState,
     tab_drag: TabDragState,
@@ -238,7 +239,15 @@ enum TabDragState {
         from: usize,
         start_x: f32,
         target: usize,
+        /// Hueco de destino relativo al TabView, para pintar la guía.
+        guide_x: f32,
     },
+}
+
+impl TabDragState {
+    fn is_dragging(&self) -> bool {
+        matches!(self, TabDragState::Dragging { .. })
+    }
 }
 
 impl PlayerState {
@@ -280,6 +289,7 @@ impl PlayerState {
             cover_rendered_for: None,
             cover_texture: R_INVALID_ID,
             track_list_widget: R_INVALID_ID,
+            playlist_tabs_widget: R_INVALID_ID,
             last_cover_dir: None,
             drag: DragState::Idle,
             tab_drag: TabDragState::Idle,
@@ -1773,7 +1783,7 @@ fn refresh_ui(
         if guide != R_INVALID_ID {
             Rwidget_set_visibility(
                 guide,
-                if state.drag.is_dragging() {
+                if state.drag.is_dragging() || state.tab_drag.is_dragging() {
                     R_VISIBLE
                 } else {
                     R_COLLAPSED
@@ -2500,7 +2510,6 @@ fn tab_drop_target(widths: &[f32], x: f32, from: usize) -> usize {
 ///
 /// Al mover hacia la derecha la pestaña termina después de la de `target`;
 /// hacia la izquierda, antes. Con `from == target` no se dibuja guía.
-#[allow(dead_code)] // Se usa en la guía de la fase 3.
 fn tab_guide_x(widths: &[f32], from: usize, target: usize) -> f32 {
     if target >= widths.len() {
         return TAB_INSET;
@@ -2574,11 +2583,12 @@ fn drag_guide_y(from: usize, start_y: f32, target: usize, row_height: f32) -> f3
     start_y + (delta as f32 + delta.signum() as f32 * 0.5) * row_height
 }
 
-/// Dibuja la línea de inserción en el hueco entre dos pistas.
+/// Dibuja la guía del gesto de arrastre activo.
 ///
 /// El widget de guía cubre toda la ventana, así que sus coordenadas locales son
-/// las de la ventana. Se usa el rect de la lista más la posición calculada desde
-/// el ancla del clic; `índice * row_height` directo ignoraría el scroll.
+/// las de la ventana. En las pistas se pinta una línea horizontal en el hueco
+/// entre filas; en las pestañas, una vertical en el hueco de destino. Se usan
+/// los rects de los widgets más la posición calculada durante el gesto.
 unsafe extern "C" fn drop_guide_paint(
     _widget: Rid,
     painter: *mut RPainter,
@@ -2593,6 +2603,49 @@ unsafe extern "C" fn drop_guide_paint(
     let Ok(st) = state.try_borrow() else {
         return;
     };
+
+    if let TabDragState::Dragging {
+        from,
+        target,
+        guide_x,
+        ..
+    } = st.tab_drag
+    {
+        if from == target {
+            // Sin movimiento no hay hueco que indicar.
+            return;
+        }
+        let tabs = st.playlist_tabs_widget;
+        if tabs == R_INVALID_ID {
+            return;
+        }
+        let (mut tabs_x, mut tabs_y, mut tabs_w, mut tabs_h) = (0.0, 0.0, 0.0, 0.0);
+        Rwidget_get_rect(
+            tabs,
+            &mut tabs_x,
+            &mut tabs_y,
+            &mut tabs_w,
+            &mut tabs_h,
+        );
+        if tabs_w <= 0.0 || tabs_h <= 0.0 {
+            return;
+        }
+        let line_x = (tabs_x + guide_x).clamp(tabs_x + TAB_INSET, tabs_x + tabs_w);
+        Rdraw_line(
+            painter,
+            line_x,
+            tabs_y + 5.0,
+            line_x,
+            tabs_y + tabs_h - 5.0,
+            2.0,
+            0.725,
+            0.639,
+            0.961,
+            0.9,
+        );
+        return;
+    }
+
     let DragState::Dragging {
         from,
         start_y,
@@ -2781,10 +2834,12 @@ unsafe extern "C" fn playlist_tabs_event_callback(
                 TabDragState::Idle => return R_FALSE,
             };
             let target = tab_drop_target(&widths, local_x, from);
+            let guide_x = tab_guide_x(&widths, from, target);
             st.tab_drag = TabDragState::Dragging {
                 from,
                 start_x,
                 target,
+                guide_x,
             };
             // Congela el hover de Raven durante el gesto.
             R_TRUE
@@ -3128,6 +3183,7 @@ fn main() {
     {
         let mut st = state.borrow_mut();
         st.track_list_widget = ui.track_list;
+        st.playlist_tabs_widget = ui.playlist_tabs;
     }
     let guide = create_drop_guide(window, &state);
     let context_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
