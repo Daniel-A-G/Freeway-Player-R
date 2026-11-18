@@ -22,6 +22,9 @@ use url::Url;
 
 
 
+#[cfg(unix)]
+mod activation;
+mod instance;
 mod opus;
 mod updates;
 
@@ -81,12 +84,51 @@ struct PlaylistStore {
     active_playlist: usize,
 }
 
+/// Qué hacer cuando se abre un archivo con la app ya en marcha.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OpenBehavior {
+    /// Añadir a la sesión y empezar a reproducirlo (opción predeterminada).
+    #[default]
+    AddAndPlay,
+    /// Añadir a la sesión sin interrumpir lo que esté sonando.
+    AddOnly,
+    /// Vaciar la sesión y quedarse solo con los archivos abiertos.
+    Replace,
+}
+
+impl OpenBehavior {
+    const ALL: [OpenBehavior; 3] = [
+        OpenBehavior::AddAndPlay,
+        OpenBehavior::AddOnly,
+        OpenBehavior::Replace,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            OpenBehavior::AddAndPlay => "Añadir a Sesión y reproducir",
+            OpenBehavior::AddOnly => "Añadir a Sesión sin cambiar la reproducción",
+            OpenBehavior::Replace => "Reemplazar Sesión y reproducir",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            OpenBehavior::AddAndPlay => 0,
+            OpenBehavior::AddOnly => 1,
+            OpenBehavior::Replace => 2,
+        }
+    }
+}
+
 /// Preferencias que sobreviven al cierre del programa. Se guardan aparte de
 /// las listas para que un fallo al escribir una no arrastre a las otras.
 #[derive(Default, Serialize, Deserialize)]
 struct SavedSettings {
     #[serde(default)]
     last_cover_dir: Option<PathBuf>,
+    #[serde(default)]
+    open_behavior: OpenBehavior,
 }
 
 /// Reparación todavía sin resolver: el archivo ya es la versión reparada y la
@@ -265,6 +307,9 @@ struct PlayerState {
     track_list_widget: Rid,
     playlist_tabs_widget: Rid,
     last_cover_dir: Option<PathBuf>,
+    open_behavior: OpenBehavior,
+    /// Rutas que envían las siguientes instancias de la app.
+    instance_paths: Option<Receiver<Vec<PathBuf>>>,
     pending_repairs: Vec<PendingRepair>,
     drag: DragState,
     tab_drag: TabDragState,
@@ -358,6 +403,8 @@ impl PlayerState {
             track_list_widget: R_INVALID_ID,
             playlist_tabs_widget: R_INVALID_ID,
             last_cover_dir: settings.last_cover_dir,
+            open_behavior: settings.open_behavior,
+            instance_paths: None,
             pending_repairs: load_pending_repairs(),
             drag: DragState::Idle,
             tab_drag: TabDragState::Idle,
@@ -615,6 +662,135 @@ impl PlayerState {
             if let Err(error) = self.play_track(playlist_index, first_added, true) {
                 self.status = error;
             }
+        }
+    }
+
+    /// Abre archivos en la lista de sesión según el ajuste configurado.
+    ///
+    /// La sesión se crea si no existe y se activa su pestaña. En `AddOnly` no
+    /// se toca la reproducción: solo se añaden pistas y se selecciona la nueva.
+    fn open_in_session(&mut self, paths: Vec<PathBuf>, behavior: OpenBehavior) {
+        if paths.is_empty() {
+            return;
+        }
+
+        let existing_session = self.playlists.iter().position(|playlist| playlist.is_temporal);
+        let playlist_index = match existing_session {
+            Some(index) => index,
+            None => {
+                self.playlists.push(Playlist::new_temporal());
+                self.playlists.len() - 1
+            }
+        };
+
+        let mut first_new = None;
+        match behavior {
+            OpenBehavior::Replace => {
+                let playlist = &mut self.playlists[playlist_index];
+                playlist.tracks = paths.clone();
+                playlist.selected = Some(0);
+                playlist.order.clear();
+                playlist.order_position = None;
+                playlist.revision += 1;
+                first_new = Some(0);
+            }
+            OpenBehavior::AddAndPlay | OpenBehavior::AddOnly => {
+                let playlist = &mut self.playlists[playlist_index];
+                let previous_len = playlist.tracks.len();
+                let mut existing: HashSet<_> = playlist.tracks.iter().cloned().collect();
+                for path in &paths {
+                    if existing.insert(path.clone()) {
+                        playlist.tracks.push(path.clone());
+                    }
+                }
+                if playlist.tracks.len() > previous_len {
+                    playlist.revision += 1;
+                    first_new = Some(previous_len);
+                }
+            }
+        }
+
+        self.active_playlist = playlist_index;
+        self.ui_rendered_playlist = None;
+        self.editor_loaded_for = None;
+
+        if existing_session.is_none() {
+            let (name, is_temporal) = {
+                let playlist = &self.playlists[playlist_index];
+                (playlist.name.clone(), playlist.is_temporal)
+            };
+            add_playlist_tab(self.playlist_tabs_widget, &name, true, is_temporal);
+        } else if self.playlist_tabs_widget != R_INVALID_ID {
+            unsafe { Rtab_view_set_active(self.playlist_tabs_widget, playlist_index as i32) };
+        }
+
+        let play_index = first_new.or_else(|| {
+            paths.first().and_then(|first| {
+                self.playlists[playlist_index]
+                    .tracks
+                    .iter()
+                    .position(|track| track == first)
+            })
+        });
+
+        if behavior == OpenBehavior::AddOnly {
+            if let Some(index) = play_index {
+                self.playlists[playlist_index].selected = Some(index);
+                self.ui_selection_dirty = true;
+                self.editor_loaded_for = None;
+                self.status = if first_new.is_some() {
+                    format!("Añadido a {SESSION_PLAYLIST_NAME} · reproducción sin cambios")
+                } else {
+                    format!("Ya estaba en {SESSION_PLAYLIST_NAME} · reproducción sin cambios")
+                };
+            }
+            return;
+        }
+
+        if let Some(index) = play_index {
+            if let Err(error) = self.play_track(playlist_index, index, true) {
+                self.status = error;
+            } else {
+                self.status = format!(
+                    "Reproduciendo · {SESSION_PLAYLIST_NAME} no se guarda; renómbrala para conservarla"
+                );
+            }
+        }
+    }
+
+    /// Recoge las rutas que envían otras instancias y trae la ventana delante.
+    fn poll_instance_messages(&mut self, window: Rid) {
+        let mut batches = Vec::new();
+        let mut disconnected = false;
+        if let Some(receiver) = &self.instance_paths {
+            loop {
+                match receiver.try_recv() {
+                    Ok(paths) => batches.push(paths),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if disconnected {
+            self.instance_paths = None;
+        }
+        if batches.is_empty() {
+            return;
+        }
+
+        #[cfg(unix)]
+        activation::bring_to_front(window);
+        #[cfg(not(unix))]
+        unsafe {
+            Rwindow_restore(window);
+            Rwindow_show(window);
+        }
+        let behavior = self.open_behavior;
+        for paths in batches {
+            self.open_in_session(paths, behavior);
         }
     }
 
@@ -1365,9 +1541,22 @@ impl PlayerState {
         self.last_cover_dir = Some(parent.to_path_buf());
         let settings = SavedSettings {
             last_cover_dir: self.last_cover_dir.clone(),
+            open_behavior: self.open_behavior,
         };
         if let Err(error) = save_settings(&settings) {
             self.status = format!("No se pudo guardar la última carpeta de carátulas: {error}");
+        }
+    }
+
+    fn set_open_behavior(&mut self, behavior: OpenBehavior) {
+        self.open_behavior = behavior;
+        self.status = format!("Ajustes: {}", behavior.label());
+        let settings = SavedSettings {
+            last_cover_dir: self.last_cover_dir.clone(),
+            open_behavior: behavior,
+        };
+        if let Err(error) = save_settings(&settings) {
+            self.status = format!("No se pudo guardar el ajuste: {error}");
         }
     }
 
@@ -2368,6 +2557,7 @@ fn refresh_ui(
     window: Rid,
 ) {
     state.poll_update_check(window);
+    state.poll_instance_messages(window);
     state.update_after_frame();
     update_track_list(state, ui, row_cache);
     update_metadata_editor(state, ui);
@@ -2908,6 +3098,35 @@ unsafe extern "C" fn check_updates_from_app_menu(_item: Rid, user_data: *mut c_v
     let state = &*(user_data as *const RefCell<PlayerState>);
     if let Ok(mut state) = state.try_borrow_mut() {
         state.start_update_check();
+    }
+}
+
+struct OpenBehaviorMenuContext {
+    state: Rc<RefCell<PlayerState>>,
+    items: [Rid; 3],
+}
+
+unsafe extern "C" fn choose_open_behavior(item: Rid, user_data: *mut c_void) {
+    let context = &*(user_data as *const OpenBehaviorMenuContext);
+    let Some(behavior) = OpenBehavior::ALL
+        .iter()
+        .copied()
+        .find(|behavior| context.items[behavior.index()] == item)
+    else {
+        return;
+    };
+    let Ok(mut state) = context.state.try_borrow_mut() else {
+        return;
+    };
+    state.set_open_behavior(behavior);
+    for candidate in OpenBehavior::ALL {
+        let menu_item = context.items[candidate.index()];
+        if menu_item != R_INVALID_ID {
+            Rmenu_item_set_checked(
+                menu_item,
+                if candidate == behavior { R_TRUE } else { R_FALSE },
+            );
+        }
     }
 }
 
@@ -4002,6 +4221,22 @@ fn expose_host_fonts_to_raven() {}
 
 fn main() {
     expose_host_fonts_to_raven();
+
+    // Los archivos se leen antes de crear la ventana: si ya hay una instancia
+    // abierta, esta se limita a enviárselos y termina sin abrir otra.
+    let audio_args: Vec<PathBuf> = audio_paths_from_args(std::env::args().skip(1))
+        .into_iter()
+        .filter(|path| path.is_file())
+        .collect();
+    let instance = match instance::start(&audio_args) {
+        instance::Role::Primary(instance) => Some(instance),
+        instance::Role::Forwarded => return,
+        instance::Role::Unavailable(error) => {
+            eprintln!("Instancia única desactivada: {error}");
+            None
+        }
+    };
+
     unsafe {
         if Rinit(R_BACKEND_VULKAN) == 0 {
             eprintln!("No se pudo iniciar Raven con Vulkan");
@@ -4042,28 +4277,60 @@ fn main() {
         st.track_list_widget = ui.track_list;
         st.playlist_tabs_widget = ui.playlist_tabs;
     }
+    if let Some(instance) = &instance {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        match instance.spawn_receiver(sender) {
+            Ok(()) => state.borrow_mut().instance_paths = Some(receiver),
+            Err(error) => {
+                state.borrow_mut().status =
+                    format!("No se pudo escuchar otras aperturas: {error}");
+            }
+        }
+    }
     create_drop_guide(window, &state);
     let context_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
-    let update_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
+    let app_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
     let edit_metadata_text = cstr("Editar metadatos");
     let edit_metadata_item = unsafe { Rmenu_add_item(context_menu, edit_metadata_text.as_ptr()) };
     let remove_from_list_text = cstr("Eliminar de la lista");
     let remove_from_list_item = unsafe { Rmenu_add_item(context_menu, remove_from_list_text.as_ptr()) };
+
+    // «Ajustes» va primero para que el comportamiento al abrir archivos esté
+    // a mano: es lo que más se toca al usar la app como reproductor del sistema.
+    let settings_title = cstr("Ajustes");
+    let settings_menu = if app_menu != R_INVALID_ID {
+        unsafe { Rmenu_add_menu(app_menu, settings_title.as_ptr()) }
+    } else {
+        R_INVALID_ID
+    };
+    let mut behavior_items = [R_INVALID_ID; 3];
+    if settings_menu != R_INVALID_ID {
+        for behavior in OpenBehavior::ALL {
+            let label = cstr(behavior.label());
+            behavior_items[behavior.index()] =
+                unsafe { Rmenu_add_item(settings_menu, label.as_ptr()) };
+        }
+        unsafe { Rmenu_add_separator(app_menu) };
+    }
     let check_updates_text = cstr("Buscar actualizaciones");
-    let check_updates_item = if update_menu != R_INVALID_ID {
-        unsafe { Rmenu_add_item(update_menu, check_updates_text.as_ptr()) }
+    let check_updates_item = if app_menu != R_INVALID_ID {
+        unsafe { Rmenu_add_item(app_menu, check_updates_text.as_ptr()) }
     } else {
         R_INVALID_ID
     };
     let about_text = cstr("Acerca de");
-    let about_item = if update_menu != R_INVALID_ID {
-        unsafe { Rmenu_add_item(update_menu, about_text.as_ptr()) }
+    let about_item = if app_menu != R_INVALID_ID {
+        unsafe { Rmenu_add_item(app_menu, about_text.as_ptr()) }
     } else {
         R_INVALID_ID
     };
     let context_data = Box::into_raw(Box::new(MetadataMenuContext {
         state: Rc::clone(&state),
         ui,
+    })) as *mut c_void;
+    let behavior_data = Box::into_raw(Box::new(OpenBehaviorMenuContext {
+        state: Rc::clone(&state),
+        items: behavior_items,
     })) as *mut c_void;
     unsafe {
         Rswitcher_set_index(ui.right_panel, 0);
@@ -4080,6 +4347,23 @@ fn main() {
             Some(remove_from_list_from_context_menu),
             Rc::as_ptr(&state) as *mut c_void,
         );
+        let open_behavior = state.borrow().open_behavior;
+        for behavior in OpenBehavior::ALL {
+            let item = behavior_items[behavior.index()];
+            if item == R_INVALID_ID {
+                continue;
+            }
+            Rmenu_item_set_checkable(item, R_TRUE);
+            Rmenu_item_set_checked(
+                item,
+                if behavior == open_behavior { R_TRUE } else { R_FALSE },
+            );
+            Rmenu_item_set_clicked_callback(
+                item,
+                Some(choose_open_behavior),
+                behavior_data,
+            );
+        }
         if check_updates_item != R_INVALID_ID {
             Rmenu_item_set_clicked_callback(
                 check_updates_item,
@@ -4143,89 +4427,23 @@ fn main() {
         unsafe { Rtab_view_set_active(ui.playlist_tabs, active_playlist as i32) };
     }
 
-    // Abrir archivos pasados como argumentos de línea de comandos
-    // (por ejemplo, al abrir un MP3 con "Abrir con Freeway Player").
-    // Flatpak entrega rutas del portal y algunos lanzadores URIs `file://`.
-    let audio_args: Vec<PathBuf> = audio_paths_from_args(std::env::args().skip(1))
-        .into_iter()
-        .filter(|path| path.is_file())
-        .collect();
-
+    // Abrir los archivos del lanzador (por ejemplo, "Abrir con Freeway
+    // Player"). Ya se validaron antes de intentar la instancia única.
     if !audio_args.is_empty() {
-        let mut st = state.borrow_mut();
-        // La sesión es la lista temporal: si ya existe, se reutiliza en lugar
-        // de abrir otra pestaña.
-        let existing_session = st.playlists.iter().position(|p| p.is_temporal);
-        let playlist_index = match existing_session {
-            Some(index) => index,
-            None => {
-                st.playlists.push(Playlist::new_temporal());
-                st.playlists.len() - 1
-            }
-        };
-
-        // Añadir solo los archivos nuevos, conservando el orden de llegada.
-        let first_new = {
-            let playlist = &mut st.playlists[playlist_index];
-            let previous_len = playlist.tracks.len();
-            let mut existing: HashSet<_> = playlist.tracks.iter().cloned().collect();
-            for path in &audio_args {
-                if existing.insert(path.clone()) {
-                    playlist.tracks.push(path.clone());
-                }
-            }
-            if playlist.tracks.len() > previous_len {
-                playlist.revision += 1;
-                Some(previous_len)
-            } else {
-                None
-            }
-        };
-
-        st.active_playlist = playlist_index;
-        st.ui_rendered_playlist = None;
-        st.editor_loaded_for = None;
-
-        // Solo hay que crear la pestaña si la sesión no existía ya.
-        if existing_session.is_none() {
-            let (name, is_temporal) = {
-                let playlist = &st.playlists[playlist_index];
-                (playlist.name.clone(), playlist.is_temporal)
-            };
-            add_playlist_tab(ui.playlist_tabs, &name, true, is_temporal);
-        }
-        unsafe { Rtab_view_set_active(ui.playlist_tabs, playlist_index as i32) };
-
-        // Reproducir el primer archivo recién añadido; si ya estaba en la
-        // sesión, el primero que se pidió abrir.
-        let play_index = first_new.or_else(|| {
-            audio_args.first().and_then(|first| {
-                st.playlists[playlist_index]
-                    .tracks
-                    .iter()
-                    .position(|track| track == first)
-            })
-        });
-        if let Some(track_index) = play_index {
-            if let Err(error) = st.play_track(playlist_index, track_index, true) {
-                st.status = error;
-            } else {
-                st.status = format!(
-                    "Reproduciendo · {SESSION_PLAYLIST_NAME} no se guarda; renómbrala para conservarla"
-                );
-            }
-        }
+        state
+            .borrow_mut()
+            .open_in_session(audio_args.clone(), OpenBehavior::AddAndPlay);
     }
 
     {
         action_bind("player.open_app_menu", move |sender, _| {
-            if update_menu == R_INVALID_ID {
+            if app_menu == R_INVALID_ID {
                 return;
             }
             let (mut x, mut y, mut width, mut height) = (0.0, 0.0, 0.0, 0.0);
             unsafe {
                 Rwidget_get_rect(sender, &mut x, &mut y, &mut width, &mut height);
-                Rmenu_open(update_menu, window, x, y + height);
+                Rmenu_open(app_menu, window, x, y + height);
             }
         });
     }
@@ -4484,10 +4702,11 @@ fn main() {
         Rwindow_close_popups(window);
         Rwidget_set_context_menu(ui.track_list, R_INVALID_ID);
         Rwidget_destroy(context_menu);
-        if update_menu != R_INVALID_ID {
-            Rwidget_destroy(update_menu);
+        if app_menu != R_INVALID_ID {
+            Rwidget_destroy(app_menu);
         }
         drop(Box::from_raw(context_data as *mut MetadataMenuContext));
+        drop(Box::from_raw(behavior_data as *mut OpenBehaviorMenuContext));
         let cover_texture = state.borrow().cover_texture;
         Rwindow_destroy(window);
         if cover_texture != R_INVALID_ID {
@@ -4502,6 +4721,8 @@ fn main() {
         destroy_symbol_fallbacks(symbols_2_font, symbols_font);
         Rshutdown();
     }
+    // Cierra el socket para que la próxima apertura cree una instancia nueva.
+    drop(instance);
 }
 
 #[cfg(test)]
@@ -4512,7 +4733,7 @@ mod tests {
         is_document_portal_path_in, next_track_index, play_starts_selected, previous_track_index,
         remap_index, repair_audio_file, repair_backup_path, tab_at, tab_close_hit, tab_drop_target,
         tab_guide_x, tab_natural_width, tab_rect, tab_widths, track_row, MetadataWriteError,
-        Playlist, SavedSettings, TabMetrics, TrackMetadata, SESSION_PLAYLIST_NAME,
+        OpenBehavior, Playlist, SavedSettings, TabMetrics, TrackMetadata, SESSION_PLAYLIST_NAME,
     };
     use rodio::{Decoder, Source};
     use std::io::Cursor;
@@ -4643,14 +4864,31 @@ mod tests {
     fn settings_round_trip_keeps_last_cover_directory() {
         let settings = SavedSettings {
             last_cover_dir: Some(PathBuf::from("/home/persona/Imágenes/caratulas")),
+            open_behavior: OpenBehavior::AddOnly,
         };
         let json = serde_json::to_string(&settings).unwrap();
         let back: SavedSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.last_cover_dir, settings.last_cover_dir);
+        assert_eq!(back.open_behavior, OpenBehavior::AddOnly);
 
         // Un archivo antiguo o vacío no impide arrancar.
         let empty: SavedSettings = serde_json::from_str("{}").unwrap();
         assert!(empty.last_cover_dir.is_none());
+    }
+
+    #[test]
+    fn missing_open_behavior_defaults_to_add_and_play() {
+        let settings: SavedSettings = serde_json::from_str(r#"{"last_cover_dir":null}"#).unwrap();
+        assert_eq!(settings.open_behavior, OpenBehavior::AddAndPlay);
+        assert_eq!(OpenBehavior::default(), OpenBehavior::AddAndPlay);
+    }
+
+    #[test]
+    fn open_behavior_values_have_distinct_indices() {
+        for (position, behavior) in OpenBehavior::ALL.iter().copied().enumerate() {
+            assert_eq!(behavior.index(), position);
+            assert!(!behavior.label().is_empty());
+        }
     }
 
     #[test]
