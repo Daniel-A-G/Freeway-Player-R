@@ -26,3 +26,4 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 libc = "0.2"
 tokio = { version = "1", features = ["rt", "time"] }
 ureq = { version = "3", features = ["json"] }
+url = "2"

@@ -421,6 +421,7 @@ dependencies = [
  "symphonia-adapter-libopus",
  "tokio",
  "ureq",
+ "url",
 ]
 
 [[package]]

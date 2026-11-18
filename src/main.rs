@@ -18,6 +18,7 @@ use std::process::Command;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
+use url::Url;
 
 
 
@@ -2519,6 +2520,49 @@ fn is_audio_file(path: &Path) -> bool {
         .is_some_and(|extension| EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
 }
 
+/// Archivos de audio recibidos por línea de comandos.
+///
+/// Acepta rutas normales y URIs `file://` (con `%20` y demás escapes), ignora
+/// los marcadores que añade Flatpak al exportar el lanzador
+/// (`--file-forwarding`, `@@`, `@@u`) y descarta lo que no sea audio. La
+/// existencia en disco se comprueba al arrancar: aquí interesa que la función
+/// sea pura y fácil de probar.
+fn audio_paths_from_args(args: impl IntoIterator<Item = String>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for arg in args {
+        if arg.is_empty() || matches!(arg.as_str(), "--file-forwarding" | "@@" | "@@u") {
+            continue;
+        }
+        let path = if arg.starts_with("file:") {
+            match Url::parse(&arg).ok().and_then(|url| url.to_file_path().ok()) {
+                Some(path) => path,
+                None => continue,
+            }
+        } else if has_uri_scheme(&arg) {
+            continue;
+        } else {
+            PathBuf::from(&arg)
+        };
+        if is_audio_file(&path) && seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// Distingue `https://…` de una ruta con dos puntos en el nombre. Solo interesa
+/// descartar esquemas ajenos a `file:`, que ya se procesa antes.
+fn has_uri_scheme(arg: &str) -> bool {
+    let Some((scheme, _)) = arg.split_once(':') else {
+        return false;
+    };
+    scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
 fn open_audio_files(_window: Rid) -> Vec<PathBuf> {
     rfd::FileDialog::new()
         .set_title("Añadir pistas a la lista")
@@ -4043,17 +4087,11 @@ fn main() {
     }
 
     // Abrir archivos pasados como argumentos de línea de comandos
-    // (por ejemplo, al abrir un MP3 con "Abrir con Freeway Player")
-    let audio_args: Vec<PathBuf> = std::env::args()
-        .skip(1)
-        .filter_map(|arg| {
-            let path = PathBuf::from(arg);
-            if is_audio_file(&path) {
-                Some(path)
-            } else {
-                None
-            }
-        })
+    // (por ejemplo, al abrir un MP3 con "Abrir con Freeway Player").
+    // Flatpak entrega rutas del portal y algunos lanzadores URIs `file://`.
+    let audio_args: Vec<PathBuf> = audio_paths_from_args(std::env::args().skip(1))
+        .into_iter()
+        .filter(|path| path.is_file())
         .collect();
 
     if !audio_args.is_empty() {
@@ -4402,7 +4440,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_scroll_step, cover_dialog_directory, displayed_location_for,
+        audio_paths_from_args, auto_scroll_step, cover_dialog_directory, displayed_location_for,
         document_portal_host_path, drag_guide_y, drag_target, existing_directory, format_time,
         is_document_portal_path_in, next_track_index, play_starts_selected, previous_track_index,
         remap_index, repair_audio_file, repair_backup_path, tab_at, tab_close_hit, tab_drop_target,
@@ -4826,6 +4864,47 @@ mod tests {
     #[test]
     fn rejects_non_audio_data() {
         assert!(Decoder::try_from(Cursor::new(b"esto no es audio".to_vec())).is_err());
+    }
+
+    #[test]
+    fn accepts_plain_paths_and_uris_from_the_launcher() {
+        assert_eq!(
+            audio_paths_from_args([
+                "/tmp/a.flac".to_owned(),
+                "file:///tmp/Mi%20m%C3%BAsica/b.MP3".to_owned(),
+                "--file-forwarding".to_owned(),
+                "@@u".to_owned(),
+                "@@".to_owned(),
+            ]),
+            vec![
+                PathBuf::from("/tmp/a.flac"),
+                PathBuf::from("/tmp/Mi música/b.MP3"),
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_non_audio_and_non_file_arguments() {
+        assert!(audio_paths_from_args([
+            "/tmp/nota.txt".to_owned(),
+            "%U".to_owned(),
+            "https://example.com/a.mp3".to_owned(),
+            "file://servidor/a.mp3".to_owned(),
+            "--open".to_owned(),
+        ])
+        .is_empty());
+    }
+
+    #[test]
+    fn removes_duplicate_audio_arguments() {
+        assert_eq!(
+            audio_paths_from_args([
+                "/tmp/a.flac".to_owned(),
+                "file:///tmp/a.flac".to_owned(),
+                "/tmp/b.ogg".to_owned(),
+            ]),
+            vec![PathBuf::from("/tmp/a.flac"), PathBuf::from("/tmp/b.ogg")]
+        );
     }
 
     #[test]
