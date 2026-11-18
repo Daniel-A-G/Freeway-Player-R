@@ -230,6 +230,7 @@ struct PlayerState {
     duration: Option<Duration>,
     volume: f32,
     playing: bool,
+    stopped: bool,
     status: String,
     update_messages: Option<Receiver<updates::UpdateMessage>>,
     update_decision: Option<Sender<bool>>,
@@ -328,6 +329,7 @@ impl PlayerState {
             duration: None,
             volume: INITIAL_VOLUME,
             playing: false,
+            stopped: true,
             status,
             update_messages: None,
             update_decision: None,
@@ -517,6 +519,7 @@ impl PlayerState {
                 self.current_metadata = None;
                 self.duration = None;
                 self.playing = false;
+                self.stopped = true;
             } else if playlist > index {
                 self.current = Some((playlist - 1, track));
             }
@@ -642,6 +645,7 @@ impl PlayerState {
             self.current_metadata = None;
             self.duration = None;
             self.playing = false;
+            self.stopped = true;
         } else if let Some((current_playlist, current_track)) = self.current {
             if current_playlist == playlist_index && current_track > track_index {
                 self.current = Some((current_playlist, current_track - 1));
@@ -692,6 +696,7 @@ impl PlayerState {
         if start_playing {
             output.player.play();
         }
+        self.stopped = false;
 
         let playlist = &mut self.playlists[playlist_index];
         if playlist.order.len() != playlist.tracks.len() || !playlist.order.contains(&track_index) {
@@ -744,6 +749,14 @@ impl PlayerState {
             self.status = "No hay un dispositivo de salida de audio disponible".to_owned();
             return;
         }
+        if let Some(location) = self.selected_location() {
+            if play_starts_selected(self.current, Some(location)) {
+                if let Err(error) = self.play_track(location.0, location.1, true) {
+                    self.status = error;
+                }
+                return;
+            }
+        }
         if let Some((playlist, track)) = self.current {
             if playlist == self.active_playlist {
                 let empty = self
@@ -758,6 +771,7 @@ impl PlayerState {
                 } else {
                     self.output.as_ref().unwrap().player.play();
                     self.playing = true;
+                    self.stopped = false;
                     self.status = "Reproduciendo".to_owned();
                 }
                 return;
@@ -767,6 +781,9 @@ impl PlayerState {
     }
 
     fn pause(&mut self) {
+        if self.is_stopped() {
+            return;
+        }
         if let Some(output) = &self.output {
             output.player.pause();
             self.playing = false;
@@ -779,6 +796,7 @@ impl PlayerState {
             output.player.stop();
         }
         self.playing = false;
+        self.stopped = true;
         self.status = "Detenido".to_owned();
     }
 
@@ -895,6 +913,7 @@ impl PlayerState {
             }
         }
         self.playing = false;
+        self.stopped = true;
         self.status = last_error.unwrap_or_else(|| {
             if automatic {
                 "Reproducción finalizada".to_owned()
@@ -952,10 +971,34 @@ impl PlayerState {
     }
 
     fn position(&self) -> Duration {
+        if self.is_stopped() {
+            return Duration::ZERO;
+        }
         self.output
             .as_ref()
             .map(|output| output.player.get_pos())
             .unwrap_or_default()
+    }
+
+    /// Detenido no es lo mismo que en pausa: el reproductor se vacía y, desde
+    /// ahí, la app se comporta como recién abierta. `Player::stop()` de rodio
+    /// conserva la última posición interna, así que no se puede usar para
+    /// decidir esto por sí solo.
+    fn is_stopped(&self) -> bool {
+        if self.playing {
+            return false;
+        }
+        match &self.output {
+            Some(output) => self.stopped || output.player.empty(),
+            None => true,
+        }
+    }
+
+    /// Pista que alimentan la carátula y los textos inferiores. Detenido manda
+    /// la fila seleccionada (como al abrir la app); sonando o en pausa manda la
+    /// pista cargada en el reproductor.
+    fn displayed_location(&self) -> Option<(usize, usize)> {
+        displayed_location_for(self.is_stopped(), self.current, self.selected_location())
     }
 
     fn selected_location(&self) -> Option<(usize, usize)> {
@@ -1686,8 +1729,29 @@ fn cover_hint_for_location(state: &PlayerState, location: Option<(usize, usize)>
     }
 }
 
+fn displayed_location_for(
+    stopped: bool,
+    current: Option<(usize, usize)>,
+    selected: Option<(usize, usize)>,
+) -> Option<(usize, usize)> {
+    if stopped {
+        selected
+    } else {
+        current.or(selected)
+    }
+}
+
+/// Play arranca la pista seleccionada cuando es distinta de la cargada; si
+/// coinciden (o no hay selección) se reanuda/relanza la que ya está cargada.
+fn play_starts_selected(
+    current: Option<(usize, usize)>,
+    selected: Option<(usize, usize)>,
+) -> bool {
+    selected.is_some_and(|selected| current != Some(selected))
+}
+
 fn update_cover_art(state: &mut PlayerState, ui: Ui) {
-    let location = state.current.or_else(|| state.selected_location());
+    let location = state.displayed_location();
     let marker = location.and_then(|(playlist, track)| {
         state
             .playlists
@@ -2300,7 +2364,10 @@ fn refresh_ui(
         );
     }
 
-    if let Some(metadata) = &state.current_metadata {
+    if state.is_stopped() {
+        set_label(ui.now_title, "Ninguna pista");
+        set_label(ui.now_artist, "Abre una lista para empezar");
+    } else if let Some(metadata) = &state.current_metadata {
         set_label(ui.now_title, &metadata.title);
         set_label(
             ui.now_artist,
@@ -2316,13 +2383,15 @@ fn refresh_ui(
     }
     set_label(ui.status, &state.status);
     set_label(ui.elapsed, &format_time(state.position()));
-    set_label(
-        ui.total,
-        &state
+    let total = if state.is_stopped() {
+        "--:--".to_owned()
+    } else {
+        state
             .duration
             .map(format_time)
-            .unwrap_or_else(|| "--:--".to_owned()),
-    );
+            .unwrap_or_else(|| "--:--".to_owned())
+    };
+    set_label(ui.total, &total);
     set_label(
         ui.volume_value,
         &format!("{}%", (state.volume * 100.0).round() as u32),
@@ -2372,7 +2441,11 @@ fn refresh_ui(
         );
     }
 
-    let duration_seconds = state.duration.unwrap_or_default().as_secs_f32();
+    let duration_seconds = if state.is_stopped() {
+        0.0
+    } else {
+        state.duration.unwrap_or_default().as_secs_f32()
+    };
     let position = state.position().as_secs_f32();
     unsafe {
         Rslider_set_range(ui.seek, 0.0, duration_seconds.max(1.0));
@@ -4329,11 +4402,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_scroll_step, cover_dialog_directory, document_portal_host_path, drag_guide_y,
-        drag_target, existing_directory, format_time, is_document_portal_path_in, next_track_index,
-        previous_track_index, remap_index, repair_audio_file, repair_backup_path, tab_at,
-        tab_close_hit, tab_drop_target, tab_guide_x, tab_natural_width, tab_widths, track_row,
-        MetadataWriteError, SavedSettings, TabMetrics, TrackMetadata,
+        auto_scroll_step, cover_dialog_directory, displayed_location_for,
+        document_portal_host_path, drag_guide_y, drag_target, existing_directory, format_time,
+        is_document_portal_path_in, next_track_index, play_starts_selected, previous_track_index,
+        remap_index, repair_audio_file, repair_backup_path, tab_at, tab_close_hit, tab_drop_target,
+        tab_guide_x, tab_natural_width, tab_widths, track_row, MetadataWriteError, SavedSettings,
+        TabMetrics, TrackMetadata,
     };
     use rodio::{Decoder, Source};
     use std::io::Cursor;
@@ -4752,6 +4826,32 @@ mod tests {
     #[test]
     fn rejects_non_audio_data() {
         assert!(Decoder::try_from(Cursor::new(b"esto no es audio".to_vec())).is_err());
+    }
+
+    #[test]
+    fn stopped_state_shows_the_selected_track() {
+        assert_eq!(
+            displayed_location_for(true, Some((0, 4)), Some((0, 1))),
+            Some((0, 1))
+        );
+        assert_eq!(displayed_location_for(true, Some((0, 4)), None), None);
+    }
+
+    #[test]
+    fn playing_state_shows_the_loaded_track() {
+        assert_eq!(
+            displayed_location_for(false, Some((0, 4)), Some((0, 1))),
+            Some((0, 4))
+        );
+        assert_eq!(displayed_location_for(false, None, Some((0, 1))), Some((0, 1)));
+    }
+
+    #[test]
+    fn play_starts_selection_only_when_it_differs_from_the_loaded_track() {
+        assert!(play_starts_selected(Some((0, 2)), Some((0, 5))));
+        assert!(!play_starts_selected(Some((0, 2)), Some((0, 2))));
+        assert!(!play_starts_selected(Some((0, 2)), None));
+        assert!(!play_starts_selected(None, None));
     }
 
     fn silent_wav(sample_count: u32) -> Vec<u8> {
