@@ -19,7 +19,7 @@ Los bindings se incluyen en `vendor/raven-gui` desde la etiqueta `v0.2.1` de Rav
 - Reordenar pistas arrastrándolas dentro de la lista: una línea guía salta entre huecos para mostrar el destino, la lista se desplaza sola al arrastrar contra los bordes y la pista queda en el hueco indicado al soltar.
 - Reordenar las listas arrastrando sus pestañas: una guía vertical marca el hueco de destino y el nuevo orden se conserva entre sesiones.
 - Reproducir, pausar, detener, avanzar y retroceder por la lista activa con controles de iconos.
-- Activar aleatorio y repetición por lista; aleatorio recorre las pistas en un orden mezclado antes de iniciar un nuevo ciclo. Las opciones se guardan junto a cada lista.
+- Activar aleatorio y repetición por lista (icono de infinito); aleatorio recorre las pistas en un orden mezclado antes de iniciar un nuevo ciclo. Las opciones se guardan junto a cada lista.
 - Cambiar volumen y posición desde la barra de progreso, con tiempo transcurrido y duración.
 - Mostrar la carátula de la pista en reproducción, con un distintivo genérico si no hay imagen. El menú contextual de cada pista abre el editor de título, artista, álbum, género, número de pista y carátula; los cambios se incrustan en el archivo.
 - Reproducción automática de la siguiente pista.
@@ -78,11 +78,11 @@ En el equipo de destino se instala o actualiza con `flatpak install --user --bun
 
 ### Releases automáticos en GitHub
 
-El workflow `.github/workflows/flatpak-release.yml` compila un bundle x86_64 y crea un GitHub Release al publicar un tag `v*`. El tag debe coincidir con la versión de `Cargo.toml`; por ejemplo, para la versión `0.2.6`:
+El workflow `.github/workflows/flatpak-release.yml` compila un bundle x86_64 y crea un GitHub Release al publicar un tag `v*`. El tag debe coincidir con la versión de `Cargo.toml`; por ejemplo, para la versión `0.2.7`:
 
 ```sh
-git tag -a v0.2.6 -m "Freeway Player v0.2.6"
-git push origin main v0.2.6
+git tag -a v0.2.7 -m "Freeway Player v0.2.7"
+git push origin main v0.2.7
 ```
 
 Conviene subir `main` junto con el tag para que la rama remota quede alineada con el Release.
