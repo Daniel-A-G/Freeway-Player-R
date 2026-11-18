@@ -390,14 +390,13 @@ impl PlayerState {
         let message = self.update_messages.as_ref().map(Receiver::try_recv);
         match message {
             Some(Ok(updates::UpdateMessage::Available(tag))) => {
-                let title = cstr("Actualización disponible");
-                let text = cstr(&format!(
-                    "Se encontró una nueva versión ({tag}). ¿Quieres instalarla ahora?"
-                ));
-                let answer = unsafe {
-                    Rmessage_box(window, title.as_ptr(), text.as_ptr(), R_MESSAGE_YES_NO)
-                };
-                let should_install = answer == R_MESSAGE_RESULT_YES;
+                let should_install = confirm_dialog(
+                    window,
+                    "Actualización disponible",
+                    &format!("Se encontró una nueva versión ({tag}). ¿Quieres instalarla ahora?"),
+                    "Instalar",
+                    "Más tarde",
+                );
                 if let Some(decision) = self.update_decision.as_ref() {
                     let _ = decision.send(should_install);
                 }
@@ -1452,21 +1451,104 @@ fn repair_audio_file(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn ask_repair_confirmation(window: Rid, error: &str) -> bool {
-    let title = cstr("Archivo dañado");
-    let text = cstr(&format!(
-        "No se pudieron guardar los metadatos: {error}\n\n\
-         ¿Quieres intentar reparar el archivo con ffmpeg? Se guardará una copia del original \
-         por si necesitas restaurarlo después."
-    ));
-    let answer = unsafe {
-        Rmessage_box(
-            window,
-            title.as_ptr(),
-            text.as_ptr(),
-            R_MESSAGE_YES_NO,
-        )
-    };
-    answer == R_MESSAGE_RESULT_YES
+    confirm_dialog(
+        window,
+        "Archivo dañado",
+        &format!(
+            "No se pudieron guardar los metadatos: {error}\n\n\
+             ¿Quieres intentar reparar el archivo con ffmpeg? Se guardará una copia del original \
+             por si necesitas restaurarlo después."
+        ),
+        "Reparar",
+        "Cancelar",
+    )
+}
+
+/// Aplica un atributo de Raven desde texto cómodo de usar.
+fn dialog_attribute(widget: Rid, name: &str, value: &str) {
+    let name = cstr(name);
+    let value = cstr(value);
+    unsafe { Rwidget_set_attribute(widget, name.as_ptr(), value.as_ptr()) };
+}
+
+/// Cierra el diálogo con el resultado guardado en `user_data` (0 o 1).
+unsafe extern "C" fn close_dialog_with_result(button: Rid, user_data: *mut c_void) {
+    Rdialog_close(button, user_data as isize as c_int);
+}
+
+/// Enter responde lo mismo que el botón principal, como en `Rmessage_box`.
+unsafe extern "C" fn confirm_dialog_key(
+    widget: Rid,
+    event: *const REvent,
+    _user_data: *mut c_void,
+) -> c_int {
+    let event = &*event;
+    if event.type_ != R_EVENT_KEY_DOWN
+        || (event.key != R_KEY_ENTER && event.key != R_KEY_KP_ENTER)
+    {
+        return 0;
+    }
+    Rdialog_close(widget, 1);
+    1
+}
+
+/// Diálogo de confirmación con botones en español.
+///
+/// `Rmessage_box` escribe «Yes»/«No» fijos en inglés (Raven 0.2.1), así que
+/// este diálogo reproduce su estructura con las etiquetas que le pasamos.
+/// Se cierra con Escape (respuesta 0) o con el botón de confirmar (respuesta 1).
+fn confirm_dialog(
+    window: Rid,
+    title: &str,
+    text: &str,
+    confirm_label: &str,
+    cancel_label: &str,
+) -> bool {
+    unsafe {
+        let dialog = Rwidget_create(R_WIDGET_VBOX);
+        Rwidget_set_size(dialog, 380.0, -1.0);
+        Rwidget_set_event_callback(dialog, Some(confirm_dialog_key), std::ptr::null_mut());
+        dialog_attribute(dialog, "Spacing", "12");
+
+        if !title.is_empty() {
+            let heading = Rwidget_create(R_WIDGET_LABEL);
+            dialog_attribute(heading, "Text", title);
+            dialog_attribute(heading, "TextSize", "17");
+            Rwidget_add_child(dialog, heading);
+        }
+
+        let message = Rwidget_create(R_WIDGET_LABEL);
+        dialog_attribute(message, "Text", text);
+        dialog_attribute(message, "Wrap", "true");
+        Rwidget_set_opacity(message, if title.is_empty() { 1.0 } else { 0.8 });
+        Rwidget_add_child(dialog, message);
+
+        let row = Rwidget_create(R_WIDGET_HBOX);
+        dialog_attribute(row, "Spacing", "8");
+        Rslot_set_halign(row, R_HALIGN_RIGHT);
+        Rslot_set_padding(row, 0.0, 6.0, 0.0, 0.0);
+        Rwidget_add_child(dialog, row);
+
+        for (label, primary, result) in [
+            (cancel_label, false, 0),
+            (confirm_label, true, 1),
+        ] {
+            let button = Rwidget_create(R_WIDGET_BUTTON);
+            dialog_attribute(button, "Text", label);
+            if primary {
+                dialog_attribute(button, "Style", "Primary");
+            }
+            Rwidget_set_min_size(button, 84.0, -1.0);
+            Rbutton_set_clicked_callback(
+                button,
+                Some(close_dialog_with_result),
+                result as isize as *mut c_void,
+            );
+            Rwidget_add_child(row, button);
+        }
+
+        Rdialog_run(window, dialog) != 0
+    }
 }
 
 fn read_track_metadata(path: &Path) -> TrackMetadata {
