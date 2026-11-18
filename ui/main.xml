@@ -66,37 +66,50 @@
                         </VBox>
                     </HBox>
                     <Separator Slot.Padding="0,2,0,4"/>
-                    <VBox Spacing="5">
-                        <Label Text="TÍTULO" TextSize="10" Color.Text="#8F8999"/>
-                        <TextInput Name="meta-title" Placeholder="Título de la pista"/>
-                    </VBox>
-                    <VBox Spacing="5">
-                        <Label Text="ARTISTA" TextSize="10" Color.Text="#8F8999"/>
-                        <TextInput Name="meta-artist" Placeholder="Artista"/>
-                    </VBox>
-                    <VBox Spacing="5">
-                        <Label Text="ÁLBUM" TextSize="10" Color.Text="#8F8999"/>
-                        <TextInput Name="meta-album" Placeholder="Álbum"/>
-                    </VBox>
-                    <HBox Spacing="10">
-                        <VBox Spacing="5" Slot.Fill="1">
-                            <Label Text="GÉNERO" TextSize="10" Color.Text="#8F8999"/>
-                            <TextInput Name="meta-genre" Placeholder="Género"/>
+                    <ScrollBox Slot.Fill="1">
+                        <VBox Spacing="10">
+                            <VBox Spacing="5">
+                                <Label Text="TÍTULO" TextSize="10" Color.Text="#8F8999"/>
+                                <TextInput Name="meta-title" Placeholder="Título de la pista"/>
+                            </VBox>
+                            <VBox Spacing="5">
+                                <Label Text="ARTISTA" TextSize="10" Color.Text="#8F8999"/>
+                                <TextInput Name="meta-artist" Placeholder="Artista"/>
+                            </VBox>
+                            <VBox Spacing="5">
+                                <Label Text="ÁLBUM" TextSize="10" Color.Text="#8F8999"/>
+                                <TextInput Name="meta-album" Placeholder="Álbum"/>
+                            </VBox>
+                            <HBox Spacing="10">
+                                <VBox Spacing="5" Slot.Fill="1">
+                                    <Label Text="GÉNERO" TextSize="10" Color.Text="#8F8999"/>
+                                    <TextInput Name="meta-genre" Placeholder="Género"/>
+                                </VBox>
+                                <VBox Spacing="5" Width="84">
+                                    <Label Text="PISTA Nº" TextSize="10" Color.Text="#8F8999"/>
+                                    <TextInput Name="meta-track" Placeholder="—"/>
+                                </VBox>
+                            </HBox>
+                            <VBox Spacing="5">
+                                <Label Text="CARÁTULA" TextSize="10" Color.Text="#8F8999"/>
+                                <HBox Spacing="8">
+                                    <Button Text="Elegir imagen…" Style="Flat" OnClicked="player.choose_cover"/>
+                                    <Button Text="Quitar" Style="Flat" Tooltip="Quitar la carátula incrustada" OnClicked="player.remove_cover"/>
+                                </HBox>
+                                <Label Name="cover-status" Text="Este archivo no tiene carátula" TextSize="10" Color.Text="#8F8999" Wrap="true"/>
+                            </VBox>
                         </VBox>
-                        <VBox Spacing="5" Width="84">
-                            <Label Text="PISTA Nº" TextSize="10" Color.Text="#8F8999"/>
-                            <TextInput Name="meta-track" Placeholder="—"/>
-                        </VBox>
+                    </ScrollBox>
+                    <HBox Name="repair-actions" Spacing="6" Visibility="Collapsed">
+                        <Label Text="⚠" TextSize="13" Color.Text="#E6B36A" Slot.VAlign="Center"/>
+                        <Label Text="Archivo reparado pendiente" TextSize="10" Color.Text="#E6B36A" Slot.VAlign="Center" Slot.Fill="1" Wrap="true"/>
+                        <Button Name="restore-file" Style="Flat" Tooltip="Restaurar el archivo original y descartar la reparación" OnClicked="player.restore_file">
+                            <Image Name="restore-icon" Width="18" Height="18" TintText="true"/>
+                        </Button>
+                        <Button Name="confirm-repair" Style="Flat" Tooltip="Convertir esta versión reparada en definitiva" OnClicked="player.confirm_repair">
+                            <Image Name="confirm-icon" Width="18" Height="18" TintText="true"/>
+                        </Button>
                     </HBox>
-                    <VBox Spacing="5">
-                        <Label Text="CARÁTULA" TextSize="10" Color.Text="#8F8999"/>
-                        <HBox Spacing="8">
-                            <Button Text="Elegir imagen…" Style="Flat" OnClicked="player.choose_cover"/>
-                            <Button Text="Quitar" Style="Flat" Tooltip="Quitar la carátula incrustada" OnClicked="player.remove_cover"/>
-                        </HBox>
-                        <Label Name="cover-status" Text="Este archivo no tiene carátula" TextSize="10" Color.Text="#8F8999" Wrap="true"/>
-                    </VBox>
-                    <Spacer Slot.Fill="1"/>
                     <Button Text="✓  Guardar cambios" Style="Primary" OnClicked="player.save_metadata"/>
                     <Label Name="metadata-hint" Text="Selecciona una pista para editar sus etiquetas" TextSize="11" Color.Text="#8F8999" Wrap="true"/>
                 </VBox>

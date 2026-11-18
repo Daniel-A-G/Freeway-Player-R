@@ -6,11 +6,15 @@ use raven::*;
 use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::{hash_map::RandomState, HashSet};
+use std::collections::{
+    hash_map::{DefaultHasher, RandomState},
+    HashSet,
+};
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::fs::{self, File};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
@@ -27,6 +31,8 @@ const ACTION_ICONS_PNG: &[u8] = include_bytes!("../data/action-icons.png");
 const SYMBOLS_2_FONT: &[u8] = include_bytes!("../data/fonts/NotoSansSymbols2-Regular.ttf");
 const SYMBOLS_FONT: &[u8] = include_bytes!("../data/fonts/NotoSansSymbols-Regular.ttf");
 const INITIAL_VOLUME: f32 = 0.8;
+const PENDING_REPAIR_HINT: &str =
+    "Archivo reparado. Restaura el original o confirma esta versión para cerrar el aviso.";
 
 struct AudioOutput {
     player: Player,
@@ -69,6 +75,41 @@ struct PlaylistStore {
     active_playlist: usize,
 }
 
+/// Reparación todavía sin resolver: el archivo ya es la versión reparada y la
+/// copia del original espera en la caché del programa.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PendingRepair {
+    path: PathBuf,
+    backup: PathBuf,
+}
+
+/// Error al escribir etiquetas. Solo los fallos al leer o escribir el audio
+/// permiten ofrecer una reparación; los de validación no tocan el archivo.
+#[derive(Clone, Debug)]
+enum MetadataWriteError {
+    Validation(String),
+    Read(String),
+    Write(String),
+}
+
+impl MetadataWriteError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Validation(message) | Self::Read(message) | Self::Write(message) => message,
+        }
+    }
+
+    fn can_repair(&self) -> bool {
+        matches!(self, Self::Read(_) | Self::Write(_))
+    }
+}
+
+impl std::fmt::Display for MetadataWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
 struct Playlist {
     name: String,
     tracks: Vec<PathBuf>,
@@ -85,6 +126,7 @@ struct Playlist {
 struct TrackListRows {
     tracks: Vec<PathBuf>,
     text: Vec<Option<CString>>,
+    pending_repairs: HashSet<PathBuf>,
 }
 
 impl Playlist {
@@ -195,6 +237,7 @@ struct PlayerState {
     track_list_widget: Rid,
     playlist_tabs_widget: Rid,
     last_cover_dir: Option<PathBuf>,
+    pending_repairs: Vec<PendingRepair>,
     drag: DragState,
     tab_drag: TabDragState,
 }
@@ -291,6 +334,7 @@ impl PlayerState {
             track_list_widget: R_INVALID_ID,
             playlist_tabs_widget: R_INVALID_ID,
             last_cover_dir: None,
+            pending_repairs: load_pending_repairs(),
             drag: DragState::Idle,
             tab_drag: TabDragState::Idle,
         }
@@ -913,7 +957,12 @@ impl PlayerState {
             .map(|track| (self.active_playlist, track))
     }
 
-    fn save_metadata(&mut self, location: (usize, usize), metadata: TrackMetadata) {
+    fn save_metadata(
+        &mut self,
+        window: Rid,
+        location: (usize, usize),
+        metadata: TrackMetadata,
+    ) {
         let Some(path) = self
             .playlists
             .get(location.0)
@@ -944,7 +993,22 @@ impl PlayerState {
             .filter(|(pending_location, _)| *pending_location == location)
             .map(|(_, change)| change.clone());
         let cover_was_changed = cover_change.is_some();
-        let save_result = write_track_metadata(&path, &metadata, cover_change);
+
+        let mut repaired = false;
+        let mut repair_warning = None;
+        let mut save_error = None;
+        match write_track_metadata(&path, &metadata, cover_change.clone()) {
+            Ok(()) => {}
+            Err(error) if error.can_repair() && ask_repair_confirmation(window, error.message()) => {
+                repaired = true;
+                match self.repair_track(&path, &metadata, cover_change) {
+                    Ok(warning) => repair_warning = warning,
+                    Err(error) => save_error = Some(error),
+                }
+            }
+            Err(error) => save_error = Some(error.message().to_owned()),
+        }
+
         let restore_result = if was_current {
             self.play_track(location.0, location.1, was_playing)
                 .and_then(|()| {
@@ -963,9 +1027,11 @@ impl PlayerState {
             Ok(())
         };
 
-        match (save_result, restore_result) {
-            (Ok(()), Ok(())) => {
-                self.playlists[location.0].revision += 1;
+        match (save_error, restore_result) {
+            (None, Ok(())) => {
+                if !repaired {
+                    self.playlists[location.0].revision += 1;
+                }
                 if self.current == Some(location) {
                     self.current_metadata = Some(metadata);
                 }
@@ -973,17 +1039,242 @@ impl PlayerState {
                 if cover_was_changed {
                     self.cover_hint = "Carátula guardada".to_owned();
                 }
-                self.metadata_hint = "Etiquetas guardadas en el archivo".to_owned();
-                self.status = "Metadatos guardados".to_owned();
+                if let Some(warning) = repair_warning {
+                    self.metadata_hint = warning;
+                    self.status = "Archivo reparado; copia original guardada".to_owned();
+                } else if repaired || self.is_pending_repair(&path) {
+                    self.metadata_hint = PENDING_REPAIR_HINT.to_owned();
+                    self.status = if repaired {
+                        "Archivo reparado; copia original guardada".to_owned()
+                    } else {
+                        "Metadatos guardados".to_owned()
+                    };
+                } else {
+                    self.metadata_hint = "Etiquetas guardadas en el archivo".to_owned();
+                    self.status = "Metadatos guardados".to_owned();
+                }
             }
+            (None, Err(error)) => {
+                self.metadata_hint = repair_warning
+                    .unwrap_or_else(|| "Etiquetas guardadas; revisa la reproducción".to_owned());
+                self.status = error;
+            }
+            (Some(error), _) => {
+                self.metadata_hint = error.clone();
+                self.status = error;
+            }
+        }
+    }
+
+    fn repair_track(
+        &mut self,
+        path: &Path,
+        metadata: &TrackMetadata,
+        cover_change: Option<CoverChange>,
+    ) -> Result<Option<String>, String> {
+        let existing_backup = self
+            .pending_repair_for(path)
+            .map(|pending| pending.backup.clone());
+        let backup = match existing_backup {
+            Some(backup) => backup,
+            None => {
+                let backup = repair_backup_path(path);
+                if let Some(parent) = backup.parent() {
+                    fs::create_dir_all(parent).map_err(|error| {
+                        format!("No se pudo crear la carpeta de reparaciones: {error}")
+                    })?;
+                }
+                fs::copy(path, &backup).map_err(|error| {
+                    format!("No se pudo guardar una copia del original: {error}")
+                })?;
+                backup
+            }
+        };
+
+        let temporary = match repair_audio_file(path) {
+            Ok(temporary) => temporary,
+            Err(error) => {
+                if self.pending_repair_for(path).is_none() {
+                    let _ = fs::remove_file(&backup);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = fs::rename(&temporary, path) {
+            let _ = fs::remove_file(&temporary);
+            if self.pending_repair_for(path).is_none() {
+                let _ = fs::remove_file(&backup);
+            }
+            return Err(format!(
+                "No se pudo sustituir el archivo original: {error}"
+            ));
+        }
+
+        let warning = write_track_metadata(path, metadata, cover_change)
+            .err()
+            .map(|error| {
+                format!(
+                    "El archivo se reparó, pero no se pudieron reaplicar los metadatos: {}",
+                    error.message()
+                )
+            });
+
+        if self.pending_repair_for(path).is_none() {
+            self.pending_repairs.push(PendingRepair {
+                path: path.to_path_buf(),
+                backup,
+            });
+            self.save_pending_repairs();
+        }
+        self.bump_playlists_for(path);
+        let is_current = self
+            .current
+            .and_then(|location| self.path_at(location))
+            .is_some_and(|current| current == path);
+        if is_current {
+            self.current_metadata = Some(read_track_metadata(path));
+            self.cover_rendered_for = None;
+        }
+        Ok(warning)
+    }
+
+    fn restore_repair(&mut self, location: (usize, usize)) {
+        let Some(path) = self.path_at(location).map(Path::to_path_buf) else {
+            self.status = "La pista seleccionada ya no está disponible".to_owned();
+            return;
+        };
+        let Some(pending) = self.pending_repair_for(&path).cloned() else {
+            self.status = "Esta pista no tiene una reparación pendiente".to_owned();
+            return;
+        };
+
+        let was_current = self.current == Some(location);
+        let was_playing = self.playing;
+        let position = if was_current {
+            self.position()
+        } else {
+            Duration::ZERO
+        };
+        if was_current {
+            if let Some(output) = &self.output {
+                output.player.stop();
+            }
+            self.playing = false;
+        }
+
+        let restored = fs::copy(&pending.backup, &path)
+            .map(|_| ())
+            .map_err(|error| format!("No se pudo restaurar el archivo original: {error}"));
+        if restored.is_ok() {
+            let _ = fs::remove_file(&pending.backup);
+            self.pending_repairs.retain(|entry| entry.path != path);
+            self.save_pending_repairs();
+            self.bump_playlists_for(&path);
+            if self.current == Some(location) {
+                self.current_metadata = Some(read_track_metadata(&path));
+                self.cover_rendered_for = None;
+            }
+            if self
+                .pending_cover
+                .as_ref()
+                .is_some_and(|(pending_location, _)| *pending_location == location)
+            {
+                self.pending_cover = None;
+            }
+            self.editor_loaded_for = None;
+        }
+
+        let resumed = if was_current {
+            self.play_track(location.0, location.1, was_playing)
+                .and_then(|()| {
+                    if position.is_zero() {
+                        Ok(())
+                    } else {
+                        self.output
+                            .as_ref()
+                            .ok_or_else(|| "No hay una salida de audio disponible".to_owned())?
+                            .player
+                            .try_seek(position)
+                            .map_err(|error| format!("No se pudo restaurar la posición: {error}"))
+                    }
+                })
+        } else {
+            Ok(())
+        };
+
+        match (restored, resumed) {
+            (Ok(()), Ok(())) => {
+                self.metadata_hint = "Archivo original restaurado".to_owned();
+                self.status = "Archivo original restaurado".to_owned();
+            }
+            (Ok(()), Err(error)) => self.status = error,
             (Err(error), _) => {
                 self.metadata_hint = error.clone();
                 self.status = error;
             }
-            (Ok(()), Err(error)) => {
-                self.metadata_hint = "Etiquetas guardadas; revisa la reproducción".to_owned();
-                self.status = error;
+        }
+    }
+
+    fn confirm_repair(&mut self, location: (usize, usize)) {
+        let Some(path) = self.path_at(location).map(Path::to_path_buf) else {
+            self.status = "La pista seleccionada ya no está disponible".to_owned();
+            return;
+        };
+        let Some(pending) = self.pending_repair_for(&path).cloned() else {
+            self.status = "Esta pista no tiene una reparación pendiente".to_owned();
+            return;
+        };
+
+        let _ = fs::remove_file(&pending.backup);
+        self.pending_repairs.retain(|entry| entry.path != path);
+        self.save_pending_repairs();
+        self.bump_playlists_for(&path);
+        self.editor_loaded_for = None;
+        self.metadata_hint = "Versión reparada confirmada como definitiva".to_owned();
+        self.status = "Versión reparada confirmada".to_owned();
+    }
+
+    fn path_at(&self, location: (usize, usize)) -> Option<&Path> {
+        self.playlists
+            .get(location.0)?
+            .tracks
+            .get(location.1)
+            .map(PathBuf::as_path)
+    }
+
+    fn pending_repair_for(&self, path: &Path) -> Option<&PendingRepair> {
+        self.pending_repairs
+            .iter()
+            .find(|pending| pending.path == path)
+    }
+
+    fn is_pending_repair(&self, path: &Path) -> bool {
+        self.pending_repair_for(path).is_some()
+    }
+
+    fn bump_playlists_for(&mut self, path: &Path) {
+        for playlist in &mut self.playlists {
+            if playlist.tracks.iter().any(|track| track == path) {
+                playlist.revision += 1;
             }
+        }
+    }
+
+    fn save_pending_repairs(&mut self) {
+        let path = repairs_store_path();
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let result = (|| -> Result<(), String> {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            let temporary = path.with_extension("json.tmp");
+            let file = File::create(&temporary).map_err(|error| error.to_string())?;
+            serde_json::to_writer_pretty(file, &self.pending_repairs)
+                .map_err(|error| error.to_string())?;
+            fs::rename(&temporary, &path).map_err(|error| error.to_string())
+        })();
+        if let Err(error) = result {
+            self.status = format!("No se pudo guardar el estado de las reparaciones: {error}");
         }
     }
 
@@ -1057,6 +1348,125 @@ fn load_playlists() -> (Vec<SavedPlaylist>, usize) {
         return (Vec::new(), 0);
     };
     (store.playlists, store.active_playlist)
+}
+
+fn cache_dir() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|path| !path.is_empty())
+                .map(|home| PathBuf::from(home).join(".cache"))
+        })
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn repairs_dir() -> PathBuf {
+    cache_dir().join("freeway-player").join("repairs")
+}
+
+fn repairs_store_path() -> PathBuf {
+    cache_dir().join("freeway-player").join("repairs.json")
+}
+
+fn load_pending_repairs() -> Vec<PendingRepair> {
+    let Ok(file) = File::open(repairs_store_path()) else {
+        return Vec::new();
+    };
+    let Ok(entries) = serde_json::from_reader::<_, Vec<PendingRepair>>(file) else {
+        return Vec::new();
+    };
+    entries
+        .into_iter()
+        .filter(|pending| pending.backup.is_file())
+        .collect()
+}
+
+/// Nombre estable en la caché para la copia del original. El hash evita que
+/// dos archivos con el mismo nombre en carpetas distintas compartan copia.
+fn repair_backup_path(path: &Path) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "audio".to_owned());
+    repairs_dir().join(format!("{:016x}-{name}", hasher.finish()))
+}
+
+/// Remuxa el archivo a un temporal junto al original. `-c copy` no recodifica,
+/// así que la reparación es rápida y conserva la calidad y los metadatos.
+fn repair_audio_file(path: &Path) -> Result<PathBuf, String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("audio");
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .ok_or_else(|| {
+            "El archivo no tiene una extensión que ffmpeg pueda reconocer".to_owned()
+        })?;
+    let temporary = parent.join(format!(".{stem}.freeway-repair.{extension}"));
+    let _ = fs::remove_file(&temporary);
+
+    let output = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-i")
+        .arg(path)
+        .arg("-c")
+        .arg("copy")
+        .arg("-map_metadata")
+        .arg("0")
+        .arg(&temporary)
+        .output()
+        .map_err(|error| {
+            format!("No se pudo ejecutar ffmpeg: {error}. Comprueba que está instalado.")
+        })?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&temporary);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        return Err(if detail.is_empty() {
+            "ffmpeg no pudo reparar el archivo".to_owned()
+        } else {
+            format!("ffmpeg no pudo reparar el archivo: {detail}")
+        });
+    }
+
+    let metadata = fs::metadata(&temporary)
+        .map_err(|error| format!("No se pudo comprobar el archivo reparado: {error}"))?;
+    if metadata.len() == 0 {
+        let _ = fs::remove_file(&temporary);
+        return Err("ffmpeg generó un archivo vacío".to_owned());
+    }
+    if let Ok(original) = fs::metadata(path) {
+        let _ = fs::set_permissions(&temporary, original.permissions());
+    }
+    Ok(temporary)
+}
+
+fn ask_repair_confirmation(window: Rid, error: &str) -> bool {
+    let title = cstr("Archivo dañado");
+    let text = cstr(&format!(
+        "No se pudieron guardar los metadatos: {error}\n\n\
+         ¿Quieres intentar reparar el archivo con ffmpeg? Se guardará una copia del original \
+         por si necesitas restaurarlo después."
+    ));
+    let answer = unsafe {
+        Rmessage_box(
+            window,
+            title.as_ptr(),
+            text.as_ptr(),
+            R_MESSAGE_YES_NO,
+        )
+    };
+    answer == R_MESSAGE_RESULT_YES
 }
 
 fn read_track_metadata(path: &Path) -> TrackMetadata {
@@ -1182,7 +1592,8 @@ fn write_track_metadata(
     path: &Path,
     metadata: &TrackMetadata,
     cover_change: Option<CoverChange>,
-) -> Result<(), String> {
+) -> Result<(), MetadataWriteError> {
+    let validation = |message: String| MetadataWriteError::Validation(message);
     let track_number = if metadata.track.trim().is_empty() {
         None
     } else {
@@ -1190,24 +1601,29 @@ fn write_track_metadata(
             .track
             .trim()
             .parse::<u32>()
-            .map_err(|_| "El número de pista debe ser un entero positivo".to_owned())?;
+            .map_err(|_| validation("El número de pista debe ser un entero positivo".to_owned()))?;
         if number == 0 {
-            return Err("El número de pista debe ser mayor que cero".to_owned());
+            return Err(validation(
+                "El número de pista debe ser mayor que cero".to_owned(),
+            ));
         }
         Some(number)
     };
-    let mut file = lofty::read_from_path(path)
-        .map_err(|error| format!("No se pudieron leer los metadatos: {error}"))?;
+    let mut file = lofty::read_from_path(path).map_err(|error| {
+        MetadataWriteError::Read(format!("No se pudieron leer los metadatos: {error}"))
+    })?;
     let tag_type = file.primary_tag_type();
     if !file.tag_support(tag_type).is_writable() {
-        return Err("Este formato no admite escribir metadatos".to_owned());
+        return Err(validation(
+            "Este formato no admite escribir metadatos".to_owned(),
+        ));
     }
     if file.primary_tag().is_none() {
         file.insert_tag(Tag::new(tag_type));
     }
-    let tag = file
-        .primary_tag_mut()
-        .ok_or_else(|| "No se pudo crear la etiqueta del archivo".to_owned())?;
+    let tag = file.primary_tag_mut().ok_or_else(|| {
+        validation("No se pudo crear la etiqueta del archivo".to_owned())
+    })?;
 
     if metadata.title.trim().is_empty() {
         tag.remove_title();
@@ -1235,21 +1651,22 @@ fn write_track_metadata(
     }
     match cover_change {
         Some(CoverChange::Replace(image_path)) => {
-            let image_data = fs::read(&image_path)
-                .map_err(|error| format!("No se pudo abrir la carátula: {error}"))?;
+            let image_data = fs::read(&image_path).map_err(|error| {
+                validation(format!("No se pudo abrir la carátula: {error}"))
+            })?;
             
             let picture = if image_path.extension().and_then(|e| e.to_str()) == Some("webp") {
                 // WebP no es soportado por lofy, convertir a PNG
                 let img = image::load_from_memory(&image_data)
-                    .map_err(|error| format!("La imagen no es compatible: {error}"))?;
+                    .map_err(|error| validation(format!("La imagen no es compatible: {error}")))?;
                 let mut png_buffer = Vec::new();
                 img.write_to(&mut std::io::Cursor::new(&mut png_buffer), image::ImageFormat::Png)
-                    .map_err(|error| format!("No se pudo convertir la imagen: {error}"))?;
+                    .map_err(|error| validation(format!("No se pudo convertir la imagen: {error}")))?;
                 Picture::unchecked(png_buffer).mime_type(MimeType::Png).build()
             } else {
                 let mut image_file = std::io::Cursor::new(&image_data);
                 Picture::from_reader(&mut image_file)
-                    .map_err(|error| format!("La imagen no es compatible: {error}"))?
+                    .map_err(|error| validation(format!("La imagen no es compatible: {error}")))?
             };
             
             let mut picture = picture;
@@ -1272,7 +1689,11 @@ fn write_track_metadata(
         None => {}
     }
     file.save_to_path(path, WriteOptions::default())
-        .map_err(|error| format!("No se pudieron guardar los metadatos: {error}"))
+        .map_err(|error| {
+            MetadataWriteError::Write(format!(
+                "No se pudieron guardar los metadatos: {error}"
+            ))
+        })
 }
 
 fn create_audio_output() -> Result<AudioOutput, String> {
@@ -1331,6 +1752,9 @@ struct Ui {
     repeat_icon: Rid,
     import_icon: Rid,
     export_icon: Rid,
+    repair_actions: Rid,
+    restore_icon: Rid,
+    confirm_icon: Rid,
     volume_value: Rid,
     meta_title: Rid,
     meta_artist: Rid,
@@ -1364,6 +1788,9 @@ impl Ui {
             repeat_icon: widget_find(window, "repeat-icon"),
             import_icon: widget_find(window, "import-icon"),
             export_icon: widget_find(window, "export-icon"),
+            repair_actions: widget_find(window, "repair-actions"),
+            restore_icon: widget_find(window, "restore-icon"),
+            confirm_icon: widget_find(window, "confirm-icon"),
             volume_value: widget_find(window, "volume-value"),
             meta_title: widget_find(window, "meta-title"),
             meta_artist: widget_find(window, "meta-artist"),
@@ -1414,16 +1841,18 @@ fn load_action_icons(ui: Ui) -> Rid {
         Rtexture_create(ACTION_ICONS_PNG.as_ptr().cast(), ACTION_ICONS_PNG.len())
     };
     if texture == R_INVALID_ID {
-        eprintln!("No se pudieron cargar los iconos de aleatorio y repetición");
+        eprintln!("No se pudieron cargar los iconos de acciones");
         return R_INVALID_ID;
     }
 
     unsafe {
         for (image, min_u, max_u) in [
-            (ui.shuffle_icon, 0.0, 0.25),
-            (ui.repeat_icon, 0.25, 0.5),
-            (ui.import_icon, 0.5, 0.75),
-            (ui.export_icon, 0.75, 1.0),
+            (ui.shuffle_icon, 0.0, 1.0 / 6.0),
+            (ui.repeat_icon, 1.0 / 6.0, 2.0 / 6.0),
+            (ui.import_icon, 2.0 / 6.0, 3.0 / 6.0),
+            (ui.export_icon, 3.0 / 6.0, 4.0 / 6.0),
+            (ui.restore_icon, 4.0 / 6.0, 5.0 / 6.0),
+            (ui.confirm_icon, 5.0 / 6.0, 1.0),
         ] {
             if image != R_INVALID_ID {
                 Rimage_set_texture(image, texture);
@@ -1528,7 +1957,7 @@ fn previous_track_index(current: Option<usize>, playlist_len: usize) -> Option<u
     }))
 }
 
-fn track_row(metadata: &TrackMetadata, index: usize) -> String {
+fn track_row(metadata: &TrackMetadata, index: usize, pending_repair: bool) -> String {
     let duration = metadata
         .duration
         .map(format_time)
@@ -1538,8 +1967,9 @@ fn track_row(metadata: &TrackMetadata, index: usize) -> String {
     } else {
         metadata.artist.as_str()
     };
+    let marker = if pending_repair { "⚠" } else { " " };
     format!(
-        "{:02}   {}  ·  {}     {}",
+        "{:02} {marker} {}  ·  {}     {}",
         index + 1,
         metadata.title,
         artist,
@@ -1568,7 +1998,8 @@ unsafe extern "C" fn track_list_row_text(
 
     if rows.text[index].is_none() {
         let metadata = read_track_metadata(&rows.tracks[index]);
-        rows.text[index] = Some(cstr(&track_row(&metadata, index)));
+        let pending_repair = rows.pending_repairs.contains(&rows.tracks[index]);
+        rows.text[index] = Some(cstr(&track_row(&metadata, index, pending_repair)));
     }
     rows.text[index]
         .as_ref()
@@ -1581,6 +2012,11 @@ fn update_track_list(
     ui: Ui,
     row_cache: &RefCell<TrackListRows>,
 ) {
+    let pending_repairs: HashSet<PathBuf> = state
+        .pending_repairs
+        .iter()
+        .map(|pending| pending.path.clone())
+        .collect();
     let Some(playlist) = state.playlists.get(state.active_playlist) else {
         return;
     };
@@ -1598,6 +2034,7 @@ fn update_track_list(
         rows.tracks = tracks;
         rows.text.clear();
         rows.text.resize_with(track_count, || None);
+        rows.pending_repairs = pending_repairs;
     }
 
     let user_data = row_cache as *const RefCell<TrackListRows> as *mut c_void;
@@ -1666,16 +2103,24 @@ fn update_metadata_editor(state: &mut PlayerState, ui: Ui) {
         state.pending_cover = None;
     }
     state.editor_loaded_for = location;
-    let metadata = location
+    let path = location
         .and_then(|(playlist, track)| state.playlists.get(playlist)?.tracks.get(track))
-        .map(|path| read_track_metadata(path));
+        .cloned();
+    let metadata = path.as_deref().map(read_track_metadata);
     if let Some(metadata) = metadata {
         set_input(ui.meta_title, &metadata.title);
         set_input(ui.meta_artist, &metadata.artist);
         set_input(ui.meta_album, &metadata.album);
         set_input(ui.meta_genre, &metadata.genre);
         set_input(ui.meta_track, &metadata.track);
-        state.metadata_hint = "Los cambios se escriben en el archivo de audio".to_owned();
+        state.metadata_hint = if path
+            .as_deref()
+            .is_some_and(|path| state.is_pending_repair(path))
+        {
+            PENDING_REPAIR_HINT.to_owned()
+        } else {
+            "Los cambios se escriben en el archivo de audio".to_owned()
+        };
         state.cover_hint = cover_hint_for_location(state, location);
     } else {
         set_input(ui.meta_title, "");
@@ -1702,6 +2147,21 @@ fn refresh_ui(
     update_track_list(state, ui, row_cache);
     update_metadata_editor(state, ui);
     update_cover_art(state, ui);
+
+    let pending_repair = state
+        .editor_loaded_for
+        .and_then(|location| state.path_at(location))
+        .is_some_and(|path| state.is_pending_repair(path));
+    unsafe {
+        Rwidget_set_visibility(
+            ui.repair_actions,
+            if pending_repair {
+                R_VISIBLE
+            } else {
+                R_COLLAPSED
+            },
+        );
+    }
 
     if let Some(metadata) = &state.current_metadata {
         set_label(ui.now_title, &metadata.title);
@@ -3513,7 +3973,37 @@ fn main() {
                 track: input_value(ui.meta_track),
                 duration: None,
             };
-            state.borrow_mut().save_metadata(location, metadata);
+            state.borrow_mut().save_metadata(window, location, metadata);
+        });
+    }
+    {
+        let state = Rc::clone(&state);
+        action_bind("player.restore_file", move |_, _| {
+            let location = state
+                .borrow()
+                .editor_loaded_for
+                .or_else(|| state.borrow().selected_location());
+            let Some(location) = location else {
+                state.borrow_mut().status =
+                    "Selecciona una pista antes de restaurar".to_owned();
+                return;
+            };
+            state.borrow_mut().restore_repair(location);
+        });
+    }
+    {
+        let state = Rc::clone(&state);
+        action_bind("player.confirm_repair", move |_, _| {
+            let location = state
+                .borrow()
+                .editor_loaded_for
+                .or_else(|| state.borrow().selected_location());
+            let Some(location) = location else {
+                state.borrow_mut().status =
+                    "Selecciona una pista antes de confirmar".to_owned();
+                return;
+            };
+            state.borrow_mut().confirm_repair(location);
         });
     }
     {
@@ -3612,12 +4102,84 @@ fn main() {
 mod tests {
     use super::{
         auto_scroll_step, drag_guide_y, drag_target, format_time, next_track_index,
-        previous_track_index, remap_index, tab_at, tab_close_hit, tab_drop_target, tab_guide_x,
-        tab_natural_width, tab_widths, TabMetrics,
+        previous_track_index, remap_index, repair_audio_file, repair_backup_path, tab_at,
+        tab_close_hit, tab_drop_target, tab_guide_x, tab_natural_width, tab_widths, track_row,
+        MetadataWriteError, TabMetrics, TrackMetadata,
     };
     use rodio::{Decoder, Source};
     use std::io::Cursor;
+    use std::path::Path;
     use std::time::Duration;
+
+    #[test]
+    fn repair_backups_separate_same_name_in_different_folders() {
+        let first = repair_backup_path(Path::new("/music/a/song.mp3"));
+        let second = repair_backup_path(Path::new("/music/b/song.mp3"));
+        assert_ne!(first, second);
+        assert_eq!(first, repair_backup_path(Path::new("/music/a/song.mp3")));
+        assert!(first
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with("-song.mp3")));
+    }
+
+    #[test]
+    fn track_row_marks_pending_repairs() {
+        let metadata = TrackMetadata::default();
+        assert!(track_row(&metadata, 0, true).contains('⚠'));
+        assert!(!track_row(&metadata, 0, false).contains('⚠'));
+    }
+
+    #[test]
+    fn only_audio_io_errors_offer_repair() {
+        assert!(MetadataWriteError::Read("lectura".to_owned()).can_repair());
+        assert!(MetadataWriteError::Write("escritura".to_owned()).can_repair());
+        assert!(!MetadataWriteError::Validation("validación".to_owned()).can_repair());
+    }
+
+    #[test]
+    fn ffmpeg_repairs_a_corrupted_mp3() {
+        use lofty::file::AudioFile;
+        use std::process::Command;
+
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("freeway-repair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("corrupt.mp3");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg("sine=frequency=440:duration=0.2")
+            .args(["-c:a", "libmp3lame", "-b:a", "64k"])
+            .arg(&original)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        // Un tamaño de etiqueta ID3 a cero reproduce el fallo de lofty al
+        // guardar ("failed to write Mpeg file") sin romper la lectura.
+        let mut bytes = std::fs::read(&original).unwrap();
+        assert_eq!(&bytes[..3], b"ID3");
+        bytes[6..10].copy_from_slice(&[0, 0, 0, 0]);
+        std::fs::write(&original, &bytes).unwrap();
+
+        let repaired = repair_audio_file(&original).expect("ffmpeg debe reparar el MP3");
+        assert!(std::fs::metadata(&repaired).unwrap().len() > 0);
+        let mut file =
+            lofty::read_from_path(&repaired).expect("el archivo reparado debe leerse");
+        file.save_to_path(&repaired, lofty::config::WriteOptions::default())
+            .expect("el archivo reparado debe admitir escritura");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[cfg(unix)]
     #[test]
