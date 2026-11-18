@@ -2692,7 +2692,47 @@ fn theme_xml_path() -> Option<PathBuf> {
     local.is_file().then_some(local)
 }
 
+/// Raven busca los glifos que le faltan en `$XDG_DATA_HOME/fonts`, pero
+/// Flatpak monta las fuentes del host en `/run/host/fonts`. Enlazar ese
+/// directorio desde la carpeta de fuentes de la app permite que Raven use las
+/// fuentes ya instaladas en el sistema, sin incrustar ninguna en el bundle.
+#[cfg(unix)]
+fn expose_host_fonts_to_raven() {
+    let host = Path::new("/run/host/fonts");
+    if !host.is_dir() {
+        return; // ejecución fuera de Flatpak: Raven ya ve /usr/share/fonts
+    }
+    let data_dir = std::env::var_os("XDG_DATA_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|path| !path.is_empty())
+                .map(|home| PathBuf::from(home).join(".local/share"))
+        });
+    let Some(data_dir) = data_dir else { return };
+    if let Err(err) = link_host_fonts(&data_dir.join("fonts"), host) {
+        eprintln!("No se pudo exponer /run/host/fonts a Raven: {err}");
+    }
+}
+
+#[cfg(unix)]
+fn link_host_fonts(fonts_dir: &Path, host: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    fs::create_dir_all(fonts_dir)?;
+    let link = fonts_dir.join("host");
+    if fs::symlink_metadata(&link).is_err() {
+        symlink(host, &link)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn expose_host_fonts_to_raven() {}
+
 fn main() {
+    expose_host_fonts_to_raven();
     unsafe {
         if Rinit(R_BACKEND_VULKAN) == 0 {
             eprintln!("No se pudo iniciar Raven con Vulkan");
@@ -3158,6 +3198,25 @@ mod tests {
     use rodio::{Decoder, Source};
     use std::io::Cursor;
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn host_fonts_link_is_created_once() {
+        use super::link_host_fonts;
+
+        let base = std::env::temp_dir().join(format!("freeway-fonts-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let fonts_dir = base.join("fonts");
+        let host = base.join("host-fonts");
+        std::fs::create_dir_all(&host).unwrap();
+
+        link_host_fonts(&fonts_dir, &host).unwrap();
+        link_host_fonts(&fonts_dir, &host).unwrap();
+
+        let link = fonts_dir.join("host");
+        assert_eq!(std::fs::read_link(&link).unwrap(), host);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn drag_target_moves_rows_and_clamps_to_list() {
