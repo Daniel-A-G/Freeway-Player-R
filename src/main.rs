@@ -195,6 +195,7 @@ struct PlayerState {
     track_list_widget: Rid,
     last_cover_dir: Option<PathBuf>,
     drag: DragState,
+    tab_drag: TabDragState,
 }
 
 /// Estado del gesto de reordenación por arrastre.
@@ -221,6 +222,23 @@ impl DragState {
     fn is_dragging(&self) -> bool {
         matches!(self, DragState::Dragging { .. })
     }
+}
+
+/// Estado del arrastre de pestañas de listas.
+///
+/// `Pressed` guarda la x del clic para aplicar el mismo umbral que en las
+/// pistas. Al superarlo se captura el índice activo real de Raven (`from`) y
+/// el destino se recalcula con los centros de las demás pestañas. Al soltar se
+/// reordena una sola vez, así que el modelo y el widget no se tocan a medias.
+#[derive(Clone, Copy, Debug)]
+enum TabDragState {
+    Idle,
+    Pressed { start_x: f32 },
+    Dragging {
+        from: usize,
+        start_x: f32,
+        target: usize,
+    },
 }
 
 impl PlayerState {
@@ -264,6 +282,7 @@ impl PlayerState {
             track_list_widget: R_INVALID_ID,
             last_cover_dir: None,
             drag: DragState::Idle,
+            tab_drag: TabDragState::Idle,
         }
     }
 
@@ -450,6 +469,27 @@ impl PlayerState {
         self.ui_rendered_playlist = None;
         self.editor_loaded_for = None;
         self.status = "Lista cerrada".to_owned();
+        self.save_playlists();
+        true
+    }
+
+    /// Reordena las listas y remapea los índices que apuntan a ellas.
+    ///
+    /// `remove` + `insert` es el mismo criterio que usa `Rwidget_insert_child`
+    /// en el TabView: el destino es la posición final en la lista reducida.
+    fn move_playlist(&mut self, from: usize, to: usize) -> bool {
+        if from == to || from >= self.playlists.len() || to >= self.playlists.len() {
+            return false;
+        }
+        let playlist = self.playlists.remove(from);
+        self.playlists.insert(to, playlist);
+
+        self.active_playlist = remap_index(self.active_playlist, from, to);
+        if let Some((playlist, track)) = self.current {
+            self.current = Some((remap_index(playlist, from, to), track));
+        }
+        self.ui_rendered_playlist = None;
+        self.editor_loaded_for = None;
         self.save_playlists();
         true
     }
@@ -1743,15 +1783,21 @@ fn refresh_ui(
     }
 }
 
+/// Título que muestra la pestaña de una lista.
+///
+/// Las listas temporales se marcan con un emoji para indicar que no son una
+/// lista normal y se borrarán al cerrar.
+fn playlist_tab_title(name: &str, is_temporal: bool) -> String {
+    if is_temporal {
+        format!("🔴 {}", name)
+    } else {
+        name.to_owned()
+    }
+}
+
 fn add_playlist_tab(tabs: Rid, title: &str, make_active: bool, is_temporal: bool) {
     let page = unsafe { Rwidget_create(R_WIDGET_VBOX) };
-    // Las listas temporales se marcan con un emoji en la pestaña para
-    // indicar que no son una lista normal y se borrarán al cerrar
-    let display_title = if is_temporal {
-        format!("🔴 {}", title)
-    } else {
-        title.to_owned()
-    };
+    let display_title = playlist_tab_title(title, is_temporal);
     let title = cstr(&display_title);
     let index = unsafe { Rtab_view_add_tab(tabs, title.as_ptr(), page) };
     if index < 0 {
@@ -2323,6 +2369,153 @@ unsafe extern "C" fn window_drop_callback(
     R_TRUE
 }
 
+// --- Geometría de las pestañas de listas ---
+//
+// Raven no expone el rect de cada pestaña, así que reproducimos su reparto
+// (`rvn_tab_natural_width` y `rvn_tab_width` en tab_view.c): ancho natural a
+// partir del texto, margen del modo Documents, reserva del botón de cerrar y
+// encogido proporcional cuando no caben. El índice de origen del arrastre se
+// lee de `Rtab_view_get_active`; esto solo decide el destino y la guía.
+
+/// Margen izquierdo de las pestañas en modo Documents.
+const TAB_INSET: f32 = 4.0;
+/// Ancho natural mínimo y máximo de una pestaña.
+const TAB_MIN_WIDTH: f32 = 96.0;
+const TAB_MAX_WIDTH: f32 = 280.0;
+/// Ancho mínimo cuando las pestañas tienen que encogerse.
+const TAB_MIN_SHRUNK: f32 = 48.0;
+/// Botón de cerrar (18 px) y su separación del texto (4 px).
+const TAB_CLOSE_WIDTH: f32 = 18.0;
+const TAB_CLOSE_GAP: f32 = 4.0;
+/// Aire del modo Documents: 4 px antes del texto y 8 px de holgura final.
+const TAB_DOCUMENTS_EXTRA: f32 = 12.0;
+
+/// Nuevo índice de un elemento al mover otro de `from` a `to`.
+///
+/// Sirve para remapear `active_playlist` y la lista de la pista actual cuando
+/// se reordenan las listas, igual que hace `move_track` con las pistas.
+fn remap_index(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < to && index > from && index <= to {
+        index - 1
+    } else if to < from && index >= to && index < from {
+        index + 1
+    } else {
+        index
+    }
+}
+
+/// Medidas que Raven usa para calcular el ancho de una pestaña.
+#[derive(Clone, Copy, Debug)]
+struct TabMetrics {
+    text_width: f32,
+    closable: bool,
+}
+
+/// Ancho natural de una pestaña, antes de repartir el espacio disponible.
+fn tab_natural_width(tab: TabMetrics, padding_x: f32) -> f32 {
+    let mut width = tab.text_width + padding_x * 2.0 + TAB_DOCUMENTS_EXTRA;
+    if tab.closable {
+        width += TAB_CLOSE_WIDTH + TAB_CLOSE_GAP;
+    }
+    width.clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH)
+}
+
+/// Anchos de todas las pestañas para el ancho disponible del TabView.
+///
+/// Si el total no cabe, Raven encoge todas proporcionalmente hasta un mínimo
+/// de 48 px. Las pestañas nunca se ocultan ni se desplazan: siempre caben.
+fn tab_widths(tabs: &[TabMetrics], padding_x: f32, view_width: f32) -> Vec<f32> {
+    let mut widths: Vec<f32> = tabs
+        .iter()
+        .map(|tab| tab_natural_width(*tab, padding_x))
+        .collect();
+    let total: f32 = widths.iter().sum();
+    if view_width > 0.0 && total > view_width - 8.0 {
+        let scale = (view_width - 8.0) / total;
+        for width in &mut widths {
+            *width = (*width * scale).max(TAB_MIN_SHRUNK);
+        }
+    }
+    widths
+}
+
+/// Pestaña que hay bajo un punto local del TabView, si hay alguna.
+fn tab_at(x: f32, y: f32, widths: &[f32], bar_height: f32) -> Option<usize> {
+    if y < 0.0 || y >= bar_height || x < TAB_INSET {
+        return None;
+    }
+    let mut left = TAB_INSET;
+    for (index, width) in widths.iter().enumerate() {
+        if x >= left && x < left + width {
+            return Some(index);
+        }
+        left += width;
+    }
+    None
+}
+
+/// ¿El punto cae sobre el botón de cerrar de una pestaña?
+///
+/// Raven solo pinta el botón en la pestaña activa o bajo el cursor, pero el
+/// clic se ignora igual: pulsar ahí cierra la pestaña, no inicia un arrastre.
+fn tab_close_hit(x: f32, y: f32, widths: &[f32], bar_height: f32) -> bool {
+    let Some(index) = tab_at(x, y, widths, bar_height) else {
+        return false;
+    };
+    let left = TAB_INSET + widths[..index].iter().sum::<f32>();
+    let close_left = left + widths[index] - TAB_CLOSE_WIDTH - 6.0;
+    let close_top = (bar_height - TAB_CLOSE_WIDTH) * 0.5 + 1.0;
+    x >= close_left
+        && x < close_left + TAB_CLOSE_WIDTH
+        && y >= close_top
+        && y < close_top + TAB_CLOSE_WIDTH
+}
+
+/// Posición final de la pestaña arrastrada.
+///
+/// Se cuentan los centros de las *demás* pestañas que quedan a la izquierda
+/// del cursor: así la pestaña agarrada no se mueve sola al cruzar su propio
+/// centro, solo cuando el cursor rebasa el centro de una vecina.
+fn tab_drop_target(widths: &[f32], x: f32, from: usize) -> usize {
+    let last = widths.len().saturating_sub(1);
+    if widths.is_empty() {
+        return 0;
+    }
+    let mut left = TAB_INSET;
+    let mut target = 0;
+    for (index, width) in widths.iter().enumerate() {
+        if index != from && x >= left + width * 0.5 {
+            // Cuenta cuántas vecinas quedan a la izquierda del cursor: ese es
+            // el índice final en la lista sin la pestaña arrastrada.
+            target += 1;
+        }
+        left += width;
+    }
+    target.min(last)
+}
+
+/// Hueco donde quedará la pestaña, relativo al TabView.
+///
+/// Al mover hacia la derecha la pestaña termina después de la de `target`;
+/// hacia la izquierda, antes. Con `from == target` no se dibuja guía.
+#[allow(dead_code)] // Se usa en la guía de la fase 3.
+fn tab_guide_x(widths: &[f32], from: usize, target: usize) -> f32 {
+    if target >= widths.len() {
+        return TAB_INSET;
+    }
+    let mut left = TAB_INSET;
+    for width in widths.iter().take(target) {
+        left += width;
+    }
+    if target > from {
+        left + widths[target]
+    } else {
+        left
+    }
+}
+
 /// Índice de destino a partir del desplazamiento del ratón desde el clic.
 ///
 /// Se usa siempre `start_y` como ancla. La rueda está congelada durante el
@@ -2482,6 +2675,170 @@ fn create_drop_guide(window: Rid, state: &Rc<RefCell<PlayerState>>) -> Rid {
         Rwidget_set_visibility(guide, R_COLLAPSED);
         Rwindow_set_content(window, overlay);
         guide
+    }
+}
+
+/// Anchos actuales de las pestañas de listas, medidos con la fuente del tema.
+///
+/// `Rfont_measure_text` con `R_INVALID_ID` y tamaño 0 resuelve la misma fuente
+/// y el mismo tamaño que usa Raven para dibujar el título de la pestaña.
+unsafe fn playlist_tab_widths(state: &PlayerState, tabs: Rid) -> Vec<f32> {
+    let (mut x, mut y, mut view_width, mut height) = (0.0, 0.0, 0.0, 0.0);
+    Rwidget_get_rect(tabs, &mut x, &mut y, &mut view_width, &mut height);
+    let padding_x = Rtheme_get_metric(R_METRIC_PADDING_X);
+    let metrics: Vec<TabMetrics> = state
+        .playlists
+        .iter()
+        .map(|playlist| {
+            let title = cstr(&playlist_tab_title(&playlist.name, playlist.is_temporal));
+            let (mut text_width, mut text_height) = (0.0, 0.0);
+            Rfont_measure_text(
+                R_INVALID_ID,
+                0.0,
+                title.as_ptr(),
+                &mut text_width,
+                &mut text_height,
+            );
+            TabMetrics {
+                text_width,
+                closable: true,
+            }
+        })
+        .collect();
+    tab_widths(&metrics, padding_x, view_width)
+}
+
+/// Altura de la barra de pestañas en modo Documents (Raven: ControlHeight + 10).
+unsafe fn playlist_tab_bar_height() -> f32 {
+    Rtheme_get_metric(R_METRIC_CONTROL_HEIGHT) + 10.0
+}
+
+// Event callback de las pestañas de listas: reordenarlas arrastrando.
+//
+// El clic se deja pasar a Raven para que active la pestaña; a partir del
+// umbral se consume el movimiento y, al soltar, se reordena una sola vez.
+unsafe extern "C" fn playlist_tabs_event_callback(
+    widget: Rid,
+    event: *const REvent,
+    user_data: *mut c_void,
+) -> c_int {
+    let state = &*(user_data as *const RefCell<PlayerState>);
+    let event_type = (*event).type_;
+    let local_x = (*event).local_x;
+    let local_y = (*event).local_y;
+    const DRAG_SLOP: f32 = 10.0;
+
+    match event_type {
+        R_EVENT_MOUSE_DOWN => {
+            if (*event).button != R_MOUSE_LEFT {
+                return R_FALSE;
+            }
+            let Ok(mut st) = state.try_borrow_mut() else {
+                return R_FALSE;
+            };
+            st.tab_drag = TabDragState::Idle;
+            let widths = playlist_tab_widths(&st, widget);
+            let bar_height = playlist_tab_bar_height();
+            if tab_at(local_x, local_y, &widths, bar_height).is_none() {
+                return R_FALSE;
+            }
+            // El botón de cerrar no es un asa de arrastre: Raven lo gestiona.
+            if tab_close_hit(local_x, local_y, &widths, bar_height) {
+                return R_FALSE;
+            }
+            st.tab_drag = TabDragState::Pressed { start_x: local_x };
+            // Sin consumir: Raven activa la pestaña pulsada y actualiza la lista activa.
+            R_FALSE
+        }
+        R_EVENT_MOUSE_MOVE => {
+            let Ok(mut st) = state.try_borrow_mut() else {
+                return R_FALSE;
+            };
+            let start_x = match st.tab_drag {
+                TabDragState::Pressed { start_x } => start_x,
+                TabDragState::Dragging { start_x, .. } => start_x,
+                TabDragState::Idle => return R_FALSE,
+            };
+            if (local_x - start_x).abs() < DRAG_SLOP {
+                return R_FALSE;
+            }
+            let widths = playlist_tab_widths(&st, widget);
+            if widths.len() != st.playlists.len() {
+                st.tab_drag = TabDragState::Idle;
+                return R_FALSE;
+            }
+            let from = match st.tab_drag {
+                TabDragState::Pressed { .. } => {
+                    // Raven ya procesó el clic: este es el índice real pulsado.
+                    let active = Rtab_view_get_active(widget);
+                    if active < 0 || active as usize >= widths.len() {
+                        st.tab_drag = TabDragState::Idle;
+                        return R_FALSE;
+                    }
+                    active as usize
+                }
+                TabDragState::Dragging { from, .. } => from,
+                TabDragState::Idle => return R_FALSE,
+            };
+            let target = tab_drop_target(&widths, local_x, from);
+            st.tab_drag = TabDragState::Dragging {
+                from,
+                start_x,
+                target,
+            };
+            // Congela el hover de Raven durante el gesto.
+            R_TRUE
+        }
+        R_EVENT_MOUSE_UP => {
+            if (*event).button != R_MOUSE_LEFT {
+                return R_FALSE;
+            }
+            let Ok(mut st) = state.try_borrow_mut() else {
+                return R_FALSE;
+            };
+            let TabDragState::Dragging { from, target, .. } = st.tab_drag else {
+                st.tab_drag = TabDragState::Idle;
+                return R_FALSE;
+            };
+            st.tab_drag = TabDragState::Idle;
+            if from == target
+                || from >= st.playlists.len()
+                || target >= st.playlists.len()
+            {
+                return R_FALSE;
+            }
+            let page = Rtab_view_get_tab(widget, from as i32);
+            if page == R_INVALID_ID {
+                return R_FALSE;
+            }
+            // Mover el hijo dispara `children_changed`; después se reordena el
+            // modelo. Raven reasigna la página activa a la primera al separar
+            // el hijo, así que se reactiva la pestaña movida al final.
+            if Rwidget_insert_child(widget, page, target as i32) == R_INVALID_ID {
+                return R_FALSE;
+            }
+            st.move_playlist(from, target);
+            Rtab_view_set_active(widget, target as i32);
+            R_FALSE
+        }
+        R_EVENT_MOUSE_LEAVE => {
+            let Ok(mut st) = state.try_borrow_mut() else {
+                return R_FALSE;
+            };
+            // Un arrastre iniciado sigue vivo aunque el cursor salga un momento.
+            if matches!(st.tab_drag, TabDragState::Pressed { .. }) {
+                st.tab_drag = TabDragState::Idle;
+            }
+            R_FALSE
+        }
+        R_EVENT_FOCUS_LOST => {
+            let Ok(mut st) = state.try_borrow_mut() else {
+                return R_FALSE;
+            };
+            st.tab_drag = TabDragState::Idle;
+            R_FALSE
+        }
+        _ => R_FALSE,
     }
 }
 
@@ -2828,6 +3185,12 @@ fn main() {
         Rtab_view_set_close_callback(
             ui.playlist_tabs,
             Some(close_playlist_tab),
+            Rc::as_ptr(&state) as *mut c_void,
+        );
+        // Reordenar las pestañas de listas arrastrándolas en horizontal
+        Rwidget_set_event_callback(
+            ui.playlist_tabs,
+            Some(playlist_tabs_event_callback),
             Rc::as_ptr(&state) as *mut c_void,
         );
         // Allow dropping audio files from the file manager into the window
@@ -3193,7 +3556,8 @@ fn main() {
 mod tests {
     use super::{
         auto_scroll_step, drag_guide_y, drag_target, format_time, next_track_index,
-        previous_track_index,
+        previous_track_index, remap_index, tab_at, tab_close_hit, tab_drop_target, tab_guide_x,
+        tab_natural_width, tab_widths, TabMetrics,
     };
     use rodio::{Decoder, Source};
     use std::io::Cursor;
@@ -3241,6 +3605,106 @@ mod tests {
         assert_eq!(drag_guide_y(2, 100.0, 4, 40.0), 200.0);
         // Sin cambio de destino no se dibuja; el valor no importa.
         assert_eq!(drag_guide_y(2, 100.0, 2, 40.0), 100.0);
+    }
+
+    #[test]
+    fn tab_widths_clamp_and_shrink_to_fit() {
+        let tab = |text_width| TabMetrics {
+            text_width,
+            closable: true,
+        };
+        // 50 + 22 (padding) + 12 (Documents) + 22 (cerrar) = 106.
+        assert_eq!(tab_natural_width(tab(50.0), 11.0), 106.0);
+        assert_eq!(tab_natural_width(tab(0.0), 11.0), 96.0);
+        assert_eq!(tab_natural_width(tab(400.0), 11.0), 280.0);
+
+        // Si caben, conservan su ancho natural.
+        let widths = tab_widths(&[tab(50.0), tab(50.0), tab(50.0)], 11.0, 1000.0);
+        assert_eq!(widths, vec![106.0, 106.0, 106.0]);
+
+        // En 200 px se reparten los 192 disponibles entre las tres.
+        let widths = tab_widths(&[tab(50.0), tab(50.0), tab(50.0)], 11.0, 200.0);
+        assert!((widths.iter().sum::<f32>() - 192.0).abs() < 0.01);
+        assert!((widths[0] - 64.0).abs() < 0.01);
+
+        // Por debajo del mínimo de Raven (48 px) no se encogen más.
+        let widths = tab_widths(&[tab(50.0), tab(50.0), tab(50.0)], 11.0, 20.0);
+        assert_eq!(widths, vec![48.0, 48.0, 48.0]);
+    }
+
+    #[test]
+    fn tab_at_stays_inside_bar_and_inset() {
+        let widths = [100.0, 100.0, 100.0];
+        // Las pestañas empiezan en x = 4 y son contiguas.
+        assert_eq!(tab_at(4.0, 10.0, &widths, 44.0), Some(0));
+        assert_eq!(tab_at(103.9, 10.0, &widths, 44.0), Some(0));
+        assert_eq!(tab_at(104.0, 10.0, &widths, 44.0), Some(1));
+        assert_eq!(tab_at(303.9, 10.0, &widths, 44.0), Some(2));
+        // Hueco a la izquierda, después de la última y fuera de la barra.
+        assert_eq!(tab_at(3.9, 10.0, &widths, 44.0), None);
+        assert_eq!(tab_at(304.0, 10.0, &widths, 44.0), None);
+        assert_eq!(tab_at(50.0, 43.9, &widths, 44.0), Some(0));
+        assert_eq!(tab_at(50.0, 44.0, &widths, 44.0), None);
+        assert_eq!(tab_at(50.0, -1.0, &widths, 44.0), None);
+    }
+
+    #[test]
+    fn tab_drop_target_crosses_neighbour_centers() {
+        let widths = [100.0, 100.0, 100.0];
+        // Centros en 54, 154 y 254. El centro de la pestaña agarrada no cuenta.
+        assert_eq!(tab_drop_target(&widths, 154.0, 1), 1);
+        assert_eq!(tab_drop_target(&widths, 155.0, 1), 1);
+        assert_eq!(tab_drop_target(&widths, 255.0, 1), 2);
+        assert_eq!(tab_drop_target(&widths, 10.0, 1), 0);
+        // La primera pestaña solo avanza una posición al rebasar la segunda.
+        assert_eq!(tab_drop_target(&widths, 155.0, 0), 1);
+        assert_eq!(tab_drop_target(&widths, 200.0, 0), 1);
+        assert_eq!(tab_drop_target(&widths, 255.0, 0), 2);
+        assert_eq!(tab_drop_target(&widths, 400.0, 0), 2);
+        // La última retrocede una posición al rebasar el centro de la segunda.
+        assert_eq!(tab_drop_target(&widths, 155.0, 2), 2);
+        assert_eq!(tab_drop_target(&widths, 100.0, 2), 1);
+        assert_eq!(tab_drop_target(&[], 100.0, 0), 0);
+        assert_eq!(tab_drop_target(&[100.0], 500.0, 0), 0);
+    }
+
+    #[test]
+    fn tab_guide_sits_at_destination_edge() {
+        let widths = [100.0, 100.0, 100.0];
+        // Hacia la derecha, después de la pestaña de destino.
+        assert_eq!(tab_guide_x(&widths, 1, 2), 304.0);
+        assert_eq!(tab_guide_x(&widths, 0, 1), 204.0);
+        // Hacia la izquierda, antes de la pestaña de destino.
+        assert_eq!(tab_guide_x(&widths, 1, 0), 4.0);
+        assert_eq!(tab_guide_x(&widths, 2, 0), 4.0);
+    }
+
+    #[test]
+    fn tab_close_button_is_not_a_drag_handle() {
+        let widths = [100.0, 100.0];
+        // Con barra de 44 px, el botón de la primera pestaña va de x=80 a 98
+        // y de y=14 a 32.
+        assert!(tab_close_hit(80.0, 14.0, &widths, 44.0));
+        assert!(tab_close_hit(97.9, 31.9, &widths, 44.0));
+        assert!(tab_close_hit(190.0, 20.0, &widths, 44.0));
+        assert!(!tab_close_hit(98.0, 14.0, &widths, 44.0));
+        assert!(!tab_close_hit(79.9, 14.0, &widths, 44.0));
+        assert!(!tab_close_hit(80.0, 13.9, &widths, 44.0));
+        assert!(!tab_close_hit(80.0, 32.0, &widths, 44.0));
+        assert!(!tab_close_hit(50.0, 20.0, &widths, 44.0));
+        assert!(!tab_close_hit(80.0, 44.0, &widths, 44.0));
+    }
+
+    #[test]
+    fn remap_index_follows_moved_item() {
+        // 1 -> 4: la lista movida acaba en 4 y las intermedias suben uno.
+        assert_eq!(remap_index(1, 1, 4), 4);
+        assert_eq!(remap_index(3, 1, 4), 2);
+        assert_eq!(remap_index(5, 1, 4), 5);
+        // 4 -> 1: la movida acaba en 1 y las intermedias bajan uno.
+        assert_eq!(remap_index(4, 4, 1), 1);
+        assert_eq!(remap_index(2, 4, 1), 3);
+        assert_eq!(remap_index(0, 4, 1), 0);
     }
 
     #[test]
