@@ -75,6 +75,14 @@ struct PlaylistStore {
     active_playlist: usize,
 }
 
+/// Preferencias que sobreviven al cierre del programa. Se guardan aparte de
+/// las listas para que un fallo al escribir una no arrastre a las otras.
+#[derive(Default, Serialize, Deserialize)]
+struct SavedSettings {
+    #[serde(default)]
+    last_cover_dir: Option<PathBuf>,
+}
+
 /// Reparación todavía sin resolver: el archivo ya es la versión reparada y la
 /// copia del original espera en la caché del programa.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -296,6 +304,7 @@ impl TabDragState {
 impl PlayerState {
     fn new() -> Self {
         let (saved, active_playlist) = load_playlists();
+        let settings = load_settings();
         let mut playlists: Vec<_> = saved.into_iter().map(Playlist::from_saved).collect();
         if playlists.is_empty() {
             playlists.push(Playlist::new("Mi música".to_owned()));
@@ -333,7 +342,7 @@ impl PlayerState {
             cover_texture: R_INVALID_ID,
             track_list_widget: R_INVALID_ID,
             playlist_tabs_widget: R_INVALID_ID,
-            last_cover_dir: None,
+            last_cover_dir: settings.last_cover_dir,
             pending_repairs: load_pending_repairs(),
             drag: DragState::Idle,
             tab_drag: TabDragState::Idle,
@@ -1277,6 +1286,26 @@ impl PlayerState {
         }
     }
 
+    /// Recuerda la carpeta del archivo elegido, en memoria y en disco. Si el
+    /// portal de documentos devolvió una ruta efímera, se guarda la carpeta
+    /// real que el portal anota en el archivo.
+    fn remember_cover_directory(&mut self, file: &Path) {
+        let host = document_portal_host_path(file).unwrap_or_else(|| file.to_path_buf());
+        let Some(parent) = host.parent() else {
+            return;
+        };
+        if is_document_portal_path(parent) {
+            return;
+        }
+        self.last_cover_dir = Some(parent.to_path_buf());
+        let settings = SavedSettings {
+            last_cover_dir: self.last_cover_dir.clone(),
+        };
+        if let Err(error) = save_settings(&settings) {
+            self.status = format!("No se pudo guardar la última carpeta de carátulas: {error}");
+        }
+    }
+
     fn export_playlist(&mut self, path: &Path) {
         let Some(playlist) = self.playlists.get(self.active_playlist) else {
             self.status = "No hay lista activa para exportar".to_owned();
@@ -1326,8 +1355,8 @@ impl PlayerState {
     }
 }
 
-fn playlist_store_path() -> PathBuf {
-    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+fn config_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
@@ -1335,8 +1364,15 @@ fn playlist_store_path() -> PathBuf {
                 .filter(|path| !path.is_empty())
                 .map(|home| PathBuf::from(home).join(".config"))
         })
-        .unwrap_or_else(|| PathBuf::from("."));
-    config_dir.join("freeway-player").join("playlists.json")
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn playlist_store_path() -> PathBuf {
+    config_dir().join("freeway-player").join("playlists.json")
+}
+
+fn settings_store_path() -> PathBuf {
+    config_dir().join("freeway-player").join("settings.json")
 }
 
 fn load_playlists() -> (Vec<SavedPlaylist>, usize) {
@@ -1347,6 +1383,25 @@ fn load_playlists() -> (Vec<SavedPlaylist>, usize) {
         return (Vec::new(), 0);
     };
     (store.playlists, store.active_playlist)
+}
+
+fn load_settings() -> SavedSettings {
+    let Ok(file) = File::open(settings_store_path()) else {
+        return SavedSettings::default();
+    };
+    serde_json::from_reader(file).unwrap_or_default()
+}
+
+fn save_settings(settings: &SavedSettings) -> Result<(), String> {
+    let path = settings_store_path();
+    let Some(parent) = path.parent() else {
+        return Err("No se pudo determinar la carpeta de configuración".to_owned());
+    };
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("json.tmp");
+    let file = File::create(&temporary).map_err(|error| error.to_string())?;
+    serde_json::to_writer_pretty(file, settings).map_err(|error| error.to_string())?;
+    fs::rename(&temporary, &path).map_err(|error| error.to_string())
 }
 
 fn cache_dir() -> PathBuf {
@@ -2402,14 +2457,100 @@ fn open_audio_files(_window: Rid) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn open_cover_file(_window: Rid, last_dir: &Option<PathBuf>) -> Option<PathBuf> {
+fn open_cover_file(_window: Rid, start_dir: Option<&Path>) -> Option<PathBuf> {
     let mut dialog = rfd::FileDialog::new()
         .set_title("Seleccionar carátula")
         .add_filter("Imágenes de carátula", &["png", "jpg", "jpeg", "bmp", "gif", "webp"]);
-    if let Some(ref dir) = last_dir {
+    if let Some(dir) = start_dir {
         dialog = dialog.set_directory(dir);
     }
     dialog.pick_file()
+}
+
+/// La carpeta existente más cercana subiendo por los ancestros. Se excluye la
+/// raíz porque abrir el diálogo en `/` no ayuda a encontrar las carátulas.
+fn existing_directory(path: &Path) -> Option<PathBuf> {
+    let mut candidate = Some(path);
+    while let Some(directory) = candidate {
+        if directory != Path::new("/") && directory.is_dir() {
+            return Some(directory.to_path_buf());
+        }
+        candidate = directory.parent();
+    }
+    None
+}
+
+/// Rutas que el portal de documentos monta en `$XDG_RUNTIME_DIR/doc` mientras
+/// dura la sesión. No sirven como última carpeta: desaparecen al cerrar.
+fn is_document_portal_path(path: &Path) -> bool {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    is_document_portal_path_in(path, runtime_dir.as_deref())
+}
+
+fn is_document_portal_path_in(path: &Path, runtime_dir: Option<&Path>) -> bool {
+    if let Some(runtime_dir) = runtime_dir {
+        if path.starts_with(runtime_dir.join("doc")) {
+            return true;
+        }
+    }
+    // Sin XDG_RUNTIME_DIR, reconoce el patrón /run/user/<uid>/doc/<id>.
+    let components: Vec<_> = path.components().collect();
+    components.len() >= 5
+        && components[0].as_os_str() == "/"
+        && components[1].as_os_str() == "run"
+        && components[2].as_os_str() == "user"
+        && components[3]
+            .as_os_str()
+            .to_string_lossy()
+            .chars()
+            .all(|character| character.is_ascii_digit())
+        && components[4].as_os_str() == "doc"
+}
+
+/// La ruta real del archivo cuando el portal de documentos lo expone como
+/// `/run/user/<uid>/doc/<id>/<nombre>` (lo habitual dentro de Flatpak). El
+/// portal guarda la ruta original en un atributo extendido del archivo.
+fn document_portal_host_path(path: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    const ATTRIBUTE: &[u8] = b"user.document-portal.host-path\0";
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let size = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            ATTRIBUTE.as_ptr().cast(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if size <= 0 {
+        return None;
+    }
+    let mut value = vec![0u8; size as usize];
+    let read = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            ATTRIBUTE.as_ptr().cast(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    if read <= 0 {
+        return None;
+    }
+    value.truncate(read as usize);
+    let value = std::ffi::OsString::from_vec(value);
+    Some(PathBuf::from(value))
+}
+
+/// Carpeta inicial del diálogo de carátulas: la última usada si todavía
+/// existe, y si no la de la pista que se está editando.
+fn cover_dialog_directory(last: Option<&Path>, track: Option<&Path>) -> Option<PathBuf> {
+    let last = last.filter(|path| !is_document_portal_path(path));
+    last.and_then(existing_directory)
+        .or_else(|| track.and_then(Path::parent).and_then(existing_directory))
 }
 
 fn open_playlist_export_file(_window: Rid) -> Option<PathBuf> {
@@ -4102,21 +4243,26 @@ fn main() {
         let state = Rc::clone(&state);
         let ui = ui;
         action_bind("player.choose_cover", move |_, _| {
-            let state_ref = state.borrow();
-            let last_dir = state_ref.last_cover_dir.clone();
-            drop(state_ref);
+            let (location, start_dir) = {
+                let state_ref = state.borrow();
+                let Some(location) = state_ref.editor_loaded_for else {
+                    drop(state_ref);
+                    state.borrow_mut().status =
+                        "Abre el editor desde una pista para cambiar la carátula".to_owned();
+                    return;
+                };
+                let start_dir = cover_dialog_directory(
+                    state_ref.last_cover_dir.as_deref(),
+                    state_ref.path_at(location),
+                );
+                (location, start_dir)
+            };
 
-            let Some(path) = open_cover_file(window, &last_dir) else {
+            let Some(path) = open_cover_file(window, start_dir.as_deref()) else {
                 return;
             };
             let mut state = state.borrow_mut();
-            let Some(location) = state.editor_loaded_for else {
-                state.status = "Abre el editor desde una pista para cambiar la carátula".to_owned();
-                return;
-            };
-            if let Some(parent) = path.parent() {
-                state.last_cover_dir = Some(parent.to_path_buf());
-            }
+            state.remember_cover_directory(&path);
             state.pending_cover = Some((location, CoverChange::Replace(path)));
             state.cover_hint = cover_hint_for_location(&state, Some(location));
             set_label(ui.cover_status, &state.cover_hint);
@@ -4183,14 +4329,15 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_scroll_step, drag_guide_y, drag_target, format_time, next_track_index,
+        auto_scroll_step, cover_dialog_directory, document_portal_host_path, drag_guide_y,
+        drag_target, existing_directory, format_time, is_document_portal_path_in, next_track_index,
         previous_track_index, remap_index, repair_audio_file, repair_backup_path, tab_at,
         tab_close_hit, tab_drop_target, tab_guide_x, tab_natural_width, tab_widths, track_row,
-        MetadataWriteError, TabMetrics, TrackMetadata,
+        MetadataWriteError, SavedSettings, TabMetrics, TrackMetadata,
     };
     use rodio::{Decoder, Source};
     use std::io::Cursor;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     #[test]
@@ -4202,6 +4349,129 @@ mod tests {
         assert!(first
             .file_name()
             .is_some_and(|name| name.to_string_lossy().ends_with("-song.mp3")));
+    }
+
+    #[test]
+    fn cover_directory_uses_closest_existing_ancestor() {
+        let base = std::env::temp_dir().join(format!(
+            "freeway-cover-{}-{}",
+            std::process::id(),
+            "ancestor"
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("last")).unwrap();
+
+        let missing = base.join("last").join("gone").join("deeper");
+        assert_eq!(existing_directory(&missing), Some(base.join("last")));
+        assert_eq!(
+            existing_directory(&base.join("last")),
+            Some(base.join("last"))
+        );
+        assert_eq!(existing_directory(Path::new("/")), None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cover_dialog_prefers_last_directory_then_track() {
+        let base =
+            std::env::temp_dir().join(format!("freeway-cover-{}-{}", std::process::id(), "dialog"));
+        let _ = std::fs::remove_dir_all(&base);
+        let last = base.join("caratulas");
+        let music = base.join("musica");
+        std::fs::create_dir_all(&last).unwrap();
+        std::fs::create_dir_all(&music).unwrap();
+        let track = music.join("cancion.mp3");
+
+        assert_eq!(
+            cover_dialog_directory(Some(&last), Some(&track)),
+            Some(last.clone())
+        );
+        assert_eq!(
+            cover_dialog_directory(None, Some(&track)),
+            Some(music.clone())
+        );
+        // Una carpeta recordada que ya no existe sube a su ancestro existente.
+        let gone = base.join("desmontada").join("sub");
+        assert_eq!(
+            cover_dialog_directory(Some(&gone), Some(&track)),
+            Some(base.clone())
+        );
+        // Una ruta efímera del portal se ignora y se usa la de la pista.
+        assert_eq!(
+            cover_dialog_directory(Some(Path::new("/run/user/1000/doc/abc123")), Some(&track)),
+            Some(music.clone())
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn document_portal_paths_are_recognized() {
+        let runtime = Path::new("/run/user/1000");
+        assert!(is_document_portal_path_in(
+            Path::new("/run/user/1000/doc/abc123/foto.png"),
+            Some(runtime)
+        ));
+        assert!(!is_document_portal_path_in(
+            Path::new("/run/user/1000/Música/foto.png"),
+            Some(runtime)
+        ));
+        // Sin XDG_RUNTIME_DIR también se reconoce el patrón del portal.
+        assert!(is_document_portal_path_in(
+            Path::new("/run/user/1000/doc/abc123/foto.png"),
+            None
+        ));
+        assert!(!is_document_portal_path_in(
+            Path::new("/run/user/1000/Música/foto.png"),
+            None
+        ));
+    }
+
+    #[test]
+    fn reads_document_portal_host_path_attribute() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("freeway-cover-{}-{}", std::process::id(), "xattr"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("foto.png");
+        std::fs::write(&file, b"png").unwrap();
+        assert_eq!(document_portal_host_path(&file), None);
+
+        let host = dir.join("real").join("foto.png");
+        let path = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        let value = host.as_os_str().as_bytes();
+        let stored = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                b"user.document-portal.host-path\0".as_ptr().cast(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        // Algunos sistemas de archivos no admiten atributos de usuario.
+        if stored == 0 {
+            assert_eq!(document_portal_host_path(&file), Some(host));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_round_trip_keeps_last_cover_directory() {
+        let settings = SavedSettings {
+            last_cover_dir: Some(PathBuf::from("/home/persona/Imágenes/caratulas")),
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let back: SavedSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.last_cover_dir, settings.last_cover_dir);
+
+        // Un archivo antiguo o vacío no impide arrancar.
+        let empty: SavedSettings = serde_json::from_str("{}").unwrap();
+        assert!(empty.last_cover_dir.is_none());
     }
 
     #[test]

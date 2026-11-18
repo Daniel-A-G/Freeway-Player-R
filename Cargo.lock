@@ -409,6 +409,7 @@ dependencies = [
  "cpal",
  "futures-util",
  "image",
+ "libc",
  "lofty",
  "raven-gui",
  "rfd",
