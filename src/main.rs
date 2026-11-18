@@ -34,6 +34,11 @@ const SYMBOLS_FONT: &[u8] = include_bytes!("../data/fonts/NotoSansSymbols-Regula
 const INITIAL_VOLUME: f32 = 0.8;
 const PENDING_REPAIR_HINT: &str =
     "Archivo reparado. Restaura el original o confirma esta versión para cerrar el aviso.";
+/// Nombre de la lista donde llegan los archivos abiertos desde el lanzador.
+///
+/// Es la única lista temporal: no se guarda en `playlists.json` y se descarta
+/// al cerrar. Renombrarla la convierte en una lista permanente.
+const SESSION_PLAYLIST_NAME: &str = "Sesión";
 
 struct AudioOutput {
     player: Player,
@@ -140,7 +145,6 @@ struct TrackListRows {
 
 impl Playlist {
     fn new(name: String) -> Self {
-        let is_temporal = name == "temp";
         Self {
             name,
             tracks: Vec::new(),
@@ -150,13 +154,13 @@ impl Playlist {
             order: Vec::new(),
             order_position: None,
             revision: 0,
-            is_temporal,
+            is_temporal: false,
         }
     }
 
     fn new_temporal() -> Self {
         Self {
-            name: "temp".to_owned(),
+            name: SESSION_PLAYLIST_NAME.to_owned(),
             tracks: Vec::new(),
             selected: None,
             shuffle: false,
@@ -193,6 +197,20 @@ impl Playlist {
             shuffle: self.shuffle,
             repeat: self.repeat,
             is_temporal: self.is_temporal,
+        }
+    }
+
+    /// Cambia el nombre de la lista y devuelve si dejó de ser temporal.
+    ///
+    /// Renombrar la sesión con otro nombre es la forma de conservarla; dejarle
+    /// el mismo nombre la mantiene como sesión.
+    fn rename(&mut self, name: String) -> bool {
+        self.name = name;
+        if self.is_temporal && self.name != SESSION_PLAYLIST_NAME {
+            self.is_temporal = false;
+            true
+        } else {
+            false
         }
     }
 
@@ -297,12 +315,6 @@ enum TabDragState {
     },
 }
 
-impl TabDragState {
-    fn is_dragging(&self) -> bool {
-        matches!(self, TabDragState::Dragging { .. })
-    }
-}
-
 impl PlayerState {
     fn new() -> Self {
         let (saved, active_playlist) = load_playlists();
@@ -365,9 +377,18 @@ impl PlayerState {
             .filter(|p| !p.is_temporal)
             .map(Playlist::saved)
             .collect();
+        // `active_playlist` incluye la sesión, que no se guarda: hay que
+        // traducirlo al índice de la lista persistente que quede antes.
+        let active_playlist = self
+            .playlists
+            .iter()
+            .take(self.active_playlist + 1)
+            .filter(|p| !p.is_temporal)
+            .count()
+            .saturating_sub(1);
         let store = PlaylistStore {
             playlists: non_temporal,
-            active_playlist: self.active_playlist,
+            active_playlist,
         };
 
         let result = (|| -> Result<(), String> {
@@ -496,12 +517,12 @@ impl PlayerState {
             return None;
         }
         let playlist = self.playlists.get_mut(self.active_playlist)?;
-        playlist.name = name.clone();
-        // Si la lista era temporal y se le cambia el nombre, deja de ser temporal
-        if playlist.is_temporal && name != "temp" {
-            playlist.is_temporal = false;
-        }
-        self.status = format!("Lista renombrada: {name}");
+        let promoted = playlist.rename(name.clone());
+        self.status = if promoted {
+            format!("Lista renombrada: {name} (se guardará al cerrar)")
+        } else {
+            format!("Lista renombrada: {name}")
+        };
         self.save_playlists();
         Some((self.active_playlist, name))
     }
@@ -2230,6 +2251,7 @@ fn update_track_list(
     let name = playlist.name.clone();
     let tracks = playlist.tracks.clone();
     let selected = playlist.selected;
+    let is_temporal = playlist.is_temporal;
     let track_count = tracks.len();
     {
         let mut rows = row_cache.borrow_mut();
@@ -2255,10 +2277,12 @@ fn update_track_list(
     state.editor_loaded_for = None;
     state.ui_selection_dirty = false;
     set_input(ui.playlist_name, &name);
-    set_label(
-        ui.playlist_summary,
-        &format!("{} pistas · {}", track_count, name),
-    );
+    let summary = if is_temporal {
+        format!("{track_count} pistas · no se guarda; renómbrala para conservarla")
+    } else {
+        format!("{track_count} pistas · {name}")
+    };
+    set_label(ui.playlist_summary, &summary);
 }
 
 fn update_metadata_editor(state: &mut PlayerState, ui: Ui) {
@@ -2342,7 +2366,6 @@ fn refresh_ui(
     ui: Ui,
     row_cache: &RefCell<TrackListRows>,
     window: Rid,
-    guide: Rid,
 ) {
     state.poll_update_check(window);
     state.update_after_frame();
@@ -2451,35 +2474,12 @@ fn refresh_ui(
     unsafe {
         Rslider_set_range(ui.seek, 0.0, duration_seconds.max(1.0));
         Rslider_set_value(ui.seek, position.min(duration_seconds));
-        if guide != R_INVALID_ID {
-            Rwidget_set_visibility(
-                guide,
-                if state.drag.is_dragging() || state.tab_drag.is_dragging() {
-                    R_VISIBLE
-                } else {
-                    R_COLLAPSED
-                },
-            );
-        }
-    }
-}
-
-/// Título que muestra la pestaña de una lista.
-///
-/// Las listas temporales se marcan con un emoji para indicar que no son una
-/// lista normal y se borrarán al cerrar.
-fn playlist_tab_title(name: &str, is_temporal: bool) -> String {
-    if is_temporal {
-        format!("🔴 {}", name)
-    } else {
-        name.to_owned()
     }
 }
 
 fn add_playlist_tab(tabs: Rid, title: &str, make_active: bool, is_temporal: bool) {
     let page = unsafe { Rwidget_create(R_WIDGET_VBOX) };
-    let display_title = playlist_tab_title(title, is_temporal);
-    let title = cstr(&display_title);
+    let title = cstr(title);
     let index = unsafe { Rtab_view_add_tab(tabs, title.as_ptr(), page) };
     if index < 0 {
         return;
@@ -2487,6 +2487,12 @@ fn add_playlist_tab(tabs: Rid, title: &str, make_active: bool, is_temporal: bool
     let page = unsafe { Rtab_view_get_tab(tabs, index) };
     unsafe {
         Rtab_view_set_tab_closable(tabs, page, R_TRUE);
+        if is_temporal {
+            let hint = cstr(
+                "Lista de sesión: se descarta al cerrar. Renómbrala para conservarla.",
+            );
+            Rwidget_set_tooltip(page, hint.as_ptr());
+        }
         if make_active {
             Rtab_view_set_active(tabs, index);
         }
@@ -3266,6 +3272,20 @@ fn tab_at(x: f32, y: f32, widths: &[f32], bar_height: f32) -> Option<usize> {
     None
 }
 
+/// Rectángulo de una pestaña en modo Documents, relativo al TabView.
+///
+/// Raven empieza en `TAB_INSET`, deja 2 px a la derecha de cada pestaña y las
+/// dibuja desde `y = 4` hasta el borde inferior de la barra. El resultado se
+/// usa para pintar el resaltado de la sesión sobre la pestaña real.
+fn tab_rect(index: usize, widths: &[f32], bar_height: f32) -> Option<(f32, f32, f32, f32)> {
+    let width = *widths.get(index)?;
+    if width <= 2.0 || bar_height <= 4.0 {
+        return None;
+    }
+    let x = TAB_INSET + widths[..index].iter().sum::<f32>();
+    Some((x, 4.0, width - 2.0, bar_height - 4.0))
+}
+
 /// ¿El punto cae sobre el botón de cerrar de una pestaña?
 ///
 /// Raven solo pinta el botón en la pestaña activa o bajo el cursor, pero el
@@ -3404,6 +3424,42 @@ unsafe extern "C" fn drop_guide_paint(
         return;
     };
 
+    // La pestaña de la sesión se distingue con un fondo rojo suave, esté o no
+    // activa. Se pinta primero para que las guías de arrastre queden encima.
+    if let Some(index) = st
+        .playlists
+        .iter()
+        .position(|playlist| playlist.is_temporal)
+    {
+        let tabs = st.playlist_tabs_widget;
+        if tabs != R_INVALID_ID {
+            let (mut tabs_x, mut tabs_y, mut tabs_w, mut tabs_h) = (0.0, 0.0, 0.0, 0.0);
+            Rwidget_get_rect(
+                tabs,
+                &mut tabs_x,
+                &mut tabs_y,
+                &mut tabs_w,
+                &mut tabs_h,
+            );
+            if tabs_w > 0.0 && tabs_h > 0.0 {
+                let widths = playlist_tab_widths(&st, tabs);
+                if let Some((x, y, width, height)) =
+                    tab_rect(index, &widths, playlist_tab_bar_height())
+                {
+                    let radius =
+                        6.0_f32.min(Rtheme_get_metric(R_METRIC_CORNER_RADIUS) + 2.0);
+                    let (x, y) = (tabs_x + x, tabs_y + y);
+                    // Un rojo apagado sobre la paleta morada: se nota sin
+                    // tapar el texto ni parecer una alerta.
+                    Rdraw_rect(painter, x, y, width, height, radius, 0.50, 0.24, 0.28, 0.20);
+                    Rdraw_rect_outline(
+                        painter, x, y, width, height, radius, 1.0, 0.82, 0.51, 0.56, 0.55,
+                    );
+                }
+            }
+        }
+    }
+
     if let TabDragState::Dragging {
         from,
         target,
@@ -3525,7 +3581,8 @@ fn create_drop_guide(window: Rid, state: &Rc<RefCell<PlayerState>>) -> Rid {
             Some(drop_guide_paint),
             Rc::as_ptr(state) as *mut c_void,
         );
-        Rwidget_set_visibility(guide, R_COLLAPSED);
+        // Siempre visible: pinta la guía de arrastre y el fondo de la sesión.
+        Rwidget_set_visibility(guide, R_VISIBLE);
         Rwindow_set_content(window, overlay);
         guide
     }
@@ -3543,7 +3600,7 @@ unsafe fn playlist_tab_widths(state: &PlayerState, tabs: Rid) -> Vec<f32> {
         .playlists
         .iter()
         .map(|playlist| {
-            let title = cstr(&playlist_tab_title(&playlist.name, playlist.is_temporal));
+            let title = cstr(&playlist.name);
             let (mut text_width, mut text_height) = (0.0, 0.0);
             Rfont_measure_text(
                 R_INVALID_ID,
@@ -3985,7 +4042,7 @@ fn main() {
         st.track_list_widget = ui.track_list;
         st.playlist_tabs_widget = ui.playlist_tabs;
     }
-    let guide = create_drop_guide(window, &state);
+    create_drop_guide(window, &state);
     let context_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
     let update_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
     let edit_metadata_text = cstr("Editar metadatos");
@@ -4096,54 +4153,66 @@ fn main() {
 
     if !audio_args.is_empty() {
         let mut st = state.borrow_mut();
-        // Crear lista temporal "temp" si no existe ya
-        let temp_index = st
-            .playlists
-            .iter()
-            .position(|p| p.name == "temp");
-        let playlist_index = match temp_index {
-            Some(i) => i,
+        // La sesión es la lista temporal: si ya existe, se reutiliza en lugar
+        // de abrir otra pestaña.
+        let existing_session = st.playlists.iter().position(|p| p.is_temporal);
+        let playlist_index = match existing_session {
+            Some(index) => index,
             None => {
-                let mut temp = Playlist::new_temporal();
-                temp.tracks = audio_args.clone();
-                if !audio_args.is_empty() {
-                    temp.selected = Some(0);
-                    temp.rebuild_order(Some(0));
-                }
-                st.playlists.push(temp);
+                st.playlists.push(Playlist::new_temporal());
                 st.playlists.len() - 1
             }
         };
 
-        // Si la lista temporal ya existía, añadir los archivos sin duplicar
-        if temp_index.is_some() {
+        // Añadir solo los archivos nuevos, conservando el orden de llegada.
+        let first_new = {
             let playlist = &mut st.playlists[playlist_index];
+            let previous_len = playlist.tracks.len();
             let mut existing: HashSet<_> = playlist.tracks.iter().cloned().collect();
-            for path in audio_args {
+            for path in &audio_args {
                 if existing.insert(path.clone()) {
-                    playlist.tracks.push(path);
+                    playlist.tracks.push(path.clone());
                 }
             }
-            playlist.revision += 1;
-            st.save_playlists();
-        }
+            if playlist.tracks.len() > previous_len {
+                playlist.revision += 1;
+                Some(previous_len)
+            } else {
+                None
+            }
+        };
 
         st.active_playlist = playlist_index;
         st.ui_rendered_playlist = None;
+        st.editor_loaded_for = None;
 
-        // Añadir pestaña para la lista temporal
-        add_playlist_tab(
-            ui.playlist_tabs,
-            &st.playlists[playlist_index].name,
-            true,
-            st.playlists[playlist_index].is_temporal,
-        );
+        // Solo hay que crear la pestaña si la sesión no existía ya.
+        if existing_session.is_none() {
+            let (name, is_temporal) = {
+                let playlist = &st.playlists[playlist_index];
+                (playlist.name.clone(), playlist.is_temporal)
+            };
+            add_playlist_tab(ui.playlist_tabs, &name, true, is_temporal);
+        }
         unsafe { Rtab_view_set_active(ui.playlist_tabs, playlist_index as i32) };
 
-        // Reproducir el primer archivo si no hay nada reproduciendo
-        if st.current.is_none() {
-            if let Err(error) = st.play_track(playlist_index, 0, true) {
+        // Reproducir el primer archivo recién añadido; si ya estaba en la
+        // sesión, el primero que se pidió abrir.
+        let play_index = first_new.or_else(|| {
+            audio_args.first().and_then(|first| {
+                st.playlists[playlist_index]
+                    .tracks
+                    .iter()
+                    .position(|track| track == first)
+            })
+        });
+        if let Some(track_index) = play_index {
+            if let Err(error) = st.play_track(playlist_index, track_index, true) {
                 st.status = error;
+            } else {
+                st.status = format!(
+                    "Reproduciendo · {SESSION_PLAYLIST_NAME} no se guarda; renómbrala para conservarla"
+                );
             }
         }
     }
@@ -4399,7 +4468,6 @@ fn main() {
         ui,
         track_list_rows.as_ref(),
         window,
-        guide,
     );
     unsafe {
         while Rwait_frame(0.2) != 0 {
@@ -4408,7 +4476,6 @@ fn main() {
                 ui,
                 track_list_rows.as_ref(),
                 window,
-                guide,
             );
             if state.borrow().restart_requested {
                 break;
@@ -4444,8 +4511,8 @@ mod tests {
         document_portal_host_path, drag_guide_y, drag_target, existing_directory, format_time,
         is_document_portal_path_in, next_track_index, play_starts_selected, previous_track_index,
         remap_index, repair_audio_file, repair_backup_path, tab_at, tab_close_hit, tab_drop_target,
-        tab_guide_x, tab_natural_width, tab_widths, track_row, MetadataWriteError, SavedSettings,
-        TabMetrics, TrackMetadata,
+        tab_guide_x, tab_natural_width, tab_rect, tab_widths, track_row, MetadataWriteError,
+        Playlist, SavedSettings, TabMetrics, TrackMetadata, SESSION_PLAYLIST_NAME,
     };
     use rodio::{Decoder, Source};
     use std::io::Cursor;
@@ -4712,6 +4779,40 @@ mod tests {
         // Por debajo del mínimo de Raven (48 px) no se encogen más.
         let widths = tab_widths(&[tab(50.0), tab(50.0), tab(50.0)], 11.0, 20.0);
         assert_eq!(widths, vec![48.0, 48.0, 48.0]);
+    }
+
+    #[test]
+    fn session_tab_rect_matches_documents_geometry() {
+        let widths = [100.0, 80.0];
+        // Raven dibuja desde x = 4, con 2 px de aire a la derecha y desde y = 4.
+        assert_eq!(tab_rect(0, &widths, 44.0), Some((4.0, 4.0, 98.0, 40.0)));
+        assert_eq!(tab_rect(1, &widths, 44.0), Some((104.0, 4.0, 78.0, 40.0)));
+        assert_eq!(tab_rect(2, &widths, 44.0), None);
+        assert_eq!(tab_rect(0, &[2.0], 44.0), None);
+        assert_eq!(tab_rect(0, &widths, 4.0), None);
+    }
+
+    #[test]
+    fn renaming_the_session_makes_it_permanent() {
+        let mut session = Playlist::new_temporal();
+        assert!(session.is_temporal);
+        assert_eq!(session.name, SESSION_PLAYLIST_NAME);
+
+        // Conservar el nombre de sesión la deja como temporal.
+        assert!(!session.rename(SESSION_PLAYLIST_NAME.to_owned()));
+        assert!(session.is_temporal);
+
+        // Cualquier otro nombre la convierte en una lista normal.
+        assert!(session.rename("Favoritas".to_owned()));
+        assert!(!session.is_temporal);
+        assert_eq!(session.name, "Favoritas");
+
+        // Una lista normal llamada "Sesión" no se vuelve temporal por el nombre.
+        let mut regular = Playlist::new("Mi música".to_owned());
+        assert!(!regular.is_temporal);
+        assert!(!regular.rename(SESSION_PLAYLIST_NAME.to_owned()));
+        assert!(!regular.is_temporal);
+        assert_eq!(regular.name, SESSION_PLAYLIST_NAME);
     }
 
     #[test]
