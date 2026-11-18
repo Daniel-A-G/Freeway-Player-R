@@ -77,11 +77,11 @@ En el equipo de destino se instala o actualiza con `flatpak install --user --bun
 
 ### Releases automáticos en GitHub
 
-El workflow `.github/workflows/flatpak-release.yml` compila un bundle x86_64 y crea un GitHub Release al publicar un tag `v*`. El tag debe coincidir con la versión de `Cargo.toml`; por ejemplo, para la versión `0.2.4`:
+El workflow `.github/workflows/flatpak-release.yml` compila un bundle x86_64 y crea un GitHub Release al publicar un tag `v*`. El tag debe coincidir con la versión de `Cargo.toml`; por ejemplo, para la versión `0.2.5`:
 
 ```sh
-git tag -a v0.2.4 -m "Freeway Player v0.2.4"
-git push origin main v0.2.4
+git tag -a v0.2.5 -m "Freeway Player v0.2.5"
+git push origin main v0.2.5
 ```
 
 Conviene subir `main` junto con el tag para que la rama remota quede alineada con el Release.
