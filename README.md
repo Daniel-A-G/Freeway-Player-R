@@ -17,6 +17,7 @@ Los bindings se incluyen en `vendor/raven-gui` desde la etiqueta `v0.2.1` de Rav
 - Abrir una o varias pistas con el selector del escritorio. En Linux usa XDG Desktop Portal, de modo que el diálogo puede mostrar las ubicaciones fijadas en GTK/KDE y dar acceso a archivos elegidos fuera del espacio concedido directamente al Flatpak.
 - Mantener varias listas en pestañas, añadir/quitar pistas y conservar las listas entre sesiones en `$XDG_CONFIG_HOME/freeway-player/playlists.json` (o `~/.config/freeway-player/playlists.json`).
 - Reordenar pistas arrastrándolas dentro de la lista: una línea guía salta entre huecos para mostrar el destino, la lista se desplaza sola al arrastrar contra los bordes y la pista queda en el hueco indicado al soltar.
+- Reordenar las listas arrastrando sus pestañas: una guía vertical marca el hueco de destino y el nuevo orden se conserva entre sesiones.
 - Reproducir, pausar, detener, avanzar y retroceder por la lista activa con controles de iconos.
 - Activar aleatorio y repetición por lista; aleatorio recorre las pistas en un orden mezclado antes de iniciar un nuevo ciclo. Las opciones se guardan junto a cada lista.
 - Cambiar volumen y posición desde la barra de progreso, con tiempo transcurrido y duración.
@@ -77,11 +78,11 @@ En el equipo de destino se instala o actualiza con `flatpak install --user --bun
 
 ### Releases automáticos en GitHub
 
-El workflow `.github/workflows/flatpak-release.yml` compila un bundle x86_64 y crea un GitHub Release al publicar un tag `v*`. El tag debe coincidir con la versión de `Cargo.toml`; por ejemplo, para la versión `0.2.5`:
+El workflow `.github/workflows/flatpak-release.yml` compila un bundle x86_64 y crea un GitHub Release al publicar un tag `v*`. El tag debe coincidir con la versión de `Cargo.toml`; por ejemplo, para la versión `0.2.6`:
 
 ```sh
-git tag -a v0.2.5 -m "Freeway Player v0.2.5"
-git push origin main v0.2.5
+git tag -a v0.2.6 -m "Freeway Player v0.2.6"
+git push origin main v0.2.6
 ```
 
 Conviene subir `main` junto con el tag para que la rama remota quede alineada con el Release.
