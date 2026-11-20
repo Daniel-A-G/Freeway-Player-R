@@ -326,10 +326,8 @@ impl Playlist {
     }
 
     fn reshuffle_cycle_after(&mut self, current_track: usize) {
-        self.order = shuffled_track_indices(self.tracks.len(), Some(current_track));
-        if current_track < self.tracks.len() {
-            self.order.push(current_track);
-        }
+        let previous = std::mem::take(&mut self.order);
+        self.order = reshuffled_cycle_order(self.tracks.len(), Some(current_track), &previous);
         self.order_position = self.order.len().checked_sub(1);
     }
 }
@@ -344,6 +342,9 @@ struct PlayerState {
     volume: f32,
     playing: bool,
     stopped: bool,
+    /// La última cola aleatoria terminó sin repetición; el siguiente «Play»
+    /// debe estrenar ciclo en lugar de reanudar la última pista.
+    cycle_finished: bool,
     status: String,
     update_messages: Option<Receiver<updates::UpdateMessage>>,
     update_decision: Option<Sender<bool>>,
@@ -447,6 +448,7 @@ impl PlayerState {
             volume,
             playing: false,
             stopped: true,
+            cycle_finished: false,
             status,
             update_messages: None,
             update_decision: None,
@@ -964,6 +966,7 @@ impl PlayerState {
             output.player.play();
         }
         self.stopped = false;
+        self.cycle_finished = false;
 
         let playlist = &mut self.playlists[playlist_index];
         if playlist.order.len() != playlist.tracks.len() || !playlist.order.contains(&track_index) {
@@ -989,6 +992,28 @@ impl PlayerState {
         Ok(())
     }
 
+    /// Escoge una pista al azar de la lista activa, excluyendo la que suena
+    /// cuando hay más de una para que el botón siempre cambie de pista. No
+    /// depende del modo aleatorio: sirve también para listas normales.
+    fn play_random(&mut self) {
+        let playlist_index = self.active_playlist;
+        let Some(playlist) = self.playlists.get(playlist_index) else {
+            return;
+        };
+        let track_count = playlist.tracks.len();
+        let current_track = self
+            .current
+            .filter(|(current_playlist, _)| *current_playlist == playlist_index)
+            .map(|(_, current_track)| current_track);
+        let Some(track_index) = random_track_index(track_count, current_track) else {
+            self.status = "Añade pistas a esta lista".to_owned();
+            return;
+        };
+        if let Err(error) = self.play_track(playlist_index, track_index, true) {
+            self.status = error;
+        }
+    }
+
     fn play_selected(&mut self, selected: Option<usize>) {
         let playlist_index = self.active_playlist;
         let Some(playlist) = self.playlists.get(playlist_index) else {
@@ -1011,6 +1036,46 @@ impl PlayerState {
         }
     }
 
+    /// Tras terminar una cola aleatoria sin repetición, arranca un ciclo nuevo
+    /// en vez de reanudar la última pista. Devuelve si ha hecho algo, para que
+    /// `play()` no siga con sus otras vías de arranque.
+    fn restart_finished_shuffle_cycle(&mut self) -> bool {
+        if !self.cycle_finished {
+            return false;
+        }
+        let Some((playlist_index, track)) = self.current else {
+            return false;
+        };
+        if playlist_index != self.active_playlist {
+            return false;
+        }
+        let previous = self
+            .playlists
+            .get(playlist_index)
+            .map(|playlist| playlist.order.clone());
+        let Some(previous) = previous else {
+            return false;
+        };
+        let next_track = {
+            let Some(playlist) = self.playlists.get_mut(playlist_index) else {
+                return false;
+            };
+            if !playlist.shuffle || previous.len() < 2 || previous.last().copied() != Some(track) {
+                return false;
+            }
+            playlist.order = reshuffled_cycle_order(previous.len(), Some(track), &previous);
+            playlist.order_position = playlist.order.len().checked_sub(1);
+            playlist.order.first().copied()
+        };
+        let Some(next_track) = next_track else {
+            return false;
+        };
+        if let Err(error) = self.play_track(playlist_index, next_track, true) {
+            self.status = error;
+        }
+        true
+    }
+
     fn play(&mut self) {
         if self.output.is_none() {
             self.status = "No hay un dispositivo de salida de audio disponible".to_owned();
@@ -1023,6 +1088,9 @@ impl PlayerState {
                 }
                 return;
             }
+        }
+        if self.restart_finished_shuffle_cycle() {
+            return;
         }
         if let Some((playlist, track)) = self.current {
             if playlist == self.active_playlist {
@@ -1064,6 +1132,7 @@ impl PlayerState {
         }
         self.playing = false;
         self.stopped = true;
+        self.cycle_finished = false;
         self.status = "Detenido".to_owned();
     }
 
@@ -1136,7 +1205,10 @@ impl PlayerState {
         let repeat = self.playlists[playlist_index].repeat;
         let shuffle = self.playlists[playlist_index].shuffle;
 
-        if forward && automatic && repeat && shuffle && position == Some(len - 1) {
+        // Toda reanudación de la cola (por repetición o con «siguiente» manual)
+        // estrena orden. Cuando termina sin repetición no se baraja todavía: la
+        // lista se ha acabado y será «Play» quien empiece un ciclo nuevo.
+        if forward && shuffle && position == Some(len - 1) && (repeat || !automatic) {
             if let Some(current_track) = current_track {
                 self.playlists[playlist_index].reshuffle_cycle_after(current_track);
                 order = self.playlists[playlist_index].order.clone();
@@ -1181,6 +1253,7 @@ impl PlayerState {
         }
         self.playing = false;
         self.stopped = true;
+        self.cycle_finished = automatic && shuffle;
         self.status = last_error.unwrap_or_else(|| {
             if automatic {
                 "Reproducción finalizada".to_owned()
@@ -2224,6 +2297,7 @@ struct Ui {
     shuffle_icon: Rid,
     repeat: Rid,
     repeat_icon: Rid,
+    random_icon: Rid,
     import_icon: Rid,
     export_icon: Rid,
     repair_actions: Rid,
@@ -2261,6 +2335,7 @@ impl Ui {
             shuffle_icon: widget_find(window, "shuffle-icon"),
             repeat: widget_find(window, "repeat"),
             repeat_icon: widget_find(window, "repeat-icon"),
+            random_icon: widget_find(window, "random-icon"),
             import_icon: widget_find(window, "import-icon"),
             export_icon: widget_find(window, "export-icon"),
             repair_actions: widget_find(window, "repair-actions"),
@@ -2322,12 +2397,13 @@ fn load_action_icons(ui: Ui) -> Rid {
 
     unsafe {
         for (image, min_u, max_u) in [
-            (ui.shuffle_icon, 0.0, 1.0 / 6.0),
-            (ui.repeat_icon, 1.0 / 6.0, 2.0 / 6.0),
-            (ui.import_icon, 2.0 / 6.0, 3.0 / 6.0),
-            (ui.export_icon, 3.0 / 6.0, 4.0 / 6.0),
-            (ui.restore_icon, 4.0 / 6.0, 5.0 / 6.0),
-            (ui.confirm_icon, 5.0 / 6.0, 1.0),
+            (ui.shuffle_icon, 0.0, 1.0 / 7.0),
+            (ui.repeat_icon, 1.0 / 7.0, 2.0 / 7.0),
+            (ui.import_icon, 2.0 / 7.0, 3.0 / 7.0),
+            (ui.export_icon, 3.0 / 7.0, 4.0 / 7.0),
+            (ui.restore_icon, 4.0 / 7.0, 5.0 / 7.0),
+            (ui.confirm_icon, 5.0 / 7.0, 6.0 / 7.0),
+            (ui.random_icon, 6.0 / 7.0, 1.0),
         ] {
             if image != R_INVALID_ID {
                 Rimage_set_texture(image, texture);
@@ -2403,6 +2479,45 @@ fn next_track_index(current: Option<usize>, playlist_len: usize) -> Option<usize
         return None;
     }
     Some(current.map_or(0, |index| (index + 1) % playlist_len))
+}
+
+/// Primera posición de una cola aleatoria. Si la lista tiene más de una
+/// pista, se excluye la actual para que «al azar» nunca repita la pista que
+/// ya suena.
+fn random_track_index(playlist_len: usize, current_track: Option<usize>) -> Option<usize> {
+    if playlist_len == 0 {
+        return None;
+    }
+    let excluded = current_track.filter(|_| playlist_len > 1);
+    shuffled_track_indices(playlist_len, excluded)
+        .into_iter()
+        .next()
+}
+
+/// Orden de un ciclo nuevo de aleatorio. La pista que acaba de sonar queda la
+/// última para no repetirla al reiniciar, y el resto se baraja de cero, de modo
+/// que el historial del ciclo anterior desaparece. Con listas cortas puede
+/// salir el mismo orden por azar; se vuelve a barajar para que el cambio sea
+/// visible siempre que sea posible.
+fn reshuffled_cycle_order(
+    playlist_len: usize,
+    current_track: Option<usize>,
+    previous_order: &[usize],
+) -> Vec<usize> {
+    let build = || {
+        let mut order = shuffled_track_indices(playlist_len, current_track);
+        if let Some(track) = current_track.filter(|track| *track < playlist_len) {
+            order.push(track);
+        }
+        order
+    };
+    let mut order = build();
+    let mut retries = if playlist_len > 2 { 8 } else { 0 };
+    while order == previous_order && retries > 0 {
+        order = build();
+        retries -= 1;
+    }
+    order
 }
 
 fn shuffled_track_indices(playlist_len: usize, excluded_track: Option<usize>) -> Vec<usize> {
@@ -2482,6 +2597,44 @@ unsafe extern "C" fn track_list_row_text(
         .unwrap_or(EMPTY.as_ptr().cast())
 }
 
+/// Posición de la pista que suena dentro de la cola mezclada, en base 1. Solo
+/// se muestra si el aleatorio está activo y esa lista es la que se está
+/// reproduciendo; si no, el número no tendría sentido para el usuario.
+fn shuffle_progress(
+    playlist: &Playlist,
+    current: Option<(usize, usize)>,
+    playlist_index: usize,
+) -> Option<String> {
+    if !playlist.shuffle || current?.0 != playlist_index {
+        return None;
+    }
+    let position = playlist.order_position?;
+    if playlist.order.is_empty() || position >= playlist.order.len() {
+        return None;
+    }
+    Some(format!("{}/{}", position + 1, playlist.order.len()))
+}
+
+/// Texto bajo «Biblioteca». Se calcula en cada refresco, no dentro de
+/// `update_track_list`, porque esa función sale pronto mientras la lista no
+/// cambie y la posición de la cola sí cambia al avanzar de pista.
+fn playlist_summary_text(
+    playlist: &Playlist,
+    current: Option<(usize, usize)>,
+    playlist_index: usize,
+) -> String {
+    let track_count = playlist.tracks.len();
+    let base = if playlist.is_temporal {
+        format!("{track_count} pistas · no se guarda; renómbrala para conservarla")
+    } else {
+        format!("{track_count} pistas · {}", playlist.name)
+    };
+    match shuffle_progress(playlist, current, playlist_index) {
+        Some(progress) => format!("{progress} · {base}"),
+        None => base,
+    }
+}
+
 fn update_track_list(
     state: &mut PlayerState,
     ui: Ui,
@@ -2503,7 +2656,6 @@ fn update_track_list(
     let name = playlist.name.clone();
     let tracks = playlist.tracks.clone();
     let selected = playlist.selected;
-    let is_temporal = playlist.is_temporal;
     let track_count = tracks.len();
     {
         let mut rows = row_cache.borrow_mut();
@@ -2529,12 +2681,6 @@ fn update_track_list(
     state.editor_loaded_for = None;
     state.ui_selection_dirty = false;
     set_input(ui.playlist_name, &name);
-    let summary = if is_temporal {
-        format!("{track_count} pistas · no se guarda; renómbrala para conservarla")
-    } else {
-        format!("{track_count} pistas · {name}")
-    };
-    set_label(ui.playlist_summary, &summary);
 }
 
 fn update_metadata_editor(state: &mut PlayerState, ui: Ui) {
@@ -2623,6 +2769,10 @@ fn refresh_ui(
     state.poll_instance_messages(window);
     state.update_after_frame();
     update_track_list(state, ui, row_cache);
+    if let Some(playlist) = state.playlists.get(state.active_playlist) {
+        let summary = playlist_summary_text(playlist, state.current, state.active_playlist);
+        set_label(ui.playlist_summary, &summary);
+    }
     update_metadata_editor(state, ui);
     update_cover_art(state, ui);
 
@@ -4651,6 +4801,12 @@ fn main() {
     }
     {
         let state = Rc::clone(&state);
+        action_bind("player.play_random", move |_, _| {
+            state.borrow_mut().play_random();
+        });
+    }
+    {
+        let state = Rc::clone(&state);
         action_bind("player.play_selected", move |sender, _| {
             let selected = unsafe { Rlist_view_get_selected(sender) };
             state
@@ -4860,10 +5016,12 @@ mod tests {
         audio_paths_from_args, auto_scroll_step, cover_dialog_directory, displayed_location_for,
         document_portal_host_path, drag_guide_y, drag_target, existing_directory, format_time,
         is_document_portal_path_in, next_track_index, play_starts_selected, previous_track_index,
+        random_track_index,
         remap_index, repair_audio_file, repair_backup_path, tab_at, tab_close_hit, tab_drop_target,
         tab_guide_x, tab_natural_width, tab_rect, tab_widths, track_row, behavior_from_option_index,
-        MetadataWriteError, OpenBehavior, Playlist, SavedPlaylist, SavedSettings, TabMetrics,
-        TrackMetadata, INITIAL_VOLUME, SESSION_PLAYLIST_NAME,
+        playlist_summary_text, shuffle_progress, MetadataWriteError, OpenBehavior, Playlist,
+        SavedPlaylist, SavedSettings, TabMetrics, TrackMetadata, INITIAL_VOLUME,
+        SESSION_PLAYLIST_NAME,
     };
     use rodio::{Decoder, Source};
     use std::io::Cursor;
@@ -5044,6 +5202,115 @@ mod tests {
         assert_eq!(playlist.selected, Some(0));
         assert_eq!(playlist.saved().order, saved.order);
         assert_eq!(playlist.saved().order_position, saved.order_position);
+    }
+
+    fn shuffled_playlist() -> Playlist {
+        Playlist::from_saved(SavedPlaylist {
+            name: "Mezclada".to_owned(),
+            tracks: vec![
+                PathBuf::from("a.flac"),
+                PathBuf::from("b.flac"),
+                PathBuf::from("c.flac"),
+            ],
+            selected: Some(0),
+            shuffle: true,
+            repeat: false,
+            is_temporal: false,
+            order: vec![2, 0, 1],
+            order_position: Some(1),
+        })
+    }
+
+    fn simple_playlist(name: &str, shuffle: bool, is_temporal: bool) -> Playlist {
+        Playlist::from_saved(SavedPlaylist {
+            name: name.to_owned(),
+            tracks: vec![PathBuf::from("a.flac")],
+            selected: None,
+            shuffle,
+            repeat: false,
+            is_temporal,
+            order: vec![0],
+            order_position: Some(0),
+        })
+    }
+
+    #[test]
+    fn shuffle_cycle_restarts_with_a_fresh_order() {
+        let mut playlist = Playlist::from_saved(SavedPlaylist {
+            name: "Mezclada".to_owned(),
+            tracks: (0..5)
+                .map(|index| PathBuf::from(format!("{index}.flac")))
+                .collect(),
+            selected: Some(4),
+            shuffle: true,
+            repeat: false,
+            is_temporal: false,
+            order: vec![0, 1, 2, 3, 4],
+            order_position: Some(4),
+        });
+        for _ in 0..20 {
+            let previous = playlist.order.clone();
+            let current = *previous.last().unwrap();
+            playlist.reshuffle_cycle_after(current);
+            // Cada reinicio baraja de nuevo y deja la última pista al final.
+            assert_ne!(playlist.order, previous);
+            assert_eq!(playlist.order.last(), Some(&current));
+            assert_eq!(playlist.order.len(), 5);
+            let mut sorted = playlist.order.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, vec![0, 1, 2, 3, 4]);
+            assert_eq!(playlist.order_position, Some(4));
+        }
+    }
+
+    #[test]
+    fn random_track_handles_empty_single_and_exclusion() {
+        assert_eq!(random_track_index(0, None), None);
+        assert_eq!(random_track_index(1, Some(0)), Some(0));
+        let chosen = random_track_index(4, Some(2));
+        assert!(chosen.is_some_and(|index| (0..4).contains(&index) && index != 2));
+    }
+
+    #[test]
+    fn random_track_eventually_reaches_every_index() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            seen.insert(random_track_index(6, None).unwrap());
+        }
+        assert_eq!(seen, (0..6).collect());
+    }
+
+    #[test]
+    fn shuffle_progress_only_shows_for_the_playing_playlist() {
+        let playlist = shuffled_playlist();
+        assert_eq!(
+            shuffle_progress(&playlist, Some((0, 0)), 0).as_deref(),
+            Some("2/3")
+        );
+        // Si suena otra lista, ésta no muestra su contador.
+        assert_eq!(shuffle_progress(&playlist, Some((1, 0)), 0), None);
+        assert_eq!(shuffle_progress(&playlist, None, 0), None);
+        // Sin aleatorio el número no aporta información.
+        let sin_aleatorio = simple_playlist("Normal", false, false);
+        assert_eq!(shuffle_progress(&sin_aleatorio, Some((0, 0)), 0), None);
+    }
+
+    #[test]
+    fn playlist_summary_appends_shuffle_position() {
+        let playlist = shuffled_playlist();
+        assert_eq!(
+            playlist_summary_text(&playlist, Some((0, 0)), 0),
+            "2/3 · 3 pistas · Mezclada"
+        );
+        assert_eq!(
+            playlist_summary_text(&playlist, Some((1, 0)), 0),
+            "3 pistas · Mezclada"
+        );
+        let temporal = simple_playlist("Sesión", false, true);
+        assert_eq!(
+            playlist_summary_text(&temporal, None, 0),
+            "1 pistas · no se guarda; renómbrala para conservarla"
+        );
     }
 
     #[test]

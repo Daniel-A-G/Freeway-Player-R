@@ -20,10 +20,14 @@
         <Splitter Orientation="Horizontal" MinPaneSize="360" Slot.Fill="1">
             <VBox Spacing="10" Slot.Fill="2" Slot.Padding="0,4,18,10">
                 <HBox Spacing="10">
-                    <VBox Spacing="2" Slot.Fill="1">
+                    <VBox Spacing="2">
                         <Label Text="Biblioteca" TextSize="21"/>
                         <Label Name="playlist-summary" Text="Lista vacía" TextSize="12" Color.Text="#8F8999"/>
                     </VBox>
+                    <Button Name="random-button" Style="Flat" Tooltip="Reproducir una pista al azar de esta lista" OnClicked="player.play_random" Slot.VAlign="Center">
+                        <Image Name="random-icon" Width="18" Height="18" TintText="true"/>
+                    </Button>
+                    <Spacer Slot.Fill="1"/>
                     <Button Text="+ Añadir pistas" Style="Primary" Tooltip="Añadir archivos de audio a esta lista" OnClicked="player.open" Slot.VAlign="Center"/>
                     <Button Text="-" Style="Flat" Tooltip="Quitar la pista seleccionada de esta lista" OnClicked="player.remove_track" Slot.VAlign="Center"/>
                     <Button Name="import-button" Style="Flat" Tooltip="Importar lista desde archivo M3U/XSPF" OnClicked="player.import_playlist" Slot.VAlign="Center">
