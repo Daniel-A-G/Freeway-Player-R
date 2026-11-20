@@ -76,6 +76,13 @@ struct SavedPlaylist {
     repeat: bool,
     #[serde(default)]
     is_temporal: bool,
+    /// Orden aleatorio ya elegido. Se guarda para no empezar de cero al volver
+    /// a abrir la aplicación. Vacío en listas sin aleatorio.
+    #[serde(default)]
+    order: Vec<usize>,
+    /// Posición dentro de `order` de la última pista reproducida.
+    #[serde(default)]
+    order_position: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -129,12 +136,28 @@ fn behavior_from_option_index(index: usize) -> Option<OpenBehavior> {
 
 /// Preferencias que sobreviven al cierre del programa. Se guardan aparte de
 /// las listas para que un fallo al escribir una no arrastre a las otras.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct SavedSettings {
     #[serde(default)]
     last_cover_dir: Option<PathBuf>,
     #[serde(default)]
     open_behavior: OpenBehavior,
+    #[serde(default = "default_volume")]
+    volume: f32,
+}
+
+fn default_volume() -> f32 {
+    INITIAL_VOLUME
+}
+
+impl Default for SavedSettings {
+    fn default() -> Self {
+        Self {
+            last_cover_dir: None,
+            open_behavior: OpenBehavior::default(),
+            volume: default_volume(),
+        }
+    }
 }
 
 /// Reparación todavía sin resolver: el archivo ya es la versión reparada y la
@@ -233,7 +256,28 @@ impl Playlist {
             revision: 0,
             is_temporal: saved.is_temporal,
         };
-        playlist.rebuild_order(selected);
+        // Solo reutilizamos un orden guardado si es una permutación válida de
+        // las pistas actuales; si la lista cambió, se regenera como siempre.
+        let valid_order = saved.order.len() == playlist.tracks.len()
+            && saved.order.iter().all(|index| *index < playlist.tracks.len())
+            && saved.order.iter().collect::<HashSet<_>>().len() == playlist.tracks.len();
+        if playlist.shuffle && valid_order {
+            playlist.order = saved.order;
+            playlist.order_position = saved
+                .order_position
+                .filter(|position| *position < playlist.order.len())
+                .or_else(|| {
+                    playlist
+                        .selected
+                        .and_then(|track| playlist.order.iter().position(|item| *item == track))
+                });
+            playlist.selected = playlist
+                .order_position
+                .and_then(|position| playlist.order.get(position).copied())
+                .or(playlist.selected);
+        } else {
+            playlist.rebuild_order(selected);
+        }
         playlist
     }
 
@@ -245,6 +289,8 @@ impl Playlist {
             shuffle: self.shuffle,
             repeat: self.repeat,
             is_temporal: self.is_temporal,
+            order: if self.shuffle { self.order.clone() } else { Vec::new() },
+            order_position: if self.shuffle { self.order_position } else { None },
         }
     }
 
@@ -370,13 +416,20 @@ impl PlayerState {
     fn new() -> Self {
         let (saved, active_playlist) = load_playlists();
         let settings = load_settings();
+        let volume = settings.volume.clamp(0.0, 1.0);
         let mut playlists: Vec<_> = saved.into_iter().map(Playlist::from_saved).collect();
         if playlists.is_empty() {
             playlists.push(Playlist::new("Mi música".to_owned()));
         }
         let active_playlist = active_playlist.min(playlists.len() - 1);
+        // `selected` es la última pista que se puso en marcha. La recuperamos
+        // como pista actual para que «siguiente» continúe la cola aleatoria
+        // guardada en vez de volver a empezar desde el principio.
+        let current = playlists[active_playlist]
+            .selected
+            .map(|track| (active_playlist, track));
 
-        let (output, status) = match create_audio_output() {
+        let (output, status) = match create_audio_output(volume) {
             Ok(output) => (Some(output), "Listo".to_owned()),
             Err(error) => (
                 None,
@@ -388,10 +441,10 @@ impl PlayerState {
             output,
             playlists,
             active_playlist,
-            current: None,
+            current,
             current_metadata: None,
             duration: None,
-            volume: INITIAL_VOLUME,
+            volume,
             playing: false,
             stopped: true,
             status,
@@ -455,6 +508,16 @@ impl PlayerState {
         if let Err(error) = result {
             self.status = format!("No se pudieron guardar las listas: {error}");
         }
+    }
+
+    /// Escribe todas las preferencias en `settings.json` desde el estado actual.
+    fn persist_settings(&mut self) -> Result<(), String> {
+        let settings = SavedSettings {
+            last_cover_dir: self.last_cover_dir.clone(),
+            open_behavior: self.open_behavior,
+            volume: self.volume,
+        };
+        save_settings(&settings)
     }
 
     fn start_update_check(&mut self) {
@@ -1545,11 +1608,7 @@ impl PlayerState {
             return;
         }
         self.last_cover_dir = Some(parent.to_path_buf());
-        let settings = SavedSettings {
-            last_cover_dir: self.last_cover_dir.clone(),
-            open_behavior: self.open_behavior,
-        };
-        if let Err(error) = save_settings(&settings) {
+        if let Err(error) = self.persist_settings() {
             self.status = format!("No se pudo guardar la última carpeta de carátulas: {error}");
         }
     }
@@ -1557,11 +1616,7 @@ impl PlayerState {
     fn set_open_behavior(&mut self, behavior: OpenBehavior) {
         self.open_behavior = behavior;
         self.status = format!("Ajustes: {}", behavior.label());
-        let settings = SavedSettings {
-            last_cover_dir: self.last_cover_dir.clone(),
-            open_behavior: behavior,
-        };
-        if let Err(error) = save_settings(&settings) {
+        if let Err(error) = self.persist_settings() {
             self.status = format!("No se pudo guardar el ajuste: {error}");
         }
     }
@@ -2114,7 +2169,7 @@ fn write_track_metadata(
         })
 }
 
-fn create_audio_output() -> Result<AudioOutput, String> {
+fn create_audio_output(volume: f32) -> Result<AudioOutput, String> {
     #[cfg(target_os = "linux")]
     let stream = {
         use cpal::traits::HostTrait;
@@ -2140,7 +2195,7 @@ fn create_audio_output() -> Result<AudioOutput, String> {
         .map_err(|error| format!("No se pudo abrir la salida de audio: {error}"))?;
 
     let player = Player::connect_new(stream.mixer());
-    player.set_volume(INITIAL_VOLUME);
+    player.set_volume(volume);
     Ok(AudioOutput {
         player,
         _stream: stream,
@@ -2164,6 +2219,7 @@ struct Ui {
     elapsed: Rid,
     total: Rid,
     seek: Rid,
+    volume: Rid,
     shuffle: Rid,
     shuffle_icon: Rid,
     repeat: Rid,
@@ -2200,6 +2256,7 @@ impl Ui {
             elapsed: widget_find(window, "elapsed"),
             total: widget_find(window, "total"),
             seek: widget_find(window, "seek"),
+            volume: widget_find(window, "volume"),
             shuffle: widget_find(window, "shuffle"),
             shuffle_icon: widget_find(window, "shuffle-icon"),
             repeat: widget_find(window, "repeat"),
@@ -3426,6 +3483,19 @@ fn decode_uri_path(s: &str) -> String {
     String::from_utf8_lossy(&result).into_owned()
 }
 
+/// Guarda las preferencias y el estado de las listas justo antes de cerrar.
+/// Así el volumen y la posición de la cola aleatoria sobreviven al reinicio.
+unsafe extern "C" fn window_close_callback(_window: Rid, user_data: *mut c_void) -> c_int {
+    let state = &*(user_data as *const RefCell<PlayerState>);
+    if let Ok(mut state) = state.try_borrow_mut() {
+        if let Err(error) = state.persist_settings() {
+            eprintln!("No se pudieron guardar los ajustes al cerrar: {error}");
+        }
+        state.save_playlists();
+    }
+    R_TRUE
+}
+
 // Drop callback: receive files dragged from the file manager into the window
 unsafe extern "C" fn window_drop_callback(
     _target: Rid,
@@ -4346,6 +4416,7 @@ fn main() {
     let action_icons_texture = load_action_icons(ui);
     let track_list_rows = Box::new(RefCell::new(TrackListRows::default()));
     let state = Rc::new(RefCell::new(PlayerState::new()));
+    unsafe { Rslider_set_value(ui.volume, state.borrow().volume) };
     {
         let mut st = state.borrow_mut();
         st.track_list_widget = ui.track_list;
@@ -4442,6 +4513,11 @@ fn main() {
         Rwidget_set_event_callback(
             ui.playlist_tabs,
             Some(playlist_tabs_event_callback),
+            Rc::as_ptr(&state) as *mut c_void,
+        );
+        Rwindow_set_close_callback(
+            window,
+            Some(window_close_callback),
             Rc::as_ptr(&state) as *mut c_void,
         );
         // Allow dropping audio files from the file manager into the window
@@ -4786,8 +4862,8 @@ mod tests {
         is_document_portal_path_in, next_track_index, play_starts_selected, previous_track_index,
         remap_index, repair_audio_file, repair_backup_path, tab_at, tab_close_hit, tab_drop_target,
         tab_guide_x, tab_natural_width, tab_rect, tab_widths, track_row, behavior_from_option_index,
-        MetadataWriteError, OpenBehavior, Playlist, SavedSettings, TabMetrics, TrackMetadata,
-        SESSION_PLAYLIST_NAME,
+        MetadataWriteError, OpenBehavior, Playlist, SavedPlaylist, SavedSettings, TabMetrics,
+        TrackMetadata, INITIAL_VOLUME, SESSION_PLAYLIST_NAME,
     };
     use rodio::{Decoder, Source};
     use std::io::Cursor;
@@ -4919,11 +4995,13 @@ mod tests {
         let settings = SavedSettings {
             last_cover_dir: Some(PathBuf::from("/home/persona/Imágenes/caratulas")),
             open_behavior: OpenBehavior::AddOnly,
+            volume: 0.37,
         };
         let json = serde_json::to_string(&settings).unwrap();
         let back: SavedSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.last_cover_dir, settings.last_cover_dir);
         assert_eq!(back.open_behavior, OpenBehavior::AddOnly);
+        assert_eq!(back.volume, 0.37);
 
         // Un archivo antiguo o vacío no impide arrancar.
         let empty: SavedSettings = serde_json::from_str("{}").unwrap();
@@ -4935,6 +5013,55 @@ mod tests {
         let settings: SavedSettings = serde_json::from_str(r#"{"last_cover_dir":null}"#).unwrap();
         assert_eq!(settings.open_behavior, OpenBehavior::AddAndPlay);
         assert_eq!(OpenBehavior::default(), OpenBehavior::AddAndPlay);
+    }
+
+    #[test]
+    fn missing_volume_defaults_to_initial_volume() {
+        let settings: SavedSettings = serde_json::from_str(r#"{"last_cover_dir":null}"#).unwrap();
+        assert_eq!(settings.volume, INITIAL_VOLUME);
+        assert_eq!(SavedSettings::default().volume, INITIAL_VOLUME);
+    }
+
+    #[test]
+    fn saved_shuffle_order_survives_a_reload() {
+        let saved = SavedPlaylist {
+            name: "Mezclada".to_owned(),
+            tracks: vec![
+                PathBuf::from("a.flac"),
+                PathBuf::from("b.flac"),
+                PathBuf::from("c.flac"),
+            ],
+            selected: Some(2),
+            shuffle: true,
+            repeat: false,
+            is_temporal: false,
+            order: vec![2, 0, 1],
+            order_position: Some(1),
+        };
+        let playlist = Playlist::from_saved(saved.clone());
+        assert_eq!(playlist.order, vec![2, 0, 1]);
+        assert_eq!(playlist.order_position, Some(1));
+        assert_eq!(playlist.selected, Some(0));
+        assert_eq!(playlist.saved().order, saved.order);
+        assert_eq!(playlist.saved().order_position, saved.order_position);
+    }
+
+    #[test]
+    fn invalid_saved_shuffle_order_is_rebuilt() {
+        let saved = SavedPlaylist {
+            name: "Mezclada".to_owned(),
+            tracks: vec![PathBuf::from("a.flac"), PathBuf::from("b.flac")],
+            selected: Some(1),
+            shuffle: true,
+            repeat: false,
+            is_temporal: false,
+            order: vec![1, 1],
+            order_position: Some(0),
+        };
+        let playlist = Playlist::from_saved(saved);
+        assert_eq!(playlist.order.len(), 2);
+        assert_ne!(playlist.order[0], playlist.order[1]);
+        assert_eq!(playlist.order_position, Some(0));
     }
 
     #[test]
