@@ -1,5 +1,7 @@
 # Freeway Player
 
+> **Aviso:** este proyecto tiene un alto uso de código generado con ayuda de IA. Revisa el código y las pruebas antes de confiar en él o redistribuirlo.
+
 Reproductor local de música para Linux escrito en Rust. La interfaz está descrita en `ui/main.xml` con Raven; reproduce MP3, FLAC, WAV, Ogg/Vorbis, Opus mono/estéreo y M4A. Opus y Vorbis en contenedor Ogg se decodifican en streaming. Permite organizar pistas en listas con pestañas y editar sus etiquetas.
 
 ## Por qué Raven
