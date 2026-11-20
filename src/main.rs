@@ -121,6 +121,12 @@ impl OpenBehavior {
     }
 }
 
+/// Posición de las opciones en el diálogo de ajustes; `None` si el índice no
+/// corresponde a ninguna (por ejemplo, si se cierra sin elegir nada).
+fn behavior_from_option_index(index: usize) -> Option<OpenBehavior> {
+    OpenBehavior::ALL.get(index).copied()
+}
+
 /// Preferencias que sobreviven al cierre del programa. Se guardan aparte de
 /// las listas para que un fallo al escribir una no arrastre a las otras.
 #[derive(Default, Serialize, Deserialize)]
@@ -3101,33 +3107,101 @@ unsafe extern "C" fn check_updates_from_app_menu(_item: Rid, user_data: *mut c_v
     }
 }
 
-struct OpenBehaviorMenuContext {
+/// Datos que necesita el diálogo de ajustes mientras está abierto. Raven
+/// borra el contenido al cerrarlo, así que las opciones se leen en la
+/// devolución de llamada de cierre.
+struct SettingsDialogContext {
     state: Rc<RefCell<PlayerState>>,
-    items: [Rid; 3],
+    options: [Rid; 3],
 }
 
-unsafe extern "C" fn choose_open_behavior(item: Rid, user_data: *mut c_void) {
-    let context = &*(user_data as *const OpenBehaviorMenuContext);
-    let Some(behavior) = OpenBehavior::ALL
-        .iter()
-        .copied()
-        .find(|behavior| context.items[behavior.index()] == item)
-    else {
-        return;
-    };
-    let Ok(mut state) = context.state.try_borrow_mut() else {
-        return;
-    };
-    state.set_open_behavior(behavior);
-    for candidate in OpenBehavior::ALL {
-        let menu_item = context.items[candidate.index()];
-        if menu_item != R_INVALID_ID {
-            Rmenu_item_set_checked(
-                menu_item,
-                if candidate == behavior { R_TRUE } else { R_FALSE },
-            );
-        }
+unsafe extern "C" fn open_settings_dialog(item: Rid, user_data: *mut c_void) {
+    let state = &*(user_data as *const Rc<RefCell<PlayerState>>);
+    let window = Rwidget_get_window(item);
+    let current = state.borrow().open_behavior;
+
+    let content = Rwidget_create(R_WIDGET_VBOX);
+    Rpanel_set_spacing(content, 12.0);
+    Rslot_set_padding(content, 24.0, 20.0, 24.0, 20.0);
+
+    let title = Rlabel_create(cstr("Ajustes").as_ptr());
+    Rlabel_set_text_size(title, 19.0);
+    Rwidget_add_child(content, title);
+
+    let category = Rlabel_create(cstr("Comportamiento al abrir archivos").as_ptr());
+    Rlabel_set_text_size(category, 14.0);
+    Rlabel_set_color(category, 0.725, 0.639, 0.961, 1.0);
+    Rwidget_add_child(content, category);
+
+    let description = Rlabel_create(
+        cstr("Elige qué ocurre cuando abres un archivo con Freeway Player ya en marcha.").as_ptr(),
+    );
+    Rlabel_set_text_size(description, 12.0);
+    Rlabel_set_wrap(description, R_TRUE);
+    Rwidget_add_child(content, description);
+
+    // Las tres casillas radio son hermanas: Raven desmarca las demás del
+    // mismo padre al marcar una.
+    let options_panel = Rwidget_create(R_WIDGET_VBOX);
+    Rpanel_set_spacing(options_panel, 6.0);
+    let mut options = [R_INVALID_ID; 3];
+    for behavior in OpenBehavior::ALL {
+        let option = Rcheckbox_create(cstr(behavior.label()).as_ptr());
+        Rcheckbox_set_style(option, R_CHECKBOX_RADIO);
+        Rcheckbox_set_checked(option, if behavior == current { R_TRUE } else { R_FALSE });
+        Rwidget_add_child(options_panel, option);
+        options[behavior.index()] = option;
     }
+    Rwidget_add_child(content, options_panel);
+
+    let separator = Rwidget_create(R_WIDGET_SEPARATOR);
+    Rwidget_add_child(content, separator);
+
+    let buttons = Rwidget_create(R_WIDGET_HBOX);
+    Rpanel_set_spacing(buttons, 8.0);
+    Rslot_set_halign(buttons, R_HALIGN_RIGHT);
+    let accept = Rbutton_create(cstr("Aceptar").as_ptr());
+    Rbutton_set_style(accept, R_BUTTON_PRIMARY);
+    Rbutton_set_clicked_callback(accept, Some(settings_dialog_accept), std::ptr::null_mut());
+    let cancel = Rbutton_create(cstr("Cancelar").as_ptr());
+    Rbutton_set_style(cancel, R_BUTTON_FLAT);
+    Rbutton_set_clicked_callback(cancel, Some(settings_dialog_cancel), std::ptr::null_mut());
+    Rwidget_add_child(buttons, accept);
+    Rwidget_add_child(buttons, cancel);
+    Rwidget_add_child(content, buttons);
+
+    let context = Box::into_raw(Box::new(SettingsDialogContext {
+        state: Rc::clone(state),
+        options,
+    })) as *mut c_void;
+    Rdialog_open(window, content, Some(settings_dialog_closed), context);
+}
+
+unsafe extern "C" fn settings_dialog_accept(button: Rid, _user_data: *mut c_void) {
+    Rdialog_close(button, R_MESSAGE_RESULT_OK);
+}
+
+unsafe extern "C" fn settings_dialog_cancel(button: Rid, _user_data: *mut c_void) {
+    Rdialog_close(button, R_MESSAGE_RESULT_CANCEL);
+}
+
+unsafe extern "C" fn settings_dialog_closed(_content: Rid, result: c_int, user_data: *mut c_void) {
+    let context = Box::from_raw(user_data as *mut SettingsDialogContext);
+    if result != R_MESSAGE_RESULT_OK {
+        return;
+    }
+    let selected = context
+        .options
+        .iter()
+        .position(|option| Rcheckbox_is_checked(*option) != R_FALSE)
+        .and_then(behavior_from_option_index);
+    let Some(behavior) = selected else {
+        return;
+    };
+    let state = Rc::clone(&context.state);
+    if let Ok(mut state) = state.try_borrow_mut() {
+        state.set_open_behavior(behavior);
+    };
 }
 
 unsafe extern "C" fn open_about_dialog(_item: Rid, user_data: *mut c_void) {
@@ -4297,19 +4371,13 @@ fn main() {
 
     // «Ajustes» va primero para que el comportamiento al abrir archivos esté
     // a mano: es lo que más se toca al usar la app como reproductor del sistema.
-    let settings_title = cstr("Ajustes");
-    let settings_menu = if app_menu != R_INVALID_ID {
-        unsafe { Rmenu_add_menu(app_menu, settings_title.as_ptr()) }
+    let settings_text = cstr("Ajustes");
+    let settings_item = if app_menu != R_INVALID_ID {
+        unsafe { Rmenu_add_item(app_menu, settings_text.as_ptr()) }
     } else {
         R_INVALID_ID
     };
-    let mut behavior_items = [R_INVALID_ID; 3];
-    if settings_menu != R_INVALID_ID {
-        for behavior in OpenBehavior::ALL {
-            let label = cstr(behavior.label());
-            behavior_items[behavior.index()] =
-                unsafe { Rmenu_add_item(settings_menu, label.as_ptr()) };
-        }
+    if settings_item != R_INVALID_ID {
         unsafe { Rmenu_add_separator(app_menu) };
     }
     let check_updates_text = cstr("Buscar actualizaciones");
@@ -4328,10 +4396,6 @@ fn main() {
         state: Rc::clone(&state),
         ui,
     })) as *mut c_void;
-    let behavior_data = Box::into_raw(Box::new(OpenBehaviorMenuContext {
-        state: Rc::clone(&state),
-        items: behavior_items,
-    })) as *mut c_void;
     unsafe {
         Rswitcher_set_index(ui.right_panel, 0);
         Rswitcher_set_index(ui.cover_switcher, 0);
@@ -4347,21 +4411,11 @@ fn main() {
             Some(remove_from_list_from_context_menu),
             Rc::as_ptr(&state) as *mut c_void,
         );
-        let open_behavior = state.borrow().open_behavior;
-        for behavior in OpenBehavior::ALL {
-            let item = behavior_items[behavior.index()];
-            if item == R_INVALID_ID {
-                continue;
-            }
-            Rmenu_item_set_checkable(item, R_TRUE);
-            Rmenu_item_set_checked(
-                item,
-                if behavior == open_behavior { R_TRUE } else { R_FALSE },
-            );
+        if settings_item != R_INVALID_ID {
             Rmenu_item_set_clicked_callback(
-                item,
-                Some(choose_open_behavior),
-                behavior_data,
+                settings_item,
+                Some(open_settings_dialog),
+                &state as *const Rc<RefCell<PlayerState>> as *mut c_void,
             );
         }
         if check_updates_item != R_INVALID_ID {
@@ -4706,7 +4760,6 @@ fn main() {
             Rwidget_destroy(app_menu);
         }
         drop(Box::from_raw(context_data as *mut MetadataMenuContext));
-        drop(Box::from_raw(behavior_data as *mut OpenBehaviorMenuContext));
         let cover_texture = state.borrow().cover_texture;
         Rwindow_destroy(window);
         if cover_texture != R_INVALID_ID {
@@ -4732,8 +4785,9 @@ mod tests {
         document_portal_host_path, drag_guide_y, drag_target, existing_directory, format_time,
         is_document_portal_path_in, next_track_index, play_starts_selected, previous_track_index,
         remap_index, repair_audio_file, repair_backup_path, tab_at, tab_close_hit, tab_drop_target,
-        tab_guide_x, tab_natural_width, tab_rect, tab_widths, track_row, MetadataWriteError,
-        OpenBehavior, Playlist, SavedSettings, TabMetrics, TrackMetadata, SESSION_PLAYLIST_NAME,
+        tab_guide_x, tab_natural_width, tab_rect, tab_widths, track_row, behavior_from_option_index,
+        MetadataWriteError, OpenBehavior, Playlist, SavedSettings, TabMetrics, TrackMetadata,
+        SESSION_PLAYLIST_NAME,
     };
     use rodio::{Decoder, Source};
     use std::io::Cursor;
@@ -4889,6 +4943,14 @@ mod tests {
             assert_eq!(behavior.index(), position);
             assert!(!behavior.label().is_empty());
         }
+    }
+
+    #[test]
+    fn settings_dialog_options_map_to_behaviors() {
+        for (position, behavior) in OpenBehavior::ALL.iter().copied().enumerate() {
+            assert_eq!(behavior_from_option_index(position), Some(behavior));
+        }
+        assert_eq!(behavior_from_option_index(OpenBehavior::ALL.len()), None);
     }
 
     #[test]
