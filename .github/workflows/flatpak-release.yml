@@ -9,16 +9,11 @@ permissions:
   contents: read
 
 jobs:
-  build-and-release:
-    name: Build, publish Flatpak repository, and release
+  build:
+    name: Build Flatpak repository and publish release
     runs-on: ubuntu-24.04
-    environment:
-      name: github-pages
-      url: https://daniel-a-g.github.io/Freeway-Player-R/
     permissions:
       contents: write
-      pages: write
-      id-token: write
 
     steps:
       - name: Check out tagged source
@@ -414,15 +409,6 @@ jobs:
           runtime=org.freedesktop.Platform//25.08
           EOF
 
-      - name: Upload Flatpak repository to GitHub Pages
-        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
-        with:
-          path: repo
-
-      - name: Deploy GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
-
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -442,3 +428,24 @@ jobs:
             release_options+=(--prerelease)
           fi
           gh release create "$tag" "${assets[@]}" "${release_options[@]}"
+
+      - name: Upload Flatpak repository to GitHub Pages
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: repo
+
+  deploy:
+    name: Deploy GitHub Pages
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: https://daniel-a-g.github.io/Freeway-Player-R/
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
