@@ -25,6 +25,7 @@ use url::Url;
 #[cfg(unix)]
 mod activation;
 mod instance;
+mod mpris;
 mod opus;
 mod updates;
 
@@ -363,6 +364,12 @@ struct PlayerState {
     open_behavior: OpenBehavior,
     /// Rutas que envían las siguientes instancias de la app.
     instance_paths: Option<Receiver<Vec<PathBuf>>>,
+    /// Publicador MPRIS y canal de órdenes entrantes (el hilo D-Bus no toca
+    /// `PlayerState`; solo envía comandos aquí).
+    mpris: Option<mpris::MprisHandle>,
+    mpris_commands: Option<Receiver<mpris::MprisCommand>>,
+    /// Carátula ya exportada: (lista, pista, revisión) -> URI del archivo.
+    mpris_art: Option<((usize, usize, u64), String)>,
     pending_repairs: Vec<PendingRepair>,
     drag: DragState,
     tab_drag: TabDragState,
@@ -466,6 +473,9 @@ impl PlayerState {
             last_cover_dir: settings.last_cover_dir,
             open_behavior: settings.open_behavior,
             instance_paths: None,
+            mpris: None,
+            mpris_commands: None,
+            mpris_art: None,
             pending_repairs: load_pending_repairs(),
             drag: DragState::Idle,
             tab_drag: TabDragState::Idle,
@@ -862,6 +872,217 @@ impl PlayerState {
         let behavior = self.open_behavior;
         for paths in batches {
             self.open_in_session(paths, behavior);
+        }
+    }
+
+    /// Estado que expone el servicio MPRIS2. Se calcula en el hilo de UI para
+    /// que el hilo D-Bus nunca tenga que leer `Rc<RefCell<PlayerState>>`.
+    fn mpris_snapshot(&self) -> mpris::MprisSnapshot {
+        let (shuffle, repeat, track_count) = self
+            .playlists
+            .get(self.active_playlist)
+            .map(|playlist| (playlist.shuffle, playlist.repeat, playlist.tracks.len()))
+            .unwrap_or((false, false, 0));
+        let stopped = self.is_stopped();
+
+        let mut track = mpris::MprisTrack {
+            id: mpris::NO_TRACK_ID.to_owned(),
+            ..mpris::MprisTrack::default()
+        };
+        if !stopped {
+            if let Some(location) = self.current {
+                track.id = mpris::track_id(location.0, location.1);
+                let marker = (
+                    location.0,
+                    location.1,
+                    self.playlists
+                        .get(location.0)
+                        .map(|playlist| playlist.revision)
+                        .unwrap_or(0),
+                );
+                if let Some((_, uri)) = self
+                    .mpris_art
+                    .as_ref()
+                    .filter(|(cached, _)| *cached == marker)
+                {
+                    track.art_uri = uri.clone();
+                }
+                if let Some(metadata) = &self.current_metadata {
+                    track.title = metadata.title.clone();
+                    if !metadata.artist.is_empty() {
+                        track.artist = vec![metadata.artist.clone()];
+                    }
+                    if !metadata.album.is_empty() {
+                        track.album = metadata.album.clone();
+                    }
+                    if !metadata.genre.is_empty() {
+                        track.genre = vec![metadata.genre.clone()];
+                    }
+                    track.track_number = metadata
+                        .track
+                        .split('/')
+                        .next()
+                        .and_then(|number| number.trim().parse::<i32>().ok());
+                }
+                if let Some(path) = self.path_at(location) {
+                    track.url = Url::from_file_path(path)
+                        .map(|url| url.to_string())
+                        .unwrap_or_default();
+                }
+                track.length_micros = self
+                    .duration
+                    .or_else(|| self.current_metadata.as_ref().and_then(|meta| meta.duration))
+                    .map(mpris::to_micros);
+            }
+        }
+
+        mpris::MprisSnapshot {
+            playback_status: if stopped {
+                "Stopped"
+            } else if self.playing {
+                "Playing"
+            } else {
+                "Paused"
+            }
+            .to_owned(),
+            metadata: mpris::metadata_for(&track),
+            position_micros: if stopped {
+                0
+            } else {
+                mpris::to_micros(self.position())
+            },
+            volume: f64::from(self.volume),
+            shuffle,
+            loop_status: if repeat { "Playlist" } else { "None" }.to_owned(),
+            can_play: true,
+            can_pause: !stopped,
+            can_go_next: track_count > 0,
+            can_go_previous: track_count > 0,
+            can_seek: !stopped && self.duration.is_some(),
+            can_control: true,
+            seeked_position: None,
+        }
+    }
+
+    /// Extrae la carátula incrustada a la caché para exponerla como
+    /// `mpris:artUrl`. Solo se repite al cambiar de pista o de revisión.
+    fn update_mpris_art(&mut self) {
+        let Some(location) = self.current.filter(|_| !self.is_stopped()) else {
+            self.mpris_art = None;
+            return;
+        };
+        let Some(playlist) = self.playlists.get(location.0) else {
+            self.mpris_art = None;
+            return;
+        };
+        let marker = (location.0, location.1, playlist.revision);
+        if self
+            .mpris_art
+            .as_ref()
+            .is_some_and(|(cached, _)| *cached == marker)
+        {
+            return;
+        }
+        let path = playlist.tracks.get(location.1).cloned();
+        let dir = cache_dir().join("freeway-player").join("mpris");
+        let uri = path
+            .as_deref()
+            .and_then(read_cover_art)
+            .and_then(|data| mpris::write_art_cache(&dir, &data))
+            .and_then(|file| Url::from_file_path(&file).ok().map(|url| url.to_string()));
+        self.mpris_art = uri.map(|uri| (marker, uri));
+    }
+
+    /// Publica el estado tras cada frame, igual que se drenan los otros canales.
+    fn publish_mpris_snapshot(&mut self) {
+        let Some(handle) = self.mpris.clone() else {
+            return;
+        };
+        self.update_mpris_art();
+        handle.publish(self.mpris_snapshot());
+    }
+
+    /// Ningún salto MPRIS debe dejar la posición fuera de la pista.
+    fn mpris_clamp_position(&self, position: i64) -> i64 {
+        let limit = self.duration.map(mpris::to_micros).unwrap_or(i64::MAX);
+        position.clamp(0, limit)
+    }
+
+    /// Marca un salto para que el hilo D-Bus emita la señal `Seeked`.
+    fn notify_mpris_seek(&self) {
+        if let Some(handle) = &self.mpris {
+            handle.mark_seeked(mpris::to_micros(self.position()));
+        }
+    }
+
+    /// Aplica las órdenes recibidas desde D-Bus en el hilo de UI.
+    fn poll_mpris_commands(&mut self) {
+        let Some(receiver) = self.mpris_commands.take() else {
+            return;
+        };
+        let mut disconnected = false;
+        loop {
+            let command = match receiver.try_recv() {
+                Ok(command) => command,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            };
+            match command {
+                mpris::MprisCommand::Play => self.play(),
+                mpris::MprisCommand::Pause => self.pause(),
+                mpris::MprisCommand::Stop => self.stop(),
+                mpris::MprisCommand::Next => self.next(),
+                mpris::MprisCommand::Previous => self.previous(),
+                mpris::MprisCommand::Seek(offset) => {
+                    let target = mpris::seek_target(mpris::to_micros(self.position()), offset);
+                    let target = self.mpris_clamp_position(target);
+                    self.seek(target as f32 / 1_000_000.0);
+                    self.notify_mpris_seek();
+                }
+                mpris::MprisCommand::SetPosition { track_id, position } => {
+                    let is_current = self
+                        .current
+                        .is_some_and(|location| mpris::track_id(location.0, location.1) == track_id);
+                    if is_current && !self.is_stopped() {
+                        let target = self.mpris_clamp_position(position);
+                        self.seek(target as f32 / 1_000_000.0);
+                        self.notify_mpris_seek();
+                    }
+                }
+                mpris::MprisCommand::SetVolume(volume) => {
+                    if volume.is_finite() {
+                        self.set_volume(volume as f32);
+                    }
+                }
+                mpris::MprisCommand::SetShuffle(shuffle) => {
+                    let should_toggle = self
+                        .playlists
+                        .get(self.active_playlist)
+                        .is_some_and(|playlist| playlist.shuffle != shuffle);
+                    if should_toggle {
+                        self.toggle_shuffle();
+                    }
+                }
+                mpris::MprisCommand::SetLoopStatus(status) => {
+                    if let Some(repeat) = mpris::loop_status_to_repeat(&status) {
+                        let should_toggle = self
+                            .playlists
+                            .get(self.active_playlist)
+                            .is_some_and(|playlist| playlist.repeat != repeat);
+                        if should_toggle {
+                            self.toggle_repeat();
+                        }
+                    }
+                }
+            }
+        }
+        if disconnected {
+            self.mpris = None;
+        } else {
+            self.mpris_commands = Some(receiver);
         }
     }
 
@@ -2768,6 +2989,7 @@ fn refresh_ui(
     state.poll_update_check(window);
     state.poll_instance_messages(window);
     state.update_after_frame();
+    state.poll_mpris_commands();
     update_track_list(state, ui, row_cache);
     if let Some(playlist) = state.playlists.get(state.active_playlist) {
         let summary = playlist_summary_text(playlist, state.current, state.active_playlist);
@@ -2878,6 +3100,7 @@ fn refresh_ui(
         Rslider_set_range(ui.seek, 0.0, duration_seconds.max(1.0));
         Rslider_set_value(ui.seek, position.min(duration_seconds));
     }
+    state.publish_mpris_snapshot();
 }
 
 fn add_playlist_tab(tabs: Rid, title: &str, make_active: bool, is_temporal: bool) {
@@ -4568,9 +4791,12 @@ fn main() {
     let state = Rc::new(RefCell::new(PlayerState::new()));
     unsafe { Rslider_set_value(ui.volume, state.borrow().volume) };
     {
+        let (mpris, mpris_commands) = mpris::MprisHandle::start();
         let mut st = state.borrow_mut();
         st.track_list_widget = ui.track_list;
         st.playlist_tabs_widget = ui.playlist_tabs;
+        st.mpris = mpris;
+        st.mpris_commands = Some(mpris_commands);
     }
     if let Some(instance) = &instance {
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -4850,7 +5076,9 @@ fn main() {
         let state = Rc::clone(&state);
         action_bind("player.seek", move |sender, _| {
             let seconds = unsafe { Rslider_get_value(sender) };
-            state.borrow_mut().seek(seconds);
+            let mut st = state.borrow_mut();
+            st.seek(seconds);
+            st.notify_mpris_seek();
         });
     }
     {
