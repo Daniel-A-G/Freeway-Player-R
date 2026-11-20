@@ -25,6 +25,7 @@ Los bindings se incluyen en `vendor/raven-gui` desde la etiqueta `v0.2.1` de Rav
 - Activar aleatorio y repetición por lista (icono de infinito); aleatorio recorre las pistas en un orden mezclado antes de iniciar un nuevo ciclo. Cada vez que la cola vuelve a empezar se baraja de nuevo, con un historial limpio, en lugar de repetir siempre el mismo orden. Las opciones, el orden mezclado y la posición de la cola se guardan junto a cada lista, así que al volver a abrir la app la reproducción aleatoria continúa donde se dejó en lugar de empezar de cero. El resumen bajo «Biblioteca» muestra la posición de la cola (`15/30 · 30 pistas · …`) mientras suene esa lista con el aleatorio activo.
 - El botón de dados a la derecha de «Biblioteca» y del recuento de pistas, antes de «+ Añadir pistas», reproduce una pista al azar de la lista activa. Funciona tanto con aleatorio activo como sin él (no tiene que ver con el modo aleatorio): si ya suena una pista, elige otra distinta.
 - Cambiar volumen y posición desde la barra de progreso, con tiempo transcurrido y duración. El volumen se recuerda entre sesiones en `$XDG_CONFIG_HOME/freeway-player/settings.json`.
+- Aparecer como reproductor del sistema mediante MPRIS2: el área de notificaciones, KDE Connect y otros clientes pueden consultar la pista actual y su carátula, y controlar reproducción, volumen, posición, aleatorio y repetición. No publica la lista de pistas por D-Bus. Si no hay bus de sesión, la reproducción local sigue funcionando igual.
 - Mostrar la carátula de la pista en reproducción, con un distintivo genérico si no hay imagen. Al detener, el panel vuelve al estado inicial y muestra la carátula de la pista seleccionada, de modo que se puede explorar la lista con sus imágenes sin reproducirlas. El menú contextual de cada pista abre el editor de título, artista, álbum, género, número de pista y carátula; los cambios se incrustan en el archivo. El selector de carátula recuerda la última carpeta usada entre sesiones en `$XDG_CONFIG_HOME/freeway-player/settings.json`; si el portal de documentos entrega una ruta efímera (`/run/user/<uid>/doc/…`), se guarda la carpeta real del archivo.
 - Reparar archivos de audio con etiquetas corruptas: si guardar los metadatos falla, la aplicación ofrece repararlos con `ffmpeg` (remux con `-c copy`, sin recodificar) en la misma ruta. Antes guarda una copia del original en `$XDG_CACHE_HOME/freeway-player/repairs/` y deja la pista pendiente, marcada con `⚠` en todas las listas. El editor muestra entonces un aviso con dos acciones: restaurar el original o confirmar la versión reparada como definitiva. Las listas conservan el orden porque el archivo no cambia de ruta.
 - Reproducción automática de la siguiente pista.
@@ -60,6 +61,16 @@ cargo run
 
 Si el sistema no instala Vulkan headers en una ruta que CMake detecte, indica `-DRAVEN_VULKAN_INCLUDE_DIR=/ruta/a/include` al configurar Raven; ese directorio debe contener `vulkan/vulkan.h`.
 
+## Control MPRIS2
+
+Al iniciarse, la aplicación publica en el bus de sesión el nombre `org.mpris.MediaPlayer2.io.github.freewayplayer.FreewayPlayer` y las interfaces `org.mpris.MediaPlayer2` y `org.mpris.MediaPlayer2.Player` en `/org/mpris/MediaPlayer2`. Expone `PlaybackStatus`, `Metadata` (título, artista, álbum, género, número de pista, URL, duración y carátula), `Volume`, `Position`, `Shuffle` y `LoopStatus`, además de las señales `PropertiesChanged` y `Seeked`. Acepta `Play`, `Pause`, `Stop`, `Next`, `Previous`, `Seek` y `SetPosition`, y permite escribir `Volume`, `Shuffle` y `LoopStatus`. `LoopStatus` solo distingue `None` de `Playlist` porque la app no tiene repetición de pista.
+
+La carátula incrustada se extrae a `$XDG_CACHE_HOME/freeway-player/mpris/cover.<ext>` y se anuncia como `mpris:artUrl`; solo se reescribe al cambiar de pista o de carátula. En Flatpak ese directorio equivale a `~/.var/app/io.github.freewayplayer.FreewayPlayer/cache/freeway-player/mpris/`, legible por clientes del host gracias a `--filesystem=home`.
+
+El servicio corre en su propio hilo y solo recibe un snapshot; las órdenes se aplican en el hilo de la interfaz, igual que los botones. Si D-Bus no está disponible, se imprime un aviso por stderr y el reproductor continúa sin control externo.
+
+En Flatpak no hace falta permiso adicional: la política por defecto permite a una app poseer `org.mpris.MediaPlayer2.$FLATPAK_ID`. Eso sí, un bundle instalado antes de esta función debe recompilarse y reinstalarse para incluirla.
+
 ## Flatpak
 
 El manifiesto está en `packaging/io.github.freewayplayer.FreewayPlayer.yml`. Usa el runtime Freedesktop 25.08, compila Raven y luego el binario Rust. Se puede instalar localmente con:
@@ -83,11 +94,11 @@ En el equipo de destino se instala o actualiza con `flatpak install --user --bun
 
 ### Releases automáticos en GitHub
 
-El workflow `.github/workflows/flatpak-release.yml` compila un bundle x86_64 y crea un GitHub Release al publicar un tag `v*`. El tag debe coincidir con la versión de `Cargo.toml`; por ejemplo, para la versión `0.3.4`:
+El workflow `.github/workflows/flatpak-release.yml` compila un bundle x86_64 y crea un GitHub Release al publicar un tag `v*`. El tag debe coincidir con la versión de `Cargo.toml`; por ejemplo, para la versión `0.3.5`:
 
 ```sh
-git tag -a v0.3.4 -m "Freeway Player v0.3.4"
-git push origin main v0.3.4
+git tag -a v0.3.5 -m "Freeway Player v0.3.5"
+git push origin main v0.3.5
 ```
 
 Conviene subir `main` junto con el tag para que la rama remota quede alineada con el Release.
