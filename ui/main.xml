@@ -21,8 +21,9 @@
             <VBox Spacing="10" Slot.Fill="2" Slot.Padding="0,4,18,10">
                 <HBox Spacing="10">
                     <VBox Spacing="2">
-                        <Label Text="Biblioteca" TextSize="21"/>
+                        <Label Name="library-title" Text="Biblioteca" TextSize="21"/>
                         <Label Name="playlist-summary" Text="Lista vacía" TextSize="12" Color.Text="#8F8999"/>
+                        <TextInput Name="youtube-search" Width="220" Placeholder="Buscar en YouTube…" Tooltip="Escribe una búsqueda y pulsa Enter" OnCommitted="player.youtube_search"/>
                     </VBox>
                     <Button Name="random-button" Style="Flat" Tooltip="Reproducir una pista al azar de esta lista" OnClicked="player.play_random" Slot.VAlign="Center">
                         <Image Name="random-icon" Width="18" Height="18" TintText="true"/>
@@ -140,8 +141,9 @@
 
             <HBox Spacing="0">
                 <HBox Spacing="0" Width="272">
-                    <!-- Espacio reservado para una futura acción en la esquina inferior izquierda. -->
-                    <Spacer Width="64"/>
+                    <Button Name="youtube-button" Width="56" Height="40" Style="Flat" Tooltip="Buscar música en YouTube (solo búsqueda, no guarda nada)" OnClicked="player.youtube_toggle">
+                        <Image Name="youtube-icon" Width="24" Height="24" TintText="true"/>
+                    </Button>
                     <Spacer Slot.Fill="1"/>
                 </HBox>
                 <HBox Spacing="8" Slot.Fill="1">

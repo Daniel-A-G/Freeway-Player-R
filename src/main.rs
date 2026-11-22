@@ -28,6 +28,7 @@ mod instance;
 mod mpris;
 mod opus;
 mod updates;
+mod youtube;
 
 const EMBEDDED_UI: &str = include_str!("../ui/main.xml");
 const EMBEDDED_THEME: &str = include_str!("../ui/theme.xml");
@@ -65,10 +66,58 @@ enum CoverChange {
     Remove,
 }
 
+/// Identifica la carátula que debe estar dibujada. En modo buscador la fila
+/// seleccionada es un resultado de YouTube, no una pista de ninguna lista.
+#[derive(Clone, Debug, PartialEq)]
+enum CoverMarker {
+    Local(usize, usize, u64),
+    Youtube {
+        generation: u64,
+        id: String,
+        index: usize,
+    },
+}
+
+/// Pista añadida desde YouTube que no se descarga: se guarda la URL y varios
+/// datos para poder mostrarla en la lista sin volver a consultar la red.
+#[derive(Clone, Serialize, Deserialize)]
+struct StreamingTrack {
+    url: String,
+    title: String,
+    artist: String,
+    thumbnail: Option<String>,
+    duration_secs: Option<u64>,
+}
+
+impl StreamingTrack {
+    fn from_youtube(track: &youtube::YoutubeTrack) -> Self {
+        Self {
+            url: track.url.clone(),
+            title: track.title.clone(),
+            artist: track.channel.clone(),
+            thumbnail: track.thumbnail.clone(),
+            duration_secs: track.duration.map(|duration| duration.as_secs()),
+        }
+    }
+
+    fn metadata(&self) -> TrackMetadata {
+        TrackMetadata {
+            title: self.title.clone(),
+            artist: self.artist.clone(),
+            duration: self.duration_secs.map(Duration::from_secs),
+            ..TrackMetadata::default()
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct SavedPlaylist {
     name: String,
     tracks: Vec<PathBuf>,
+    /// Entradas en streaming, paralelas a `tracks`. `None` es una pista local.
+    /// El campo es opcional para leer listas guardadas antes de esta versión.
+    #[serde(default)]
+    streams: Vec<Option<StreamingTrack>>,
     #[serde(default)]
     selected: Option<usize>,
     #[serde(default)]
@@ -181,6 +230,10 @@ struct SavedSettings {
     open_behavior: OpenBehavior,
     #[serde(default)]
     add_behavior: AddBehavior,
+    /// Carpeta elegida para guardar descargas. `None` usa la de descargas del
+    /// sistema; nunca se escribe nada ahí hasta que el usuario lo pida.
+    #[serde(default)]
+    download_dir: Option<PathBuf>,
     #[serde(default = "default_volume")]
     volume: f32,
 }
@@ -189,12 +242,39 @@ fn default_volume() -> f32 {
     INITIAL_VOLUME
 }
 
+/// Texto que describe la carpeta de descargas en el diálogo de ajustes.
+fn download_dir_text(dir: Option<&Path>) -> String {
+    match dir {
+        Some(path) => {
+            let real = document_portal_host_path(path).unwrap_or_else(|| path.to_path_buf());
+            format!("Carpeta: {}", real.display())
+        }
+        None => match default_download_dir() {
+            Some(path) => format!("Carpeta: {} (predeterminada)", path.display()),
+            None => "Carpeta: predeterminada del sistema".to_owned(),
+        },
+    }
+}
+
+/// Carpeta de descargas del sistema, usada mientras no haya una elegida en
+/// Ajustes. Dentro del Flatpak `HOME` apunta al sandbox, que ya tiene
+/// `--filesystem=home`.
+fn default_download_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_DOWNLOAD_DIR") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads"))
+}
+
 impl Default for SavedSettings {
     fn default() -> Self {
         Self {
             last_cover_dir: None,
             open_behavior: OpenBehavior::default(),
             add_behavior: AddBehavior::default(),
+            download_dir: None,
             volume: default_volume(),
         }
     }
@@ -238,6 +318,7 @@ impl std::fmt::Display for MetadataWriteError {
 struct Playlist {
     name: String,
     tracks: Vec<PathBuf>,
+    streams: Vec<Option<StreamingTrack>>,
     selected: Option<usize>,
     shuffle: bool,
     repeat: bool,
@@ -250,8 +331,15 @@ struct Playlist {
 #[derive(Default)]
 struct TrackListRows {
     tracks: Vec<PathBuf>,
+    streams: Vec<Option<StreamingTrack>>,
     text: Vec<Option<CString>>,
     pending_repairs: HashSet<PathBuf>,
+    /// Fila única que se muestra en el modo YouTube mientras no haya
+    /// resultados: nunca sustituye a las pistas de la lista activa.
+    placeholder: Option<CString>,
+    /// En modo YouTube la lista muestra resultados en memoria, no pistas.
+    youtube: bool,
+    youtube_results: Vec<youtube::YoutubeTrack>,
 }
 
 impl Playlist {
@@ -259,6 +347,7 @@ impl Playlist {
         Self {
             name,
             tracks: Vec::new(),
+            streams: Vec::new(),
             selected: None,
             shuffle: false,
             repeat: false,
@@ -273,6 +362,7 @@ impl Playlist {
         Self {
             name: SESSION_PLAYLIST_NAME.to_owned(),
             tracks: Vec::new(),
+            streams: Vec::new(),
             selected: None,
             shuffle: false,
             repeat: false,
@@ -285,9 +375,13 @@ impl Playlist {
 
     fn from_saved(saved: SavedPlaylist) -> Self {
         let selected = saved.selected.filter(|index| *index < saved.tracks.len());
+        let mut streams = saved.streams;
+        streams.truncate(saved.tracks.len());
+        streams.resize_with(saved.tracks.len(), || None);
         let mut playlist = Self {
             name: saved.name,
             tracks: saved.tracks,
+            streams,
             selected,
             shuffle: saved.shuffle,
             repeat: saved.repeat,
@@ -325,6 +419,7 @@ impl Playlist {
         SavedPlaylist {
             name: self.name.clone(),
             tracks: self.tracks.clone(),
+            streams: self.streams.clone(),
             selected: self.selected,
             shuffle: self.shuffle,
             repeat: self.repeat,
@@ -332,6 +427,10 @@ impl Playlist {
             order: if self.shuffle { self.order.clone() } else { Vec::new() },
             order_position: if self.shuffle { self.order_position } else { None },
         }
+    }
+
+    fn stream_at(&self, index: usize) -> Option<&StreamingTrack> {
+        self.streams.get(index).and_then(Option::as_ref)
     }
 
     /// Cambia el nombre de la lista y devuelve si dejó de ser temporal.
@@ -401,13 +500,42 @@ struct PlayerState {
     editor_loaded_for: Option<(usize, usize)>,
     ui_selection_dirty: bool,
     pending_cover: Option<((usize, usize), CoverChange)>,
-    cover_rendered_for: Option<(usize, usize, u64)>,
+    cover_rendered_for: Option<CoverMarker>,
     cover_texture: Rid,
     track_list_widget: Rid,
     playlist_tabs_widget: Rid,
     last_cover_dir: Option<PathBuf>,
     open_behavior: OpenBehavior,
     add_behavior: AddBehavior,
+    download_dir: Option<PathBuf>,
+    /// El modo YouTube es solo una vista de búsqueda: no guarda resultados ni
+    /// añade pistas a las listas sin una acción explícita del usuario.
+    youtube_mode: bool,
+    /// Resultados de la última búsqueda, en memoria. Se descartan al salir del
+    /// modo YouTube o al abrir una lista.
+    youtube_results: Vec<youtube::YoutubeTrack>,
+    youtube_query: String,
+    youtube_messages: Option<Receiver<youtube::YoutubeMessage>>,
+    youtube_generation: u64,
+    youtube_hint: String,
+    /// Fila seleccionada en el buscador; la sincroniza `refresh_ui` con Raven.
+    youtube_selected: Option<usize>,
+    /// Descarga de audio en curso y resultado al que pertenece.
+    youtube_audio: Option<Receiver<youtube::YoutubeAudioMessage>>,
+    youtube_audio_generation: u64,
+    youtube_pending_audio: Option<(u64, usize)>,
+    /// Resultado que suena y archivo temporal que lo contiene.
+    youtube_current: Option<usize>,
+    youtube_audio_path: Option<PathBuf>,
+    /// Descarga explícita en Opus pedida desde el menú contextual.
+    youtube_downloads: Option<Receiver<youtube::YoutubeDownloadMessage>>,
+    youtube_download_generation: u64,
+    /// Reproducción de pistas añadidas como streaming a una lista normal.
+    stream_audio: Option<Receiver<youtube::YoutubeAudioMessage>>,
+    stream_generation: u64,
+    stream_pending: Option<((usize, usize), u64)>,
+    stream_current: Option<(usize, usize)>,
+    stream_audio_path: Option<PathBuf>,
     /// Rutas que envían las siguientes instancias de la app.
     instance_paths: Option<Receiver<Vec<PathBuf>>>,
     /// Publicador MPRIS y canal de órdenes entrantes (el hilo D-Bus no toca
@@ -519,6 +647,26 @@ impl PlayerState {
             last_cover_dir: settings.last_cover_dir,
             open_behavior: settings.open_behavior,
             add_behavior: settings.add_behavior,
+            download_dir: settings.download_dir,
+            youtube_mode: false,
+            youtube_results: Vec::new(),
+            youtube_query: String::new(),
+            youtube_messages: None,
+            youtube_generation: 0,
+            youtube_hint: "Busca en YouTube… los resultados aparecerán aquí".to_owned(),
+            youtube_selected: None,
+            youtube_audio: None,
+            youtube_audio_generation: 0,
+            youtube_pending_audio: None,
+            youtube_current: None,
+            youtube_audio_path: None,
+            youtube_downloads: None,
+            youtube_download_generation: 0,
+            stream_audio: None,
+            stream_generation: 0,
+            stream_pending: None,
+            stream_current: None,
+            stream_audio_path: None,
             instance_paths: None,
             mpris: None,
             mpris_commands: None,
@@ -575,6 +723,7 @@ impl PlayerState {
             last_cover_dir: self.last_cover_dir.clone(),
             open_behavior: self.open_behavior,
             add_behavior: self.add_behavior,
+            download_dir: self.download_dir.clone(),
             volume: self.volume,
         };
         save_settings(&settings)
@@ -677,13 +826,26 @@ impl PlayerState {
     }
 
     fn set_active_playlist(&mut self, index: usize) {
-        if index >= self.playlists.len() || index == self.active_playlist {
+        if index >= self.playlists.len() {
             return;
+        }
+        // Elegir una lista normal (aunque sea la misma que estaba activa antes
+        // de entrar en el buscador) sale siempre del modo YouTube.
+        let leaving_youtube = self.youtube_mode;
+        if index == self.active_playlist && !leaving_youtube {
+            return;
+        }
+        self.youtube_mode = false;
+        if leaving_youtube {
+            self.clear_youtube_results();
         }
         self.active_playlist = index;
         self.ui_rendered_playlist = None;
         self.editor_loaded_for = None;
         self.save_playlists();
+        if leaving_youtube {
+            self.status = format!("Lista activa: {}", self.playlists[index].name);
+        }
     }
 
     fn rename_active_playlist(&mut self, name: String) -> Option<(usize, String)> {
@@ -764,10 +926,12 @@ impl PlayerState {
         let playlist_index = self.active_playlist;
         let playlist = &mut self.playlists[playlist_index];
         let first_added = playlist.tracks.len();
+        playlist.streams.resize_with(first_added, || None);
         let mut existing: HashSet<_> = playlist.tracks.iter().cloned().collect();
         for path in paths {
             if existing.insert(path.clone()) {
                 playlist.tracks.push(path);
+                playlist.streams.push(None);
             }
         }
         if playlist.tracks.len() == first_added {
@@ -829,6 +993,8 @@ impl PlayerState {
             OpenBehavior::Replace => {
                 let playlist = &mut self.playlists[playlist_index];
                 playlist.tracks = paths.clone();
+                playlist.streams.clear();
+                playlist.streams.resize_with(playlist.tracks.len(), || None);
                 playlist.selected = Some(0);
                 playlist.order.clear();
                 playlist.order_position = None;
@@ -838,10 +1004,12 @@ impl PlayerState {
             OpenBehavior::AddAndPlay | OpenBehavior::AddOnly => {
                 let playlist = &mut self.playlists[playlist_index];
                 let previous_len = playlist.tracks.len();
+                playlist.streams.resize_with(previous_len, || None);
                 let mut existing: HashSet<_> = playlist.tracks.iter().cloned().collect();
                 for path in &paths {
                     if existing.insert(path.clone()) {
                         playlist.tracks.push(path.clone());
+                        playlist.streams.push(None);
                     }
                 }
                 if playlist.tracks.len() > previous_len {
@@ -1158,6 +1326,8 @@ impl PlayerState {
         }
         let track = playlist.tracks.remove(from_index);
         playlist.tracks.insert(to_index, track);
+        let stream = playlist.streams.remove(from_index);
+        playlist.streams.insert(to_index, stream);
 
         // Adjust current track if needed
         if let Some((pl, tr)) = self.current {
@@ -1190,7 +1360,9 @@ impl PlayerState {
         };
 
         if self.current == Some((playlist_index, track_index)) {
-            if let Some(output) = &self.output {
+            if self.stream_pending.is_some() || self.stream_current.is_some() {
+                self.reset_stream_playback();
+            } else if let Some(output) = &self.output {
                 output.player.stop();
             }
             self.current = None;
@@ -1206,6 +1378,9 @@ impl PlayerState {
 
         let playlist = &mut self.playlists[playlist_index];
         playlist.tracks.remove(track_index);
+        if track_index < playlist.streams.len() {
+            playlist.streams.remove(track_index);
+        }
         playlist.selected = if playlist.tracks.is_empty() {
             None
         } else {
@@ -1229,6 +1404,14 @@ impl PlayerState {
         track_index: usize,
         start_playing: bool,
     ) -> Result<(), String> {
+        let stream = self
+            .playlists
+            .get(playlist_index)
+            .and_then(|playlist| playlist.stream_at(track_index))
+            .cloned();
+        if let Some(stream) = stream {
+            return self.play_streaming_track((playlist_index, track_index), stream);
+        }
         let path = self
             .playlists
             .get(playlist_index)
@@ -1303,6 +1486,12 @@ impl PlayerState {
     }
 
     fn play_selected(&mut self, selected: Option<usize>) {
+        // En el buscador el índice es de resultado, no de pista: usarlo con
+        // `play_track` sería lo que hacía recorrer la lista que estaba abierta.
+        if self.youtube_mode {
+            self.play_youtube_result(selected);
+            return;
+        }
         let playlist_index = self.active_playlist;
         let Some(playlist) = self.playlists.get(playlist_index) else {
             return;
@@ -1369,6 +1558,10 @@ impl PlayerState {
             self.status = "No hay un dispositivo de salida de audio disponible".to_owned();
             return;
         }
+        if self.youtube_mode {
+            self.play_youtube_result(None);
+            return;
+        }
         if let Some(location) = self.selected_location() {
             if play_starts_selected(self.current, Some(location)) {
                 if let Err(error) = self.play_track(location.0, location.1, true) {
@@ -1419,7 +1612,13 @@ impl PlayerState {
     }
 
     fn stop(&mut self) {
-        if let Some(output) = &self.output {
+        if self.youtube_mode
+            && (self.youtube_current.is_some() || self.youtube_pending_audio.is_some())
+        {
+            self.reset_youtube_playback();
+        } else if self.stream_pending.is_some() || self.stream_current.is_some() {
+            self.reset_stream_playback();
+        } else if let Some(output) = &self.output {
             output.player.stop();
         }
         self.playing = false;
@@ -1461,6 +1660,19 @@ impl PlayerState {
     }
 
     fn step_track(&mut self, forward: bool) {
+        if self.youtube_mode {
+            let length = self.youtube_results.len();
+            let Some(from) = self.displayed_youtube_index() else {
+                self.status = "Busca un resultado para reproducirlo".to_owned();
+                return;
+            };
+            let Some(next) = Self::youtube_step_index(length, from, forward) else {
+                self.status = "No hay resultados para reproducir".to_owned();
+                return;
+            };
+            self.play_youtube_result(Some(next));
+            return;
+        }
         let playlist_index = self
             .current
             .filter(|(playlist, _)| *playlist == self.active_playlist)
@@ -1600,6 +1812,24 @@ impl PlayerState {
             return;
         }
 
+        if self.youtube_mode {
+            let Some(index) = self.youtube_current else {
+                self.playing = false;
+                return;
+            };
+            let Some(next) = Self::youtube_step_index(self.youtube_results.len(), index, true) else {
+                self.youtube_current = None;
+                self.current_metadata = None;
+                self.duration = None;
+                self.playing = false;
+                self.stopped = true;
+                self.status = "Reproducción finalizada".to_owned();
+                return;
+            };
+            self.play_youtube_result(Some(next));
+            return;
+        }
+
         let Some((playlist_index, _)) = self.current else {
             self.playing = false;
             return;
@@ -1660,6 +1890,15 @@ impl PlayerState {
             self.status = "La pista seleccionada ya no está disponible".to_owned();
             return;
         };
+        if self
+            .playlists
+            .get(location.0)
+            .and_then(|playlist| playlist.stream_at(location.1))
+            .is_some()
+        {
+            self.status = "Las pistas en streaming no se editan".to_owned();
+            return;
+        }
 
         let was_current = self.current == Some(location);
         let was_playing = self.playing;
@@ -1996,6 +2235,653 @@ impl PlayerState {
         self.status = format!("Ajustes: {}", behavior.label());
         if let Err(error) = self.persist_settings() {
             self.status = format!("No se pudo guardar el ajuste: {error}");
+        }
+    }
+
+    fn set_download_dir(&mut self, dir: Option<PathBuf>) {
+        self.download_dir = dir;
+        let effective = self.download_dir.clone().or_else(default_download_dir);
+        self.status = match effective {
+            Some(path) => format!("Ajustes: descargas en {}", path.display()),
+            None => "Ajustes: descargas en la carpeta predeterminada".to_owned(),
+        };
+        if let Err(error) = self.persist_settings() {
+            self.status = format!("No se pudo guardar el ajuste: {error}");
+        }
+    }
+
+    /// Entra o sale del buscador de YouTube. No toca listas ni reproducción:
+    /// es solo un cambio de vista. Al salir se descartan los resultados, porque
+    /// el buscador no guarda nada.
+    fn toggle_youtube_mode(&mut self) {
+        self.youtube_mode = !self.youtube_mode;
+        if !self.youtube_mode {
+            self.clear_youtube_results();
+        }
+        // La lista de la izquierda cambia de contenido: hay que forzar el
+        // renderizado aunque la lista activa no haya cambiado de revisión.
+        self.ui_rendered_playlist = None;
+        self.status = if self.youtube_mode {
+            "Modo YouTube: la lista está desactivada; escribe una búsqueda y pulsa Enter".to_owned()
+        } else {
+            "Modo YouTube desactivado: vuelve la lista activa".to_owned()
+        };
+    }
+
+    fn clear_youtube_results(&mut self) {
+        self.reset_youtube_playback();
+        self.youtube_results.clear();
+        self.youtube_query.clear();
+        self.youtube_messages = None;
+        self.youtube_generation = self.youtube_generation.wrapping_add(1);
+        self.youtube_selected = None;
+        self.youtube_hint = "Busca en YouTube… los resultados aparecerán aquí".to_owned();
+    }
+
+    /// Detiene cualquier audio de YouTube y descarta la descarga en curso. Se
+    /// usa al salir del buscador, al cambiar de lista y al lanzar otra búsqueda,
+    /// para que un resultado nunca siga sonando fuera del modo buscador.
+    fn reset_youtube_playback(&mut self) {
+        let has_youtube_audio = self.youtube_current.is_some()
+            || self.youtube_pending_audio.is_some()
+            || self.youtube_audio.is_some()
+            || self.youtube_audio_path.is_some();
+        if has_youtube_audio {
+            if let Some(output) = &self.output {
+                output.player.clear();
+            }
+            if self.current_metadata.take().is_some() {
+                // Los textos «suena ahora» pertenecían al resultado anterior.
+                self.duration = None;
+            }
+            self.playing = false;
+            self.stopped = true;
+        }
+        self.youtube_audio = None;
+        self.youtube_pending_audio = None;
+        self.youtube_audio_generation = self.youtube_audio_generation.wrapping_add(1);
+        self.youtube_current = None;
+        if let Some(path) = self.youtube_audio_path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    /// Lanza una búsqueda en un hilo aparte. La generación evita que una
+    /// búsqueda antigua sobrescriba los resultados de la última consulta.
+    fn start_youtube_search(&mut self, query: String) {
+        let query = query.trim().to_owned();
+        if query.is_empty() {
+            self.status = "Escribe algo para buscar en YouTube".to_owned();
+            return;
+        }
+        if !self.youtube_mode {
+            self.youtube_mode = true;
+        }
+        self.reset_youtube_playback();
+        self.youtube_generation = self.youtube_generation.wrapping_add(1);
+        let generation = self.youtube_generation;
+        self.youtube_results.clear();
+        self.youtube_query = query.clone();
+        self.youtube_hint = "Buscando en YouTube…".to_owned();
+        self.status = format!("YouTube: buscando «{query}»…");
+        self.ui_rendered_playlist = None;
+        match youtube::start_search(&query, generation) {
+            Ok(messages) => self.youtube_messages = Some(messages),
+            Err(error) => {
+                self.youtube_messages = None;
+                self.youtube_hint = error.clone();
+                self.status = error;
+            }
+        }
+    }
+
+    /// Sondea el canal del hilo de búsqueda desde el bucle de la interfaz, igual
+    /// que se hace con las actualizaciones y los comandos MPRIS.
+    fn poll_youtube_search(&mut self) {
+        let message = self.youtube_messages.as_ref().map(Receiver::try_recv);
+        match message {
+            Some(Ok(youtube::YoutubeMessage::Searching { generation }))
+                if generation == self.youtube_generation =>
+            {
+                self.youtube_hint = "Buscando en YouTube…".to_owned();
+                self.ui_rendered_playlist = None;
+            }
+            Some(Ok(youtube::YoutubeMessage::Results { generation, tracks }))
+                if generation == self.youtube_generation =>
+            {
+                self.youtube_messages = None;
+                self.youtube_results = tracks;
+                let count = self.youtube_results.len();
+                self.youtube_hint = if count == 0 {
+                    "Sin resultados. Prueba con otra búsqueda".to_owned()
+                } else {
+                    String::new()
+                };
+                self.status = format!(
+                    "YouTube: {count} resultado{} para «{}»",
+                    if count == 1 { "" } else { "s" },
+                    self.youtube_query
+                );
+                self.ui_rendered_playlist = None;
+            }
+            Some(Ok(youtube::YoutubeMessage::Error { generation, message }))
+                if generation == self.youtube_generation =>
+            {
+                self.youtube_messages = None;
+                self.youtube_hint = message.clone();
+                self.status = message;
+                self.ui_rendered_playlist = None;
+            }
+            // Mensajes de una búsqueda ya sustituida: se ignoran.
+            Some(Ok(_)) => {}
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.youtube_messages = None;
+                if !self.youtube_results.is_empty() {
+                    self.status = format!(
+                        "YouTube: {} resultado{} para «{}»",
+                        self.youtube_results.len(),
+                        if self.youtube_results.len() == 1 { "" } else { "s" },
+                        self.youtube_query
+                    );
+                }
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    /// Raven no avisa de cada cambio de selección, así que se lee en cada
+    /// fotograma. En modo buscador esa fila nunca se copia a una lista.
+    fn sync_youtube_selection(&mut self, selected: i32) {
+        if !self.youtube_mode {
+            return;
+        }
+        self.youtube_selected = if selected >= 0 && (selected as usize) < self.youtube_results.len()
+        {
+            Some(selected as usize)
+        } else {
+            // Raven devuelve -1 justo después de repintar la lista; mientras
+            // siga sonando un resultado, ese es el marcador válido.
+            self.youtube_current
+        };
+    }
+
+    /// En el buscador manda la fila seleccionada: así la carátula cambia en
+    /// cuanto el usuario elige otro resultado, aunque esté sonando otro.
+    fn displayed_youtube_index(&self) -> Option<usize> {
+        self.youtube_selected.or(self.youtube_current)
+    }
+
+    fn youtube_step_index(length: usize, from: usize, forward: bool) -> Option<usize> {
+        if length == 0 {
+            return None;
+        }
+        let from = from.min(length - 1);
+        Some(if forward {
+            (from + 1) % length
+        } else {
+            (from + length - 1) % length
+        })
+    }
+
+    /// Reproduce un resultado sin tocar `playlists` ni `active_playlist`. El
+    /// audio se descarga primero a la caché porque `rodio` necesita una fuente
+    /// que se pueda leer como un archivo.
+    fn play_youtube_result(&mut self, selected: Option<usize>) {
+        if !self.youtube_mode {
+            return;
+        }
+        let Some(index) = selected
+            .or(self.youtube_selected)
+            .or(self.youtube_current)
+            .or_else(|| (!self.youtube_results.is_empty()).then_some(0))
+        else {
+            self.status = "Busca un resultado para reproducirlo".to_owned();
+            return;
+        };
+        let Some(track) = self.youtube_results.get(index).cloned() else {
+            self.status = "Ese resultado ya no está disponible".to_owned();
+            return;
+        };
+        self.youtube_selected = Some(index);
+
+        // Si es el mismo resultado y sigue cargado, Play solo reanuda. Si ya
+        // terminó, se reutiliza el Opus descargado en vez de volver a bajarlo.
+        {
+            let Some(output) = &self.output else {
+                self.status = "No hay un dispositivo de salida de audio disponible".to_owned();
+                return;
+            };
+            if self.youtube_current == Some(index) && self.youtube_pending_audio.is_none() {
+                if !output.player.empty() {
+                    output.player.play();
+                    self.playing = true;
+                    self.stopped = false;
+                    self.cycle_finished = false;
+                    self.status = "Reproduciendo desde YouTube".to_owned();
+                    return;
+                }
+                if let Some(path) = self.youtube_audio_path.clone().filter(|path| path.is_file()) {
+                    match opus::source_for_path(&path) {
+                        Ok(source) => {
+                            let duration = source.total_duration().or(track.duration);
+                            output.player.clear();
+                            if output.player.empty() {
+                                let _ = output.player.try_seek(Duration::ZERO);
+                            }
+                            output.player.set_volume(self.volume);
+                            output.player.append(source);
+                            output.player.play();
+                            self.youtube_current = Some(index);
+                            self.youtube_selected = Some(index);
+                            self.current = None;
+                            self.current_metadata = Some(TrackMetadata {
+                                title: track.title,
+                                artist: track.channel,
+                                duration,
+                                ..TrackMetadata::default()
+                            });
+                            self.duration = duration;
+                            self.playing = true;
+                            self.stopped = false;
+                            self.cycle_finished = false;
+                            self.status = "Reproduciendo desde YouTube".to_owned();
+                            return;
+                        }
+                        Err(error) => {
+                            self.status =
+                                format!("No se pudo volver a abrir el audio de YouTube: {error}");
+                            return;
+                        }
+                    }
+                }
+            }
+            output.player.clear();
+        }
+
+        // Un streaming de la lista podría seguir en el reproductor: al pasar a
+        // un resultado de YouTube se descarta su audio temporal.
+        self.reset_stream_playback();
+        self.youtube_audio = None;
+        self.youtube_pending_audio = None;
+        self.youtube_audio_generation = self.youtube_audio_generation.wrapping_add(1);
+        let generation = self.youtube_audio_generation;
+        self.youtube_current = None;
+        // `current` apunta a una pista local; si se deja ahí, Siguiente o el
+        // avance automático intentarían seguir la lista que había abierta.
+        self.current = None;
+        self.current_metadata = Some(TrackMetadata {
+            title: track.title.clone(),
+            artist: track.channel.clone(),
+            duration: track.duration,
+            ..TrackMetadata::default()
+        });
+        self.duration = track.duration;
+        self.playing = false;
+        self.stopped = true;
+        self.cycle_finished = false;
+        self.status = format!("YouTube: descargando audio de «{}»…", track.title);
+        match youtube::start_audio(track, generation, index) {
+            Ok(receiver) => {
+                self.youtube_audio = Some(receiver);
+                self.youtube_pending_audio = Some((generation, index));
+            }
+            Err(error) => {
+                self.current_metadata = None;
+                self.duration = None;
+                self.status = error;
+            }
+        }
+    }
+
+    /// Recoge el resultado de la descarga de audio y lo entrega a `rodio` sin
+    /// escribir nada en las listas ni en la configuración.
+    fn poll_youtube_audio(&mut self) {
+        let message = self.youtube_audio.as_ref().map(Receiver::try_recv);
+        match message {
+            Some(Ok(youtube::YoutubeAudioMessage::Ready {
+                generation,
+                index,
+                track,
+                path,
+            })) if self.youtube_pending_audio == Some((generation, index)) => {
+                self.youtube_audio = None;
+                self.youtube_pending_audio = None;
+                let source = match opus::source_for_path(&path) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        let _ = fs::remove_file(&path);
+                        self.current_metadata = None;
+                        self.duration = None;
+                        self.status = format!("No se pudo reproducir el audio de YouTube: {error}");
+                        self.playing = false;
+                        self.stopped = true;
+                        return;
+                    }
+                };
+                let duration = source.total_duration().or(track.duration);
+                {
+                    let Some(output) = &self.output else {
+                        self.status = "No hay un dispositivo de salida de audio disponible".to_owned();
+                        return;
+                    };
+                    output.player.clear();
+                    if output.player.empty() {
+                        let _ = output.player.try_seek(Duration::ZERO);
+                    }
+                    output.player.set_volume(self.volume);
+                    output.player.append(source);
+                    output.player.play();
+                }
+                if let Some(previous) = self.youtube_audio_path.replace(path) {
+                    let _ = fs::remove_file(previous);
+                }
+                self.youtube_current = Some(index);
+                self.youtube_selected = Some(index);
+                self.current = None;
+                self.current_metadata = Some(TrackMetadata {
+                    title: track.title,
+                    artist: track.channel,
+                    duration,
+                    ..TrackMetadata::default()
+                });
+                self.duration = duration;
+                self.playing = true;
+                self.stopped = false;
+                self.cycle_finished = false;
+                self.status = "Reproduciendo desde YouTube".to_owned();
+            }
+            Some(Ok(youtube::YoutubeAudioMessage::Error {
+                generation,
+                index,
+                message,
+            })) if self.youtube_pending_audio == Some((generation, index)) => {
+                self.youtube_audio = None;
+                self.youtube_pending_audio = None;
+                self.current_metadata = None;
+                self.duration = None;
+                self.playing = false;
+                self.stopped = true;
+                self.status = message;
+            }
+            Some(Ok(_)) => {}
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.youtube_audio = None;
+                if self.youtube_pending_audio.take().is_some() {
+                    self.current_metadata = None;
+                    self.duration = None;
+                    self.playing = false;
+                    self.stopped = true;
+                    self.status = "La descarga del audio de YouTube se interrumpió".to_owned();
+                }
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    /// Añade el resultado elegido a la lista activa guardando solo la URL. Es
+    /// una acción explícita: el buscador sigue sin persistir nada por sí mismo.
+    fn add_youtube_to_playlist(&mut self, selected: Option<usize>) {
+        let index = selected
+            .or(self.youtube_selected)
+            .or(self.youtube_current)
+            .or_else(|| (!self.youtube_results.is_empty()).then_some(0));
+        let Some(index) = index else {
+            self.status = "Selecciona un resultado para añadirlo".to_owned();
+            return;
+        };
+        let Some(track) = self.youtube_results.get(index).cloned() else {
+            self.status = "Ese resultado ya no está disponible".to_owned();
+            return;
+        };
+        let playlist_index = self.active_playlist;
+        let Some(playlist) = self.playlists.get(playlist_index) else {
+            return;
+        };
+        let name = playlist.name.clone();
+        if playlist
+            .streams
+            .iter()
+            .flatten()
+            .any(|entry| entry.url == track.url)
+        {
+            self.status = format!("«{}» ya está en la lista {name}", track.title);
+            return;
+        }
+        let new_index = playlist.tracks.len();
+        let playlist = &mut self.playlists[playlist_index];
+        playlist.tracks.push(PathBuf::from(&track.url));
+        playlist
+            .streams
+            .push(Some(StreamingTrack::from_youtube(&track)));
+        playlist.selected = Some(new_index);
+        playlist.revision += 1;
+        self.save_playlists();
+        self.status = format!("Añadido «{}» a {name} (streaming)", track.title);
+    }
+
+    /// Descarga explícita en Opus a la carpeta configurada en Ajustes.
+    fn download_youtube_track(&mut self, selected: Option<usize>) {
+        let index = selected
+            .or(self.youtube_selected)
+            .or(self.youtube_current)
+            .or_else(|| (!self.youtube_results.is_empty()).then_some(0));
+        let Some(index) = index else {
+            self.status = "Selecciona un resultado para descargarlo".to_owned();
+            return;
+        };
+        let Some(track) = self.youtube_results.get(index).cloned() else {
+            self.status = "Ese resultado ya no está disponible".to_owned();
+            return;
+        };
+        let Some(directory) = self.download_dir.clone().or_else(default_download_dir) else {
+            self.status = "Configura una carpeta de descargas en Ajustes".to_owned();
+            return;
+        };
+        self.youtube_download_generation = self.youtube_download_generation.wrapping_add(1);
+        let generation = self.youtube_download_generation;
+        self.status = format!("YouTube: descargando «{}» en Opus…", track.title);
+        match youtube::start_download(track, directory, generation) {
+            Ok(receiver) => self.youtube_downloads = Some(receiver),
+            Err(error) => {
+                self.youtube_downloads = None;
+                self.status = error;
+            }
+        }
+    }
+
+    fn poll_youtube_downloads(&mut self) {
+        let message = self.youtube_downloads.as_ref().map(Receiver::try_recv);
+        match message {
+            Some(Ok(youtube::YoutubeDownloadMessage::Done {
+                generation,
+                title,
+                path,
+            })) if generation == self.youtube_download_generation => {
+                self.youtube_downloads = None;
+                self.status = format!("Descargado «{title}»: {}", path.display());
+            }
+            Some(Ok(youtube::YoutubeDownloadMessage::Error {
+                generation, message,
+            })) if generation == self.youtube_download_generation => {
+                self.youtube_downloads = None;
+                self.status = message;
+            }
+            Some(Ok(_)) => {}
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.youtube_downloads = None;
+                if self.youtube_download_generation > 0 {
+                    self.status = "La descarga se interrumpió".to_owned();
+                }
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    /// Prepara una pista en streaming para reproducción. Igual que con los
+    /// resultados del buscador, `yt-dlp` deja un Opus en la caché; aquí además
+    /// se conserva la posición `(lista, pista)` para que Siguiente funcione.
+    fn play_streaming_track(
+        &mut self,
+        location: (usize, usize),
+        stream: StreamingTrack,
+    ) -> Result<(), String> {
+        if self.output.is_none() {
+            return Err("No hay un dispositivo de salida de audio disponible".to_owned());
+        }
+        self.reset_stream_playback();
+        {
+            let output = self.output.as_ref().unwrap();
+            output.player.clear();
+            if output.player.empty() {
+                let _ = output.player.try_seek(Duration::ZERO);
+            }
+            output.player.set_volume(self.volume);
+        }
+        self.stream_generation = self.stream_generation.wrapping_add(1);
+        let generation = self.stream_generation;
+        self.current = Some(location);
+        self.current_metadata = Some(stream.metadata());
+        self.duration = stream.duration_secs.map(Duration::from_secs);
+        self.playing = false;
+        self.stopped = true;
+        self.cycle_finished = false;
+        self.status = format!(
+            "Descargando audio de «{}» para reproducir en streaming…",
+            stream.title
+        );
+        let track = youtube::YoutubeTrack {
+            id: stream.url.clone(),
+            title: stream.title,
+            channel: stream.artist,
+            duration: self.duration,
+            thumbnail: stream.thumbnail,
+            thumbnail_data: None,
+            url: stream.url,
+            live: false,
+        };
+        match youtube::start_audio(track, generation, 0) {
+            Ok(receiver) => {
+                self.stream_audio = Some(receiver);
+                self.stream_pending = Some((location, generation));
+                Ok(())
+            }
+            Err(error) => {
+                self.current_metadata = None;
+                self.duration = None;
+                Err(error)
+            }
+        }
+    }
+
+    fn poll_stream_audio(&mut self) {
+        let message = self.stream_audio.as_ref().map(Receiver::try_recv);
+        match message {
+            Some(Ok(youtube::YoutubeAudioMessage::Ready {
+                generation,
+                track,
+                path,
+                ..
+            })) if self
+                .stream_pending
+                .is_some_and(|(location, pending)| pending == generation && Some(location) == self.current) =>
+            {
+                let location = match self.stream_pending.take() {
+                    Some((location, _)) => location,
+                    None => return,
+                };
+                self.stream_audio = None;
+                let source = match opus::source_for_path(&path) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        let _ = fs::remove_file(&path);
+                        self.current_metadata = None;
+                        self.duration = None;
+                        self.playing = false;
+                        self.stopped = true;
+                        self.status = format!("No se pudo reproducir el streaming: {error}");
+                        return;
+                    }
+                };
+                let duration = source.total_duration().or(track.duration);
+                {
+                    let Some(output) = &self.output else {
+                        self.status = "No hay un dispositivo de salida de audio disponible".to_owned();
+                        return;
+                    };
+                    output.player.clear();
+                    if output.player.empty() {
+                        let _ = output.player.try_seek(Duration::ZERO);
+                    }
+                    output.player.set_volume(self.volume);
+                    output.player.append(source);
+                    output.player.play();
+                }
+                if let Some(previous) = self.stream_audio_path.replace(path) {
+                    let _ = fs::remove_file(previous);
+                }
+                self.stream_current = Some(location);
+                self.current = Some(location);
+                self.current_metadata = Some(TrackMetadata {
+                    title: track.title,
+                    artist: track.channel,
+                    duration,
+                    ..TrackMetadata::default()
+                });
+                self.duration = duration;
+                self.playing = true;
+                self.stopped = false;
+                self.cycle_finished = false;
+                self.status = "Reproduciendo en streaming".to_owned();
+            }
+            Some(Ok(youtube::YoutubeAudioMessage::Error {
+                generation, message, ..
+            })) if self
+                .stream_pending
+                .is_some_and(|(_, pending)| pending == generation) =>
+            {
+                self.stream_audio = None;
+                self.stream_pending = None;
+                self.current_metadata = None;
+                self.duration = None;
+                self.playing = false;
+                self.stopped = true;
+                self.status = message;
+            }
+            Some(Ok(_)) => {}
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.stream_audio = None;
+                if self.stream_pending.take().is_some() {
+                    self.current_metadata = None;
+                    self.duration = None;
+                    self.playing = false;
+                    self.stopped = true;
+                    self.status = "La descarga del streaming se interrumpió".to_owned();
+                }
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    fn reset_stream_playback(&mut self) {
+        let has_stream_audio = self.stream_audio.is_some()
+            || self.stream_pending.is_some()
+            || self.stream_current.is_some()
+            || self.stream_audio_path.is_some();
+        if has_stream_audio {
+            if self.stream_current.is_some() {
+                if let Some(output) = &self.output {
+                    output.player.clear();
+                }
+            }
+            self.playing = false;
+            self.stopped = true;
+        }
+        self.stream_audio = None;
+        self.stream_pending = None;
+        self.stream_generation = self.stream_generation.wrapping_add(1);
+        self.stream_current = None;
+        if let Some(path) = self.stream_audio_path.take() {
+            let _ = fs::remove_file(path);
         }
     }
 
@@ -2401,20 +3287,49 @@ fn play_starts_selected(
 }
 
 fn update_cover_art(state: &mut PlayerState, ui: Ui) {
-    let location = state.displayed_location();
-    let marker = location.and_then(|(playlist, track)| {
-        state
-            .playlists
-            .get(playlist)
-            .map(|entry| (playlist, track, entry.revision))
-    });
+    let marker = if state.youtube_mode {
+        state.displayed_youtube_index().and_then(|index| {
+            state.youtube_results.get(index).map(|track| CoverMarker::Youtube {
+                generation: state.youtube_generation,
+                id: track.id.clone(),
+                index,
+            })
+        })
+    } else {
+        state.displayed_location().and_then(|(playlist, track)| {
+            state
+                .playlists
+                .get(playlist)
+                .map(|entry| CoverMarker::Local(playlist, track, entry.revision))
+        })
+    };
     if marker == state.cover_rendered_for {
         return;
     }
 
-    let image_data = marker
-        .and_then(|(playlist, track, _)| state.playlists.get(playlist)?.tracks.get(track))
-        .and_then(|path| read_cover_art(path));
+    let image_data = match &marker {
+        Some(CoverMarker::Youtube { index, .. }) => state
+            .youtube_results
+            .get(*index)
+            .and_then(|track| track.thumbnail_data.clone()),
+        Some(CoverMarker::Local(playlist, track, _)) => state
+            .playlists
+            .get(*playlist)
+            .and_then(|entry| entry.tracks.get(*track))
+            .and_then(|path| read_cover_art(path)),
+        None => None,
+    };
+    if state.youtube_mode {
+        state.cover_hint = match (&marker, &image_data) {
+            (Some(CoverMarker::Youtube { .. }), Some(_)) => {
+                "Miniatura del resultado de YouTube".to_owned()
+            }
+            (Some(CoverMarker::Youtube { .. }), None) => {
+                "Este resultado no tiene miniatura".to_owned()
+            }
+            _ => "Selecciona un resultado para ver su carátula".to_owned(),
+        };
+    }
     let new_texture = image_data
         .filter(|data| !data.is_empty())
         .map(|data| unsafe { Rtexture_create(data.as_ptr().cast(), data.len()) })
@@ -2586,7 +3501,11 @@ struct Ui {
     playlist_tabs: Rid,
     playlist_name: Rid,
     playlist_summary: Rid,
+    library_title: Rid,
+    youtube_search: Rid,
     track_list: Rid,
+    youtube_button: Rid,
+    youtube_icon: Rid,
     right_panel: Rid,
     cover_switcher: Rid,
     cover_image: Rid,
@@ -2624,7 +3543,11 @@ impl Ui {
             playlist_tabs: widget_find(window, "playlist-tabs"),
             playlist_name: widget_find(window, "playlist-name"),
             playlist_summary: widget_find(window, "playlist-summary"),
+            library_title: widget_find(window, "library-title"),
+            youtube_search: widget_find(window, "youtube-search"),
             track_list: widget_find(window, "track-list"),
+            youtube_button: widget_find(window, "youtube-button"),
+            youtube_icon: widget_find(window, "youtube-icon"),
             right_panel: widget_find(window, "right-panel"),
             cover_switcher: widget_find(window, "cover-switcher"),
             cover_image: widget_find(window, "cover-image"),
@@ -2702,13 +3625,14 @@ fn load_action_icons(ui: Ui) -> Rid {
 
     unsafe {
         for (image, min_u, max_u) in [
-            (ui.shuffle_icon, 0.0, 1.0 / 7.0),
-            (ui.repeat_icon, 1.0 / 7.0, 2.0 / 7.0),
-            (ui.import_icon, 2.0 / 7.0, 3.0 / 7.0),
-            (ui.export_icon, 3.0 / 7.0, 4.0 / 7.0),
-            (ui.restore_icon, 4.0 / 7.0, 5.0 / 7.0),
-            (ui.confirm_icon, 5.0 / 7.0, 6.0 / 7.0),
-            (ui.random_icon, 6.0 / 7.0, 1.0),
+            (ui.shuffle_icon, 0.0, 1.0 / 8.0),
+            (ui.repeat_icon, 1.0 / 8.0, 2.0 / 8.0),
+            (ui.import_icon, 2.0 / 8.0, 3.0 / 8.0),
+            (ui.export_icon, 3.0 / 8.0, 4.0 / 8.0),
+            (ui.restore_icon, 4.0 / 8.0, 5.0 / 8.0),
+            (ui.confirm_icon, 5.0 / 8.0, 6.0 / 8.0),
+            (ui.random_icon, 6.0 / 8.0, 7.0 / 8.0),
+            (ui.youtube_icon, 7.0 / 8.0, 1.0),
         ] {
             if image != R_INVALID_ID {
                 Rimage_set_texture(image, texture);
@@ -2852,17 +3776,59 @@ fn previous_track_index(current: Option<usize>, playlist_len: usize) -> Option<u
     }))
 }
 
-fn track_row(metadata: &TrackMetadata, index: usize, pending_repair: bool) -> String {
+fn youtube_result_row(track: &youtube::YoutubeTrack, index: usize) -> String {
+    let duration = if track.live {
+        "EN DIRECTO".to_owned()
+    } else {
+        track
+            .duration
+            .map(format_time)
+            .unwrap_or_else(|| "--:--".to_owned())
+    };
+    let channel = if track.channel.is_empty() {
+        "Canal desconocido"
+    } else {
+        track.channel.as_str()
+    };
+    format!(
+        "{:02} {}  ·  {}     {}",
+        index + 1,
+        track.title,
+        channel,
+        duration
+    )
+}
+
+fn track_row(
+    metadata: &TrackMetadata,
+    index: usize,
+    pending_repair: bool,
+    streaming: bool,
+) -> String {
     let duration = metadata
         .duration
         .map(format_time)
         .unwrap_or_else(|| "--:--".to_owned());
     let artist = if metadata.artist.is_empty() {
-        "Artista desconocido"
+        "Artista desconocido".to_owned()
     } else {
-        metadata.artist.as_str()
+        metadata.artist.clone()
     };
-    let marker = if pending_repair { "⚠" } else { " " };
+    // El triángulo va justo antes del título, como el distintivo «▶» del
+    // buscador. `(YouTube)` lo hace explícito aunque se confunda con el icono
+    // de reproducción; una pista en streaming no es un archivo local.
+    let marker = if pending_repair {
+        "⚠"
+    } else if streaming {
+        "▶"
+    } else {
+        " "
+    };
+    let artist = if streaming {
+        format!("{artist} (YouTube)")
+    } else {
+        artist
+    };
     format!(
         "{:02} {marker} {}  ·  {}     {}",
         index + 1,
@@ -2886,15 +3852,47 @@ unsafe extern "C" fn track_list_row_text(
     let Ok(mut rows) = rows.try_borrow_mut() else {
         return EMPTY.as_ptr().cast();
     };
+    if rows.youtube {
+        if let Some(placeholder) = rows.placeholder.as_ref() {
+            return placeholder.as_ptr();
+        }
+        let index = index as usize;
+        let Some(track) = rows.youtube_results.get(index) else {
+            return EMPTY.as_ptr().cast();
+        };
+        if rows.text[index].is_none() {
+            rows.text[index] = Some(cstr(&youtube_result_row(track, index)));
+        }
+        return rows.text[index]
+            .as_ref()
+            .map(|text| text.as_ptr())
+            .unwrap_or(EMPTY.as_ptr().cast());
+    }
+    if let Some(placeholder) = rows.placeholder.as_ref() {
+        return placeholder.as_ptr();
+    }
     let index = index as usize;
     if index >= rows.tracks.len() {
         return EMPTY.as_ptr().cast();
     }
 
     if rows.text[index].is_none() {
-        let metadata = read_track_metadata(&rows.tracks[index]);
-        let pending_repair = rows.pending_repairs.contains(&rows.tracks[index]);
-        rows.text[index] = Some(cstr(&track_row(&metadata, index, pending_repair)));
+        // Las pistas en streaming guardan una URL, no un archivo: usar su
+        // metadato cacheado evita intentar leer la URL como si fuera local.
+        let streaming = rows.streams.get(index).and_then(Option::as_ref);
+        let (metadata, pending_repair) = match streaming {
+            Some(stream) => (stream.metadata(), false),
+            None => (
+                read_track_metadata(&rows.tracks[index]),
+                rows.pending_repairs.contains(&rows.tracks[index]),
+            ),
+        };
+        rows.text[index] = Some(cstr(&track_row(
+            &metadata,
+            index,
+            pending_repair,
+            streaming.is_some(),
+        )));
     }
     rows.text[index]
         .as_ref()
@@ -2950,6 +3948,42 @@ fn update_track_list(
         .iter()
         .map(|pending| pending.path.clone())
         .collect();
+
+    if state.youtube_mode {
+        let marker = (usize::MAX, 0);
+        if state.ui_rendered_playlist == Some(marker) {
+            return;
+        }
+        let count = state.youtube_results.len();
+        let placeholder = (count == 0).then(|| cstr(&state.youtube_hint));
+        {
+            let mut rows = row_cache.borrow_mut();
+            rows.tracks.clear();
+            rows.streams.clear();
+            rows.text.clear();
+            rows.text.resize_with(count, || None);
+            rows.pending_repairs.clear();
+            rows.youtube = true;
+            rows.youtube_results = state.youtube_results.clone();
+            rows.placeholder = placeholder;
+        }
+        let user_data = row_cache as *const RefCell<TrackListRows> as *mut c_void;
+        unsafe {
+            Rlist_view_set_virtual_items(
+                ui.track_list,
+                count.max(1) as i32,
+                Some(track_list_row_text),
+                user_data,
+            );
+            Rlist_view_set_selected(ui.track_list, -1);
+        }
+        state.ui_rendered_playlist = Some(marker);
+        state.editor_loaded_for = None;
+        state.ui_selection_dirty = false;
+        set_input(ui.playlist_name, "");
+        return;
+    }
+
     let Some(playlist) = state.playlists.get(state.active_playlist) else {
         return;
     };
@@ -2960,14 +3994,19 @@ fn update_track_list(
 
     let name = playlist.name.clone();
     let tracks = playlist.tracks.clone();
+    let streams = playlist.streams.clone();
     let selected = playlist.selected;
     let track_count = tracks.len();
     {
         let mut rows = row_cache.borrow_mut();
         rows.tracks = tracks;
+        rows.streams = streams;
         rows.text.clear();
         rows.text.resize_with(track_count, || None);
         rows.pending_repairs = pending_repairs;
+        rows.placeholder = None;
+        rows.youtube = false;
+        rows.youtube_results.clear();
     }
 
     let user_data = row_cache as *const RefCell<TrackListRows> as *mut c_void;
@@ -2989,6 +4028,14 @@ fn update_track_list(
 }
 
 fn update_metadata_editor(state: &mut PlayerState, ui: Ui) {
+    // En el buscador la fila seleccionada es un resultado, no una pista de la
+    // lista: sincronizarla cambiaría `playlist.selected` y podría abrir el
+    // editor de una pista local que no tiene nada que ver.
+    if state.youtube_mode {
+        state.ui_selection_dirty = false;
+        state.metadata_hint = "Los resultados de YouTube no se editan".to_owned();
+        return;
+    }
     // Durante un arrastre la selección de Raven es la guía visual del destino.
     // Sincronizarla de vuelta al modelo aquí provocaría un bucle que movía la
     // selección sin sentido; al soltar, `move_track` ya fija el estado final.
@@ -3032,17 +4079,25 @@ fn update_metadata_editor(state: &mut PlayerState, ui: Ui) {
         state.pending_cover = None;
     }
     state.editor_loaded_for = location;
+    let stream = location
+        .and_then(|(playlist, track)| state.playlists.get(playlist)?.stream_at(track))
+        .cloned();
     let path = location
         .and_then(|(playlist, track)| state.playlists.get(playlist)?.tracks.get(track))
         .cloned();
-    let metadata = path.as_deref().map(read_track_metadata);
+    let metadata = stream
+        .as_ref()
+        .map(StreamingTrack::metadata)
+        .or_else(|| path.as_deref().map(read_track_metadata));
     if let Some(metadata) = metadata {
         set_input(ui.meta_title, &metadata.title);
         set_input(ui.meta_artist, &metadata.artist);
         set_input(ui.meta_album, &metadata.album);
         set_input(ui.meta_genre, &metadata.genre);
         set_input(ui.meta_track, &metadata.track);
-        state.metadata_hint = if path
+        state.metadata_hint = if stream.is_some() {
+            "Las pistas en streaming no se editan".to_owned()
+        } else if path
             .as_deref()
             .is_some_and(|path| state.is_pending_repair(path))
         {
@@ -3050,7 +4105,11 @@ fn update_metadata_editor(state: &mut PlayerState, ui: Ui) {
         } else {
             "Los cambios se escriben en el archivo de audio".to_owned()
         };
-        state.cover_hint = cover_hint_for_location(state, location);
+        state.cover_hint = if stream.is_some() {
+            "Las pistas en streaming no tienen carátula editable".to_owned()
+        } else {
+            cover_hint_for_location(state, location)
+        };
     } else {
         set_input(ui.meta_title, "");
         set_input(ui.meta_artist, "");
@@ -3068,17 +4127,50 @@ fn refresh_ui(
     state: &mut PlayerState,
     ui: Ui,
     row_cache: &RefCell<TrackListRows>,
+    menus: &mut ContextMenus,
     window: Rid,
 ) {
+    menus.sync(ui, state.youtube_mode);
     state.poll_update_check(window);
     state.poll_instance_messages(window);
     state.update_after_frame();
     state.poll_mpris_commands();
+    state.poll_youtube_search();
+    state.poll_youtube_audio();
+    state.poll_youtube_downloads();
+    state.poll_stream_audio();
     update_track_list(state, ui, row_cache);
-    if let Some(playlist) = state.playlists.get(state.active_playlist) {
+    let selected = unsafe { Rlist_view_get_selected(ui.track_list) };
+    state.sync_youtube_selection(selected);
+    set_label(
+        ui.library_title,
+        if state.youtube_mode {
+            "YouTube"
+        } else {
+            "Biblioteca"
+        },
+    );
+    if state.youtube_mode {
+        let count = state.youtube_results.len();
+        let summary = if count == 0 {
+            "Buscador · los resultados no se guardan".to_owned()
+        } else {
+            format!(
+                "{count} resultado{} · los resultados no se guardan",
+                if count == 1 { "" } else { "s" }
+            )
+        };
+        set_label(ui.playlist_summary, &summary);
+    } else if let Some(playlist) = state.playlists.get(state.active_playlist) {
         let summary = playlist_summary_text(playlist, state.current, state.active_playlist);
         set_label(ui.playlist_summary, &summary);
     }
+    let youtube_tooltip = if state.youtube_mode {
+        "Volver a la lista de música"
+    } else {
+        "Buscar música en YouTube (solo búsqueda, no guarda nada)"
+    };
+    unsafe { Rwidget_set_tooltip(ui.youtube_button, cstr(youtube_tooltip).as_ptr()) };
     update_metadata_editor(state, ui);
     update_cover_art(state, ui);
 
@@ -3578,15 +4670,18 @@ fn xml_unescape(s: &str) -> String {
         .replace("&apos;", "'")
 }
 
-struct MetadataMenuContext {
+/// Contexto compartido por los dos menüs contextuales de la lista. Raven no
+/// permite ocultar items, así que hay un menú para listas normales y otro para
+/// resultados de YouTube; ambos usan los mismos datos.
+struct ContextMenuContext {
     state: Rc<RefCell<PlayerState>>,
     ui: Ui,
 }
 
 unsafe extern "C" fn open_metadata_editor_from_context_menu(_item: Rid, user_data: *mut c_void) {
-    let context = &*(user_data as *const MetadataMenuContext);
+    let context = &*(user_data as *const ContextMenuContext);
     let selected = Rlist_view_get_selected(context.ui.track_list);
-    if selected < 0 {
+    if selected < 0 || context.state.borrow().youtube_mode {
         return;
     }
 
@@ -3596,7 +4691,7 @@ unsafe extern "C" fn open_metadata_editor_from_context_menu(_item: Rid, user_dat
     let Some(playlist) = state.playlists.get_mut(playlist_index) else {
         return;
     };
-    if track_index >= playlist.tracks.len() {
+    if track_index >= playlist.tracks.len() || playlist.stream_at(track_index).is_some() {
         return;
     }
     playlist.selected = Some(track_index);
@@ -3614,6 +4709,90 @@ unsafe extern "C" fn remove_from_list_from_context_menu(_item: Rid, user_data: *
     }
 }
 
+/// Descarga explícita del resultado elegido, en Opus y en la carpeta de
+/// descargas configurada. No ocurre nada en silencio: solo lo pide el usuario.
+unsafe extern "C" fn download_opus_from_context_menu(_item: Rid, user_data: *mut c_void) {
+    let context = &*(user_data as *const ContextMenuContext);
+    let selected = Rlist_view_get_selected(context.ui.track_list);
+    let Ok(mut state) = context.state.try_borrow_mut() else {
+        return;
+    };
+    if !state.youtube_mode {
+        return;
+    }
+    let index = (selected >= 0).then_some(selected as usize);
+    state.download_youtube_track(index);
+}
+
+/// Añade el resultado elegido a la lista activa guardando solo la URL, para
+/// poder reproducirlo después en streaming sin descargar el archivo.
+unsafe extern "C" fn add_to_playlist_from_context_menu(_item: Rid, user_data: *mut c_void) {
+    let context = &*(user_data as *const ContextMenuContext);
+    let selected = Rlist_view_get_selected(context.ui.track_list);
+    let Ok(mut state) = context.state.try_borrow_mut() else {
+        return;
+    };
+    if !state.youtube_mode {
+        return;
+    }
+    let index = (selected >= 0).then_some(selected as usize);
+    state.add_youtube_to_playlist(index);
+}
+
+/// Sincroniza la vista con el modo del buscador: menú contextual, caja de
+/// búsqueda y aspecto del logo. `None` fuerza la primera aplicación al arrancar.
+struct ContextMenus {
+    normal: Rid,
+    youtube: Rid,
+    showing_youtube: Option<bool>,
+}
+
+impl ContextMenus {
+    fn new(normal: Rid, youtube: Rid) -> Self {
+        Self {
+            normal,
+            youtube,
+            showing_youtube: None,
+        }
+    }
+
+    fn sync(&mut self, ui: Ui, youtube_mode: bool) {
+        if self.showing_youtube == Some(youtube_mode) {
+            return;
+        }
+        self.showing_youtube = Some(youtube_mode);
+        let menu = if youtube_mode { self.youtube } else { self.normal };
+        unsafe {
+            Rwidget_set_context_menu(ui.track_list, menu);
+            // El modo YouTube es la «lista» activa: se atenúan las pestañas para
+            // que la anterior no parezca la seleccionada (siguen siendo clicables).
+            Rwidget_set_opacity(ui.playlist_tabs, if youtube_mode { 0.6 } else { 1.0 });
+            // El buscador solo existe mientras está activo el modo YouTube.
+            Rwidget_set_visibility(
+                ui.youtube_search,
+                if youtube_mode { R_VISIBLE } else { R_COLLAPSED },
+            );
+            if youtube_mode {
+                // El logo se tiñe con el acento mientras el modo está activo.
+                Rimage_set_tint_text(ui.youtube_icon, R_FALSE);
+                Rimage_set_tint_color(ui.youtube_icon, 0.725, 0.639, 0.961, 1.0);
+                // Al aparecer, el campo ya está listo para escribir.
+                Rwidget_focus(ui.youtube_search);
+            } else {
+                Rimage_set_tint_text(ui.youtube_icon, R_TRUE);
+            }
+        }
+    }
+
+    fn destroy(&self, widget: Rid) {
+        unsafe {
+            Rwidget_set_context_menu(widget, R_INVALID_ID);
+            Rwidget_destroy(self.normal);
+            Rwidget_destroy(self.youtube);
+        }
+    }
+}
+
 unsafe extern "C" fn check_updates_from_app_menu(_item: Rid, user_data: *mut c_void) {
     let state = &*(user_data as *const RefCell<PlayerState>);
     if let Ok(mut state) = state.try_borrow_mut() {
@@ -3628,15 +4807,22 @@ struct SettingsDialogContext {
     state: Rc<RefCell<PlayerState>>,
     open_options: [Rid; 3],
     add_options: [Rid; 2],
+    download_dir: Rc<RefCell<Option<PathBuf>>>,
+    download_dir_label: Rid,
 }
 
 unsafe extern "C" fn open_settings_dialog(item: Rid, user_data: *mut c_void) {
     let state = &*(user_data as *const Rc<RefCell<PlayerState>>);
     let window = Rwidget_get_window(item);
-    let (current_open, current_add) = {
+    let (current_open, current_add, current_download) = {
         let state = state.borrow();
-        (state.open_behavior, state.add_behavior)
+        (
+            state.open_behavior,
+            state.add_behavior,
+            state.download_dir.clone(),
+        )
     };
+    let current_download = Rc::new(RefCell::new(current_download));
 
     let content = Rwidget_create(R_WIDGET_VBOX);
     Rpanel_set_spacing(content, 12.0);
@@ -3699,6 +4885,32 @@ unsafe extern "C" fn open_settings_dialog(item: Rid, user_data: *mut c_void) {
     }
     Rwidget_add_child(content, add_options_panel);
 
+    let downloads_separator = Rwidget_create(R_WIDGET_SEPARATOR);
+    Rwidget_add_child(content, downloads_separator);
+
+    let downloads_category = Rlabel_create(cstr("Descargas").as_ptr());
+    Rlabel_set_text_size(downloads_category, 14.0);
+    Rlabel_set_color(downloads_category, 0.725, 0.639, 0.961, 1.0);
+    Rwidget_add_child(content, downloads_category);
+
+    let downloads_description = Rlabel_create(cstr("Carpeta donde se guardarán las pistas de YouTube que decidas descargar. Buscar y escuchar en streaming no escribe ningún archivo.").as_ptr());
+    Rlabel_set_text_size(downloads_description, 12.0);
+    Rlabel_set_wrap(downloads_description, R_TRUE);
+    Rwidget_add_child(content, downloads_description);
+
+    let downloads_row = Rwidget_create(R_WIDGET_HBOX);
+    Rpanel_set_spacing(downloads_row, 8.0);
+    let download_dir_label = Rlabel_create(
+        cstr(&download_dir_text(current_download.borrow().as_deref())).as_ptr(),
+    );
+    Rlabel_set_text_size(download_dir_label, 12.0);
+    Rslot_set_fill(download_dir_label, 1.0);
+    Rwidget_add_child(downloads_row, download_dir_label);
+    let choose_button = Rbutton_create(cstr("Elegir carpeta…").as_ptr());
+    Rbutton_set_clicked_callback(choose_button, Some(choose_download_dir), std::ptr::null_mut());
+    Rwidget_add_child(downloads_row, choose_button);
+    Rwidget_add_child(content, downloads_row);
+
     let separator = Rwidget_create(R_WIDGET_SEPARATOR);
     Rwidget_add_child(content, separator);
 
@@ -3719,8 +4931,22 @@ unsafe extern "C" fn open_settings_dialog(item: Rid, user_data: *mut c_void) {
         state: Rc::clone(state),
         open_options,
         add_options,
+        download_dir: current_download,
+        download_dir_label,
     })) as *mut c_void;
     Rdialog_open(window, content, Some(settings_dialog_closed), context);
+}
+
+unsafe extern "C" fn choose_download_dir(_button: Rid, user_data: *mut c_void) {
+    let context = &*(user_data as *const SettingsDialogContext);
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("Carpeta de descargas")
+        .pick_folder()
+    else {
+        return;
+    };
+    *context.download_dir.borrow_mut() = Some(path.clone());
+    set_label(context.download_dir_label, &download_dir_text(Some(&path)));
 }
 
 unsafe extern "C" fn settings_dialog_accept(button: Rid, _user_data: *mut c_void) {
@@ -3746,6 +4972,7 @@ unsafe extern "C" fn settings_dialog_closed(_content: Rid, result: c_int, user_d
         .iter()
         .position(|option| Rcheckbox_is_checked(*option) != R_FALSE)
         .and_then(add_behavior_from_option_index);
+    let download_dir = context.download_dir.borrow().clone();
     let state = Rc::clone(&context.state);
     if let Ok(mut state) = state.try_borrow_mut() {
         if let Some(behavior) = open_behavior {
@@ -3754,6 +4981,7 @@ unsafe extern "C" fn settings_dialog_closed(_content: Rid, result: c_int, user_d
         if let Some(behavior) = add_behavior {
             state.set_add_behavior(behavior);
         }
+        state.set_download_dir(download_dir);
     };
 }
 
@@ -4508,14 +5736,18 @@ unsafe extern "C" fn playlist_tabs_event_callback(
             st.tab_drag = TabDragState::Idle;
             let widths = playlist_tab_widths(&st, widget);
             let bar_height = playlist_tab_bar_height();
-            if tab_at(local_x, local_y, &widths, bar_height).is_none() {
+            let Some(index) = tab_at(local_x, local_y, &widths, bar_height) else {
                 return R_FALSE;
-            }
+            };
             // El botón de cerrar no es un asa de arrastre: Raven lo gestiona.
             if tab_close_hit(local_x, local_y, &widths, bar_height) {
                 return R_FALSE;
             }
             st.tab_drag = TabDragState::Pressed { start_x: local_x };
+            // Raven no dispara `playlist_changed` al pulsar la pestaña ya activa;
+            // sin esto, ese clic no sacaría del modo YouTube. `set_active_playlist`
+            // sale pronto cuando no hay cambio de lista ni buscador activo.
+            st.set_active_playlist(index);
             // Sin consumir: Raven activa la pestaña pulsada y actualiza la lista activa.
             R_FALSE
         }
@@ -4633,6 +5865,12 @@ unsafe extern "C" fn track_list_event_callback(
             let Ok(mut st) = state.try_borrow_mut() else {
                 return R_FALSE;
             };
+            // Los resultados no se pueden arrastrar: la fila no corresponde a
+            // una pista de la lista activa.
+            if st.youtube_mode {
+                st.drag = DragState::Idle;
+                return R_FALSE;
+            }
             // Un clic nuevo cancela cualquier gesto anterior. Dejamos pasar el
             // evento (R_FALSE) para que Raven seleccione la fila pulsada: nuestro
             // callback se ejecuta ANTES del widget, así que leer la selección aquí
@@ -4789,6 +6027,9 @@ unsafe extern "C" fn track_list_event_callback(
                 let Ok(mut st) = state.try_borrow_mut() else {
                     return R_FALSE;
                 };
+                if st.youtube_mode {
+                    return R_FALSE;
+                }
                 st.remove_selected_track();
                 return R_TRUE;
             }
@@ -4932,12 +6173,22 @@ fn main() {
         }
     }
     create_drop_guide(window, &state);
+    // Raven no puede ocultar items de un menú, así que se crean dos: el de
+    // siempre para las listas locales y uno propio para el buscador.
     let context_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
+    let youtube_context_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
+    let mut menus = ContextMenus::new(context_menu, youtube_context_menu);
     let app_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
     let edit_metadata_text = cstr("Editar metadatos");
     let edit_metadata_item = unsafe { Rmenu_add_item(context_menu, edit_metadata_text.as_ptr()) };
     let remove_from_list_text = cstr("Eliminar de la lista");
     let remove_from_list_item = unsafe { Rmenu_add_item(context_menu, remove_from_list_text.as_ptr()) };
+    let download_opus_text = cstr("Descargar en Opus");
+    let download_opus_item = unsafe {
+        Rmenu_add_item(youtube_context_menu, download_opus_text.as_ptr())
+    };
+    let add_stream_text = cstr("Añadir a lista de reproducción (Streaming)");
+    let add_stream_item = unsafe { Rmenu_add_item(youtube_context_menu, add_stream_text.as_ptr()) };
 
     // «Ajustes» va primero para que el comportamiento al abrir archivos esté
     // a mano: es lo que más se toca al usar la app como reproductor del sistema.
@@ -4962,7 +6213,7 @@ fn main() {
     } else {
         R_INVALID_ID
     };
-    let context_data = Box::into_raw(Box::new(MetadataMenuContext {
+    let context_data = Box::into_raw(Box::new(ContextMenuContext {
         state: Rc::clone(&state),
         ui,
     })) as *mut c_void;
@@ -4980,6 +6231,16 @@ fn main() {
             remove_from_list_item,
             Some(remove_from_list_from_context_menu),
             Rc::as_ptr(&state) as *mut c_void,
+        );
+        Rmenu_item_set_clicked_callback(
+            download_opus_item,
+            Some(download_opus_from_context_menu),
+            context_data,
+        );
+        Rmenu_item_set_clicked_callback(
+            add_stream_item,
+            Some(add_to_playlist_from_context_menu),
+            context_data,
         );
         if settings_item != R_INVALID_ID {
             Rmenu_item_set_clicked_callback(
@@ -5156,6 +6417,21 @@ fn main() {
     }
     {
         let state = Rc::clone(&state);
+        action_bind("player.youtube_toggle", move |_, _| {
+            state.borrow_mut().toggle_youtube_mode();
+        });
+    }
+    {
+        let state = Rc::clone(&state);
+        let ui = ui;
+        action_bind("player.youtube_search", move |sender, _| {
+            let query = input_value(sender);
+            state.borrow_mut().start_youtube_search(query);
+            set_input(ui.youtube_search, "");
+        });
+    }
+    {
+        let state = Rc::clone(&state);
         action_bind("player.play_selected", move |sender, _| {
             let selected = unsafe { Rlist_view_get_selected(sender) };
             state
@@ -5165,7 +6441,13 @@ fn main() {
     }
     {
         let state = Rc::clone(&state);
-        action_bind("player.play", move |_, _| state.borrow_mut().play());
+        let track_list = ui.track_list;
+        action_bind("player.play", move |_, _| {
+            let selected = unsafe { Rlist_view_get_selected(track_list) };
+            let mut state = state.borrow_mut();
+            state.sync_youtube_selection(selected);
+            state.play();
+        });
     }
     {
         let state = Rc::clone(&state);
@@ -5322,6 +6604,7 @@ fn main() {
         &mut state.borrow_mut(),
         ui,
         track_list_rows.as_ref(),
+        &mut menus,
         window,
     );
     unsafe {
@@ -5330,6 +6613,7 @@ fn main() {
                 &mut state.borrow_mut(),
                 ui,
                 track_list_rows.as_ref(),
+                &mut menus,
                 window,
             );
             if state.borrow().restart_requested {
@@ -5337,12 +6621,11 @@ fn main() {
             }
         }
         Rwindow_close_popups(window);
-        Rwidget_set_context_menu(ui.track_list, R_INVALID_ID);
-        Rwidget_destroy(context_menu);
+        menus.destroy(ui.track_list);
         if app_menu != R_INVALID_ID {
             Rwidget_destroy(app_menu);
         }
-        drop(Box::from_raw(context_data as *mut MetadataMenuContext));
+        drop(Box::from_raw(context_data as *mut ContextMenuContext));
         let cover_texture = state.borrow().cover_texture;
         Rwindow_destroy(window);
         if cover_texture != R_INVALID_ID {
@@ -5364,17 +6647,22 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        audio_paths_from_args, auto_scroll_step, cover_dialog_directory, displayed_location_for,
-        document_portal_host_path, drag_guide_y, drag_target, existing_directory, format_time,
-        is_document_portal_path_in, next_track_index, play_starts_selected, previous_track_index,
-        random_track_index,
-        remap_index, repair_audio_file, repair_backup_path, tab_at, tab_close_hit, tab_drop_target,
-        tab_guide_x, tab_natural_width, tab_rect, tab_widths, track_row,
-        add_behavior_from_option_index, behavior_from_option_index, playlist_summary_text,
-        shuffle_progress, AddBehavior, MetadataWriteError, OpenBehavior, Playlist, SavedPlaylist,
-        SavedSettings, TabMetrics, TrackMetadata, INITIAL_VOLUME, SESSION_PLAYLIST_NAME,
+        add_behavior_from_option_index, audio_paths_from_args, auto_scroll_step,
+        behavior_from_option_index, cover_dialog_directory, cstr, displayed_location_for,
+        document_portal_host_path, download_dir_text, drag_guide_y, drag_target, existing_directory,
+        format_time, is_document_portal_path_in, next_track_index, play_starts_selected,
+        playlist_summary_text, previous_track_index, random_track_index, remap_index,
+        repair_audio_file, repair_backup_path, shuffle_progress, tab_at, tab_close_hit,
+        tab_drop_target, tab_guide_x, tab_natural_width, tab_rect, tab_widths, track_list_row_text,
+        track_row, youtube_result_row, AddBehavior, MetadataWriteError, OpenBehavior, Playlist,
+        PlaylistStore, SavedPlaylist, StreamingTrack,
+        SavedSettings, TabMetrics, TrackListRows, TrackMetadata, INITIAL_VOLUME, R_INVALID_ID,
+        SESSION_PLAYLIST_NAME,
     };
     use rodio::{Decoder, Source};
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    use std::ffi::c_void;
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -5505,6 +6793,7 @@ mod tests {
             last_cover_dir: Some(PathBuf::from("/home/persona/Imágenes/caratulas")),
             open_behavior: OpenBehavior::AddOnly,
             add_behavior: AddBehavior::AddOnly,
+            download_dir: Some(PathBuf::from("/home/persona/Descargas")),
             volume: 0.37,
         };
         let json = serde_json::to_string(&settings).unwrap();
@@ -5512,11 +6801,99 @@ mod tests {
         assert_eq!(back.last_cover_dir, settings.last_cover_dir);
         assert_eq!(back.open_behavior, OpenBehavior::AddOnly);
         assert_eq!(back.add_behavior, AddBehavior::AddOnly);
+        assert_eq!(back.download_dir, settings.download_dir);
         assert_eq!(back.volume, 0.37);
 
         // Un archivo antiguo o vacío no impide arrancar.
         let empty: SavedSettings = serde_json::from_str("{}").unwrap();
         assert!(empty.last_cover_dir.is_none());
+        assert!(empty.download_dir.is_none());
+    }
+
+    #[test]
+    fn missing_download_dir_defaults_to_none() {
+        let settings: SavedSettings = serde_json::from_str(r#"{"last_cover_dir":null}"#).unwrap();
+        assert!(settings.download_dir.is_none());
+        assert!(download_dir_text(None).starts_with("Carpeta:"));
+        assert!(download_dir_text(Some(Path::new("/tmp/descargas")))
+            .contains("/tmp/descargas"));
+    }
+
+    #[test]
+    fn youtube_placeholder_row_does_not_read_a_playlist_track() {
+        let rows = RefCell::new(TrackListRows {
+            tracks: Vec::new(),
+            streams: Vec::new(),
+            text: Vec::new(),
+            pending_repairs: HashSet::new(),
+            placeholder: Some(cstr("Busca en YouTube…")),
+            youtube: true,
+            youtube_results: Vec::new(),
+        });
+        let pointer = unsafe {
+            track_list_row_text(
+                R_INVALID_ID,
+                0,
+                &rows as *const RefCell<TrackListRows> as *mut c_void,
+            )
+        };
+        let value = unsafe { std::ffi::CStr::from_ptr(pointer) }
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(value, "Busca en YouTube…");
+    }
+
+    #[test]
+    fn youtube_results_use_their_own_row_text() {
+        let track = crate::youtube::YoutubeTrack {
+            id: "abc123".to_owned(),
+            title: "Canción de prueba".to_owned(),
+            channel: "Canal de prueba".to_owned(),
+            duration: Some(Duration::from_secs(215)),
+            thumbnail: None,
+            thumbnail_data: None,
+            url: "https://www.youtube.com/watch?v=abc123".to_owned(),
+            live: false,
+        };
+        let rows = RefCell::new(TrackListRows {
+            tracks: vec![PathBuf::from("/una/pista/local.mp3")],
+            streams: vec![None],
+            text: vec![None],
+            pending_repairs: HashSet::new(),
+            placeholder: None,
+            youtube: true,
+            youtube_results: vec![track.clone()],
+        });
+        let pointer = unsafe {
+            track_list_row_text(
+                R_INVALID_ID,
+                0,
+                &rows as *const RefCell<TrackListRows> as *mut c_void,
+            )
+        };
+        let value = unsafe { std::ffi::CStr::from_ptr(pointer) }
+            .to_string_lossy()
+            .into_owned();
+        assert!(value.contains("Canción de prueba"));
+        assert!(value.contains("Canal de prueba"));
+        assert!(value.contains("03:35"));
+        assert!(!value.contains("local.mp3"));
+        assert_eq!(youtube_result_row(&track, 0), value);
+
+        let live = crate::youtube::YoutubeTrack {
+            live: true,
+            duration: None,
+            ..track
+        };
+        assert!(youtube_result_row(&live, 0).contains("EN DIRECTO"));
+    }
+
+    #[test]
+    fn youtube_step_index_wraps_and_handles_empty_results() {
+        assert_eq!(crate::PlayerState::youtube_step_index(3, 0, true), Some(1));
+        assert_eq!(crate::PlayerState::youtube_step_index(3, 2, true), Some(0));
+        assert_eq!(crate::PlayerState::youtube_step_index(3, 0, false), Some(2));
+        assert_eq!(crate::PlayerState::youtube_step_index(0, 0, true), None);
     }
 
     #[test]
@@ -5541,6 +6918,36 @@ mod tests {
     }
 
     #[test]
+    fn old_playlists_without_streams_still_load() {
+        let json = r#"{"playlists":[{"name":"Antigua","tracks":["a.flac","b.flac"],"selected":null,"shuffle":false,"repeat":false,"is_temporal":false,"order":[0,1],"order_position":null}],"active_playlist":0}"#;
+        let store: PlaylistStore = serde_json::from_str(json).unwrap();
+        let playlist = Playlist::from_saved(store.playlists.into_iter().next().unwrap());
+        assert_eq!(playlist.tracks.len(), 2);
+        assert_eq!(playlist.streams.len(), 2);
+        assert!(playlist.streams.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn streaming_tracks_survive_a_playlist_round_trip() {
+        let stream = StreamingTrack {
+            url: "https://www.youtube.com/watch?v=abc123".to_owned(),
+            title: "Canción en streaming".to_owned(),
+            artist: "Canal".to_owned(),
+            thumbnail: None,
+            duration_secs: Some(215),
+        };
+        let mut playlist = Playlist::new("Lista".to_owned());
+        playlist.tracks.push(PathBuf::from(&stream.url));
+        playlist.streams.push(Some(stream.clone()));
+        let json = serde_json::to_string(&playlist.saved()).unwrap();
+        let restored = Playlist::from_saved(serde_json::from_str(&json).unwrap());
+        let restored_stream = restored.stream_at(0).expect("la pista en streaming se conserva");
+        assert_eq!(restored_stream.url, stream.url);
+        assert_eq!(restored_stream.title, stream.title);
+        assert_eq!(restored_stream.metadata().title, "Canción en streaming");
+    }
+
+    #[test]
     fn saved_shuffle_order_survives_a_reload() {
         let saved = SavedPlaylist {
             name: "Mezclada".to_owned(),
@@ -5549,6 +6956,7 @@ mod tests {
                 PathBuf::from("b.flac"),
                 PathBuf::from("c.flac"),
             ],
+            streams: Vec::new(),
             selected: Some(2),
             shuffle: true,
             repeat: false,
@@ -5572,6 +6980,7 @@ mod tests {
                 PathBuf::from("b.flac"),
                 PathBuf::from("c.flac"),
             ],
+            streams: Vec::new(),
             selected: Some(0),
             shuffle: true,
             repeat: false,
@@ -5585,6 +6994,7 @@ mod tests {
         Playlist::from_saved(SavedPlaylist {
             name: name.to_owned(),
             tracks: vec![PathBuf::from("a.flac")],
+            streams: Vec::new(),
             selected: None,
             shuffle,
             repeat: false,
@@ -5601,6 +7011,7 @@ mod tests {
             tracks: (0..5)
                 .map(|index| PathBuf::from(format!("{index}.flac")))
                 .collect(),
+            streams: Vec::new(),
             selected: Some(4),
             shuffle: true,
             repeat: false,
@@ -5678,6 +7089,7 @@ mod tests {
         let saved = SavedPlaylist {
             name: "Mezclada".to_owned(),
             tracks: vec![PathBuf::from("a.flac"), PathBuf::from("b.flac")],
+            streams: Vec::new(),
             selected: Some(1),
             shuffle: true,
             repeat: false,
@@ -5747,8 +7159,24 @@ mod tests {
     #[test]
     fn track_row_marks_pending_repairs() {
         let metadata = TrackMetadata::default();
-        assert!(track_row(&metadata, 0, true).contains('⚠'));
-        assert!(!track_row(&metadata, 0, false).contains('⚠'));
+        assert!(track_row(&metadata, 0, true, false).contains('⚠'));
+        assert!(!track_row(&metadata, 0, false, false).contains('⚠'));
+    }
+
+    #[test]
+    fn track_row_marks_streaming_tracks() {
+        let metadata = TrackMetadata {
+            title: "Canción en streaming".to_owned(),
+            artist: "Canal".to_owned(),
+            ..TrackMetadata::default()
+        };
+        let local = track_row(&metadata, 0, false, false);
+        let stream = track_row(&metadata, 0, false, true);
+        assert!(!local.contains('▶'));
+        assert!(!local.contains("(YouTube)"));
+        assert!(stream.contains('▶'));
+        assert!(stream.contains("(YouTube)"));
+        assert!(stream.contains("Canción en streaming"));
     }
 
     #[test]
@@ -5796,7 +7224,7 @@ mod tests {
 
         let repaired = repair_audio_file(&original).expect("ffmpeg debe reparar el MP3");
         assert!(std::fs::metadata(&repaired).unwrap().len() > 0);
-        let mut file =
+        let file =
             lofty::read_from_path(&repaired).expect("el archivo reparado debe leerse");
         file.save_to_path(&repaired, lofty::config::WriteOptions::default())
             .expect("el archivo reparado debe admitir escritura");
