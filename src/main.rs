@@ -24,6 +24,7 @@ use url::Url;
 
 #[cfg(unix)]
 mod activation;
+mod converter;
 mod instance;
 mod mpris;
 mod opus;
@@ -489,6 +490,39 @@ impl Playlist {
     }
 }
 
+/// Opciones elegidas en el diálogo que debe aplicar el hilo principal cuando
+/// termina cada archivo. Las listas se reescriben una sola vez al final.
+struct PendingConversion {
+    total: usize,
+    finished: usize,
+    failed: usize,
+    skipped: usize,
+    replacements: Vec<(PathBuf, PathBuf)>,
+    /// FLAC y Opus final generado para cada borrado pendiente.
+    deletions: Vec<(PathBuf, PathBuf)>,
+    replace_in_lists: bool,
+    delete_flac: bool,
+    /// FLAC que estaba sonando al iniciar el lote: no se borra en caliente.
+    playing_source: Option<PathBuf>,
+}
+
+fn conversion_generation(message: &converter::ConversionMessage) -> u64 {
+    use converter::ConversionMessage as Message;
+    match message {
+        Message::Started { generation, .. }
+        | Message::Done { generation, .. }
+        | Message::Error { generation, .. } => *generation,
+    }
+}
+
+fn replacement_target(replacements: &[(PathBuf, PathBuf)], path: PathBuf) -> PathBuf {
+    replacements
+        .iter()
+        .find(|(source, _)| source == &path)
+        .map(|(_, output)| output.clone())
+        .unwrap_or(path)
+}
+
 struct PlayerState {
     output: Option<AudioOutput>,
     playlists: Vec<Playlist>,
@@ -561,6 +595,10 @@ struct PlayerState {
     /// Carátula ya exportada: (lista, pista, revisión) -> URI del archivo.
     mpris_art: Option<((usize, usize, u64), String)>,
     pending_repairs: Vec<PendingRepair>,
+    /// Lote de conversión en curso y opciones del diálogo que lo originó.
+    converter_messages: Option<Receiver<converter::ConversionMessage>>,
+    converter_generation: u64,
+    converter_pending: Option<PendingConversion>,
     drag: DragState,
     tab_drag: TabDragState,
 }
@@ -690,6 +728,9 @@ impl PlayerState {
             mpris_commands: None,
             mpris_art: None,
             pending_repairs: load_pending_repairs(),
+            converter_messages: None,
+            converter_generation: 0,
+            converter_pending: None,
             drag: DragState::Idle,
             tab_drag: TabDragState::Idle,
         }
@@ -1899,6 +1940,232 @@ impl PlayerState {
             .get(self.active_playlist)?
             .selected
             .map(|track| (self.active_playlist, track))
+    }
+
+    fn selected_is_flac(&self) -> bool {
+        self.selected_location()
+            .and_then(|(playlist, track)| self.playlists.get(playlist)?.tracks.get(track))
+            .is_some_and(|path| converter::is_flac(path))
+    }
+
+    /// Ruta local cargada en el reproductor ahora mismo, si la hay.
+    /// En estado detenido `current` solo marca la fila mostrada: no hay archivo
+    /// abierto, así que borrar ese FLAC no interrumpe nada.
+    fn playing_source_path(&self) -> Option<PathBuf> {
+        if self.is_stopped() {
+            return None;
+        }
+        let (playlist, track) = self.current?;
+        let playlist = self.playlists.get(playlist)?;
+        if playlist.stream_at(track).is_some() {
+            return None;
+        }
+        playlist.tracks.get(track).cloned()
+    }
+
+    fn start_conversion_job(
+        &mut self,
+        tasks: Vec<converter::ConversionTask>,
+        generation: u64,
+        replace_in_lists: bool,
+        delete_flac: bool,
+        skipped: usize,
+    ) -> Result<(), String> {
+        let total = tasks.len() + skipped;
+        let pending = PendingConversion {
+            total,
+            // Los omitidos no generan mensajes: los contamos como cerrados.
+            finished: skipped,
+            failed: 0,
+            skipped,
+            replacements: Vec::new(),
+            deletions: Vec::new(),
+            replace_in_lists,
+            delete_flac,
+            playing_source: self.playing_source_path(),
+        };
+        let converting = tasks.len();
+        let receiver = converter::start_conversion(tasks, generation)?;
+        self.converter_generation = generation;
+        self.converter_messages = Some(receiver);
+        self.converter_pending = Some(pending);
+        self.status = format!("Convirtiendo {} archivo…", converting);
+        Ok(())
+    }
+
+    fn poll_conversion(&mut self) {
+        loop {
+            let message = match self.converter_messages.as_ref().map(Receiver::try_recv) {
+                Some(Ok(message)) => message,
+                Some(Err(TryRecvError::Empty)) | None => return,
+                Some(Err(TryRecvError::Disconnected)) => {
+                    let interrupted = self
+                        .converter_pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.finished < pending.total);
+                    self.converter_messages = None;
+                    if interrupted {
+                        self.converter_pending = None;
+                        self.status = "La conversión se interrumpió".to_owned();
+                    }
+                    return;
+                }
+            };
+            if self.converter_generation != conversion_generation(&message) {
+                continue;
+            }
+            self.handle_conversion_message(message);
+        }
+    }
+
+    fn handle_conversion_message(&mut self, message: converter::ConversionMessage) {
+        use converter::ConversionMessage as Message;
+
+        let Some(pending) = self.converter_pending.as_mut() else {
+            return;
+        };
+        match message {
+            Message::Started {
+                index, source, ..
+            } => {
+                let name = source.file_name().unwrap_or_default().to_string_lossy();
+                self.status = format!(
+                    "Convirtiendo «{name}» ({}/{})…",
+                    index + 1,
+                    pending.total
+                );
+                return;
+            }
+            Message::Done { source, output, .. } => {
+                if pending.replace_in_lists {
+                    pending.replacements.push((source.clone(), output.clone()));
+                }
+                if pending.delete_flac {
+                    pending.deletions.push((source, output));
+                }
+            }
+            Message::Error {
+                source, message, ..
+            } => {
+                pending.failed += 1;
+                let name = source.file_name().unwrap_or_default().to_string_lossy();
+                self.status = format!("No se pudo convertir «{name}»: {message}");
+            }
+        }
+        pending.finished += 1;
+        if pending.finished >= pending.total {
+            self.finish_conversion_job();
+        }
+    }
+
+    fn finish_conversion_job(&mut self) {
+        let Some(pending) = self.converter_pending.take() else {
+            return;
+        };
+        self.converter_messages = None;
+
+        let mut changed_lists = 0;
+        if pending.replace_in_lists && !pending.replacements.is_empty() {
+            let mut entries: Vec<Vec<(PathBuf, Option<StreamingTrack>)>> = self
+                .playlists
+                .iter()
+                .map(|playlist| {
+                    playlist
+                        .tracks
+                        .iter()
+                        .cloned()
+                        .zip(playlist.streams.iter().cloned())
+                        .collect()
+                })
+                .collect();
+            changed_lists = converter::replace_entries_in_lists(&mut entries, &pending.replacements);
+
+            let old_current = self.current.and_then(|(playlist, track)| {
+                self.playlists
+                    .get(playlist)
+                    .and_then(|list| list.tracks.get(track).cloned())
+                    .map(|path| (playlist, path))
+            });
+            for (playlist, converted) in self.playlists.iter_mut().zip(entries) {
+                let previous = playlist.tracks.clone();
+                let selected_path = playlist
+                    .selected
+                    .and_then(|index| previous.get(index).cloned())
+                    .map(|path| replacement_target(&pending.replacements, path));
+                playlist.tracks = converted.iter().map(|(path, _)| path.clone()).collect();
+                playlist.streams = converted
+                    .into_iter()
+                    .map(|(_, stream)| stream)
+                    .collect();
+                let selected = selected_path
+                    .and_then(|path| playlist.tracks.iter().position(|item| item == &path));
+                playlist.selected = selected;
+                playlist.rebuild_order(selected);
+            }
+            if let Some((playlist, old_path)) = old_current {
+                let new_path = replacement_target(&pending.replacements, old_path);
+                if let Some(track) = self.playlists[playlist]
+                    .tracks
+                    .iter()
+                    .position(|path| path == &new_path)
+                {
+                    self.current = Some((playlist, track));
+                }
+            }
+            self.ui_rendered_playlist = None;
+            self.editor_loaded_for = None;
+            self.save_playlists();
+        }
+
+        let mut deleted = 0;
+        let mut in_use = 0;
+        let mut delete_errors = 0;
+        if pending.delete_flac {
+            let current_source = self.playing_source_path();
+            for (source, output) in &pending.deletions {
+                let playing = pending.playing_source.as_ref() == Some(source)
+                    || current_source.as_ref() == Some(source);
+                let replacement_ok = !pending.replace_in_lists
+                    || pending
+                        .replacements
+                        .iter()
+                        .any(|(old, new)| old == source && new == output);
+                if !converter::can_delete_source(true, output.is_file(), replacement_ok, playing) {
+                    if playing {
+                        in_use += 1;
+                    } else {
+                        delete_errors += 1;
+                    }
+                    continue;
+                }
+                match fs::remove_file(source) {
+                    Ok(()) => deleted += 1,
+                    Err(_) => delete_errors += 1,
+                }
+            }
+        }
+
+        let converted = pending.total - pending.failed - pending.skipped;
+        let mut notes = vec![format!("{converted} convertidos")];
+        if pending.failed > 0 {
+            notes.push(format!("{} fallidos", pending.failed));
+        }
+        if pending.skipped > 0 {
+            notes.push(format!("{} omitidos", pending.skipped));
+        }
+        if changed_lists > 0 {
+            notes.push(format!("{changed_lists} en listas"));
+        }
+        if deleted > 0 {
+            notes.push(format!("{deleted} FLAC borrados"));
+        }
+        if in_use > 0 {
+            notes.push(format!("{in_use} en uso, sin borrar"));
+        }
+        if delete_errors > 0 {
+            notes.push(format!("{delete_errors} borrados con error"));
+        }
+        self.status = format!("Conversión terminada: {}", notes.join(", "));
     }
 
     fn save_metadata(
@@ -4253,7 +4520,7 @@ fn refresh_ui(
     menus: &mut ContextMenus,
     window: Rid,
 ) {
-    menus.sync(ui, state.youtube_mode);
+    menus.sync(ui, state.youtube_mode, state.selected_is_flac());
     state.poll_update_check(window);
     state.poll_instance_messages(window);
     state.update_after_frame();
@@ -4262,6 +4529,7 @@ fn refresh_ui(
     state.poll_youtube_audio();
     state.poll_youtube_downloads();
     state.poll_stream_audio();
+    state.poll_conversion();
     update_track_list(state, ui, row_cache);
     let selected = unsafe { Rlist_view_get_selected(ui.track_list) };
     state.sync_youtube_selection(selected);
@@ -4863,28 +5131,38 @@ unsafe extern "C" fn add_to_playlist_from_context_menu(_item: Rid, user_data: *m
 }
 
 /// Sincroniza la vista con el modo del buscador: menú contextual, caja de
-/// búsqueda y aspecto del logo. `None` fuerza la primera aplicación al arrancar.
+/// búsqueda y aspecto del logo. Raven no puede ocultar items, así que las
+/// pistas FLAC tienen su propio menú con la entrada del conversor. `None`
+/// fuerza la primera aplicación al arrancar.
 struct ContextMenus {
     normal: Rid,
     youtube: Rid,
-    showing_youtube: Option<bool>,
+    flac: Rid,
+    showing: Option<(bool, bool)>,
 }
 
 impl ContextMenus {
-    fn new(normal: Rid, youtube: Rid) -> Self {
+    fn new(normal: Rid, youtube: Rid, flac: Rid) -> Self {
         Self {
             normal,
             youtube,
-            showing_youtube: None,
+            flac,
+            showing: None,
         }
     }
 
-    fn sync(&mut self, ui: Ui, youtube_mode: bool) {
-        if self.showing_youtube == Some(youtube_mode) {
+    fn sync(&mut self, ui: Ui, youtube_mode: bool, flac_mode: bool) {
+        if self.showing == Some((youtube_mode, flac_mode)) {
             return;
         }
-        self.showing_youtube = Some(youtube_mode);
-        let menu = if youtube_mode { self.youtube } else { self.normal };
+        self.showing = Some((youtube_mode, flac_mode));
+        let menu = if youtube_mode {
+            self.youtube
+        } else if flac_mode {
+            self.flac
+        } else {
+            self.normal
+        };
         unsafe {
             Rwidget_set_context_menu(ui.track_list, menu);
             // El modo YouTube es la «lista» activa: se atenúan las pestañas para
@@ -4912,6 +5190,7 @@ impl ContextMenus {
             Rwidget_set_context_menu(widget, R_INVALID_ID);
             Rwidget_destroy(self.normal);
             Rwidget_destroy(self.youtube);
+            Rwidget_destroy(self.flac);
         }
     }
 }
@@ -4921,6 +5200,516 @@ unsafe extern "C" fn check_updates_from_app_menu(_item: Rid, user_data: *mut c_v
     if let Ok(mut state) = state.try_borrow_mut() {
         state.start_update_check();
     }
+}
+
+/// Lo que el usuario elige en el diálogo del conversor. Los callbacks de Raven
+/// actualizan esta estructura en sitio; `Rdialog_run` la deja lista al volver.
+struct ConverterDialogData {
+    quality_index: usize,
+    custom_bitrate: u32,
+    files: Vec<PathBuf>,
+    replace: bool,
+    delete: bool,
+}
+
+/// Punteros a los widgets que deben cambiar cuando cambia otro. Vive en la
+/// pila mientras `Rdialog_run` está ejecutando los callbacks.
+struct ConverterCallbacks {
+    data: *mut ConverterDialogData,
+    quality: [Rid; 5],
+    replace: Rid,
+    files_view: Rid,
+    status: Rid,
+    listed: *const HashSet<PathBuf>,
+    replace_touched: bool,
+}
+
+const CONVERTER_QUALITY_LABELS: [&str; 5] = [
+    "96 kbps",
+    "128 kbps",
+    "160 kbps (recomendada)",
+    "192 kbps",
+    "Personalizada",
+];
+
+/// Índice del preset recomendado en el diálogo del conversor.
+fn default_quality_index() -> usize {
+    converter::PRESET_BITRATES
+        .iter()
+        .position(|&bitrate| bitrate == converter::RECOMMENDED_BITRATE)
+        .expect("el preset recomendado debe estar en PRESET_BITRATES")
+}
+
+unsafe extern "C" fn converter_quality_changed(
+    checkbox: Rid,
+    checked: c_int,
+    user_data: *mut c_void,
+) {
+    if checked == R_FALSE {
+        return;
+    }
+    let callbacks = &*(user_data as *const ConverterCallbacks);
+    for (index, radio) in callbacks.quality.iter().enumerate() {
+        if *radio == checkbox {
+            (*callbacks.data).quality_index = index;
+        }
+    }
+}
+
+unsafe extern "C" fn converter_custom_bitrate_changed(
+    _spin_box: Rid,
+    value: f64,
+    user_data: *mut c_void,
+) {
+    let callbacks = &*(user_data as *const ConverterCallbacks);
+    (*callbacks.data).custom_bitrate = converter::clamp_bitrate(value.round() as u32);
+    (*callbacks.data).quality_index = CONVERTER_QUALITY_LABELS.len() - 1;
+    Rcheckbox_set_checked(callbacks.quality[CONVERTER_QUALITY_LABELS.len() - 1], R_TRUE);
+}
+
+unsafe extern "C" fn converter_replace_changed(
+    _checkbox: Rid,
+    checked: c_int,
+    user_data: *mut c_void,
+) {
+    let callbacks = &mut *(user_data as *mut ConverterCallbacks);
+    callbacks.replace_touched = true;
+    (*callbacks.data).replace = checked != R_FALSE;
+}
+
+unsafe extern "C" fn converter_delete_changed(
+    _checkbox: Rid,
+    checked: c_int,
+    user_data: *mut c_void,
+) {
+    let callbacks = &*(user_data as *const ConverterCallbacks);
+    (*callbacks.data).delete = checked != R_FALSE;
+}
+
+unsafe fn converter_refresh_files(callbacks: &ConverterCallbacks) {
+    Rlist_view_clear_items(callbacks.files_view);
+    for path in &(*callbacks.data).files {
+        Rlist_view_add_item(callbacks.files_view, cstr(&path.to_string_lossy()).as_ptr());
+    }
+    let count = (*callbacks.data).files.len();
+    let text = format!("{count} archivo{} seleccionado{}", if count == 1 { "" } else { "s" }, if count == 1 { "" } else { "s" });
+    Rlabel_set_text(callbacks.status, cstr(&text).as_ptr());
+}
+
+unsafe extern "C" fn converter_add_files(_button: Rid, user_data: *mut c_void) {
+    let callbacks = &mut *(user_data as *mut ConverterCallbacks);
+    let paths = rfd::FileDialog::new()
+        .set_title("Seleccionar archivos FLAC")
+        .add_filter("Archivos FLAC", &["flac"])
+        .pick_files()
+        .unwrap_or_default();
+    let mut added = false;
+    for path in paths {
+        if converter::is_flac(&path) && !(*callbacks.data).files.contains(&path) {
+            (*callbacks.data).files.push(path);
+            added = true;
+        }
+    }
+    if !added {
+        return;
+    }
+    // En el modo Herramientas el usuario todavía no ha elegido archivos: si
+    // alguno está en una lista, proponemos reemplazarlo. Si ya tocó la casilla,
+    // respetamos su decisión.
+    if !callbacks.replace_touched
+        && (*callbacks.data)
+            .files
+            .iter()
+            .any(|path| (*callbacks.listed).contains(path))
+    {
+        (*callbacks.data).replace = true;
+        Rcheckbox_set_checked(callbacks.replace, R_TRUE);
+    }
+    converter_refresh_files(callbacks);
+}
+
+unsafe extern "C" fn converter_remove_file(_button: Rid, user_data: *mut c_void) {
+    let callbacks = &mut *(user_data as *mut ConverterCallbacks);
+    let selected = Rlist_view_get_selected(callbacks.files_view);
+    if selected < 0 {
+        return;
+    }
+    let index = selected as usize;
+    if index < (*callbacks.data).files.len() {
+        (*callbacks.data).files.remove(index);
+        converter_refresh_files(callbacks);
+    }
+}
+
+unsafe extern "C" fn converter_accept(button: Rid, user_data: *mut c_void) {
+    let callbacks = &mut *(user_data as *mut ConverterCallbacks);
+    let valid: Vec<PathBuf> = (*callbacks.data)
+        .files
+        .iter()
+        .filter(|path| converter::is_flac(path) && path.is_file())
+        .cloned()
+        .collect();
+    if valid.is_empty() {
+        Rlabel_set_text(
+            callbacks.status,
+            cstr("Selecciona al menos un archivo FLAC existente").as_ptr(),
+        );
+        return;
+    }
+    (*callbacks.data).files = valid;
+    Rdialog_close(button, R_MESSAGE_RESULT_OK);
+}
+
+unsafe extern "C" fn converter_cancel(button: Rid, _user_data: *mut c_void) {
+    Rdialog_close(button, R_MESSAGE_RESULT_CANCEL);
+}
+
+/// Botones del diálogo de colisión: cada uno guarda su decisión y cierra.
+struct CollisionButton {
+    choice: *mut c_int,
+    value: c_int,
+}
+
+unsafe extern "C" fn collision_button_clicked(button: Rid, user_data: *mut c_void) {
+    let option = &*(user_data as *const CollisionButton);
+    *option.choice = option.value;
+    Rdialog_close(button, option.value);
+}
+
+unsafe extern "C" fn collision_apply_changed(
+    _checkbox: Rid,
+    checked: c_int,
+    user_data: *mut c_void,
+) {
+    *(user_data as *mut c_int) = checked;
+}
+
+/// Pregunta qué hacer con un `.opus` ya existente. La casilla devuelve si la
+/// respuesta debe fijarse para el resto de colisiones del lote.
+fn ask_collision(window: Rid, source: &Path, desired: &Path) -> (c_int, bool) {
+    unsafe {
+        let content = Rwidget_create(R_WIDGET_VBOX);
+        Rwidget_set_size(content, 430.0, -1.0);
+        Rpanel_set_spacing(content, 12.0);
+        Rslot_set_padding(content, 22.0, 18.0, 22.0, 18.0);
+
+        let title = Rlabel_create(cstr("El archivo Opus ya existe").as_ptr());
+        Rlabel_set_text_size(title, 17.0);
+        Rwidget_add_child(content, title);
+
+        let name = desired
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let source_name = source
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let text = format!(
+            "Ya existe «{name}» junto a «{source_name}». ¿Qué quieres hacer con este archivo?"
+        );
+        let message = Rlabel_create(cstr(&text).as_ptr());
+        Rlabel_set_text_size(message, 12.0);
+        Rlabel_set_wrap(message, R_TRUE);
+        Rwidget_set_max_size(message, 390.0, -1.0);
+        Rwidget_add_child(content, message);
+
+        let mut choice: c_int = 3; // Omitir, también si se cierra con Escape.
+        let buttons = [
+            CollisionButton { choice: &mut choice, value: 1 },
+            CollisionButton { choice: &mut choice, value: 2 },
+            CollisionButton { choice: &mut choice, value: 3 },
+        ];
+        let row = Rwidget_create(R_WIDGET_HBOX);
+        Rpanel_set_spacing(row, 8.0);
+        Rslot_set_halign(row, R_HALIGN_RIGHT);
+        for (label, style, option) in [
+            ("Sobrescribir", R_BUTTON_PRIMARY, &buttons[0]),
+            ("Cambiar nombre", R_BUTTON_FLAT, &buttons[1]),
+            ("Omitir", R_BUTTON_FLAT, &buttons[2]),
+        ] {
+            let button = Rbutton_create(cstr(label).as_ptr());
+            Rbutton_set_style(button, style);
+            Rbutton_set_clicked_callback(
+                button,
+                Some(collision_button_clicked),
+                option as *const CollisionButton as *mut c_void,
+            );
+            Rwidget_add_child(row, button);
+        }
+        Rwidget_add_child(content, row);
+
+        let mut apply: c_int = R_FALSE;
+        let apply_check = Rcheckbox_create(cstr("Aplicar la misma opción al resto").as_ptr());
+        Rcheckbox_set_changed_callback(
+            apply_check,
+            Some(collision_apply_changed),
+            &mut apply as *mut c_int as *mut c_void,
+        );
+        Rwidget_add_child(content, apply_check);
+
+        Rdialog_run(window, content);
+        (choice, apply != R_FALSE)
+    }
+}
+
+/// Prepara el lote y lo lanza. Las colisiones se resuelven antes de crear los
+/// temporales, así que el hilo de conversión no necesita diálogos.
+fn launch_conversion(
+    window: Rid,
+    state: &Rc<RefCell<PlayerState>>,
+    data: ConverterDialogData,
+) {
+    use converter::CollisionPolicy;
+
+    let quality = converter::quality_from_option(data.quality_index, data.custom_bitrate)
+        .unwrap_or_default();
+    let inputs: Vec<PathBuf> = data
+        .files
+        .into_iter()
+        .filter(|path| converter::is_flac(path) && path.is_file())
+        .collect();
+    if inputs.is_empty() {
+        state.borrow_mut().status = "Selecciona al menos un archivo FLAC".to_owned();
+        return;
+    }
+
+    let generation = state.borrow().converter_generation + 1;
+    let mut occupied = converter::existing_outputs_in(&inputs);
+    let mut fixed_policy: Option<CollisionPolicy> = None;
+    let mut tasks = Vec::new();
+    let mut skipped = 0;
+    for source in &inputs {
+        let desired = converter::output_path(source);
+        let policy = if occupied.contains(&desired) {
+            match fixed_policy {
+                Some(policy) => policy,
+                None => {
+                    let (choice, apply_to_rest) = ask_collision(window, source, &desired);
+                    let policy =
+                        converter::collision_policy_from_choice(choice).unwrap_or(CollisionPolicy::Skip);
+                    if apply_to_rest {
+                        fixed_policy = Some(policy);
+                    }
+                    policy
+                }
+            }
+        } else {
+            CollisionPolicy::Overwrite
+        };
+        let Some(output) = converter::resolve_output_path(source, &occupied, policy) else {
+            skipped += 1;
+            continue;
+        };
+        occupied.push(output.clone());
+        tasks.push(converter::ConversionTask::new(
+            source.clone(),
+            output,
+            quality,
+            policy == CollisionPolicy::Overwrite,
+            generation,
+            tasks.len(),
+        ));
+    }
+
+    if tasks.is_empty() {
+        state.borrow_mut().status = "No quedó ningún archivo para convertir".to_owned();
+        return;
+    }
+    let mut state = state.borrow_mut();
+    if let Err(error) = state.start_conversion_job(
+        tasks,
+        generation,
+        data.replace,
+        data.delete,
+        skipped,
+    ) {
+        state.status = error;
+    }
+}
+
+fn open_converter_dialog(
+    window: Rid,
+    state: Rc<RefCell<PlayerState>>,
+    preselected: Option<PathBuf>,
+) {
+    let listed: HashSet<PathBuf> = state
+        .borrow()
+        .playlists
+        .iter()
+        .flat_map(|playlist| playlist.tracks.iter().cloned())
+        .collect();
+    let mut data = ConverterDialogData {
+        quality_index: default_quality_index(),
+        custom_bitrate: converter::RECOMMENDED_BITRATE,
+        files: preselected.into_iter().collect(),
+        replace: false,
+        delete: false,
+    };
+    data.replace = data.files.iter().any(|path| listed.contains(path));
+
+    unsafe {
+        let content = Rwidget_create(R_WIDGET_VBOX);
+        Rwidget_set_size(content, 480.0, -1.0);
+        Rpanel_set_spacing(content, 8.0);
+        Rslot_set_padding(content, 18.0, 14.0, 18.0, 14.0);
+
+        let title = Rlabel_create(cstr("Conversor FLAC a OPUS").as_ptr());
+        Rlabel_set_text_size(title, 18.0);
+        Rwidget_add_child(content, title);
+        Rwidget_add_child(
+            content,
+            settings_description("Convierte FLAC a Opus en la misma carpeta y conserva las etiquetas de texto."),
+        );
+
+        let mut callbacks = ConverterCallbacks {
+            data: &mut data,
+            quality: [R_INVALID_ID; 5],
+            replace: R_INVALID_ID,
+            files_view: R_INVALID_ID,
+            status: R_INVALID_ID,
+            listed: &listed,
+            replace_touched: false,
+        };
+
+        Rwidget_add_child(content, settings_heading("Calidad"));
+        let quality_panel = Rwidget_create(R_WIDGET_VBOX);
+        Rpanel_set_spacing(quality_panel, 2.0);
+        for (index, label) in CONVERTER_QUALITY_LABELS.iter().enumerate() {
+            let radio = Rcheckbox_create(cstr(label).as_ptr());
+            Rcheckbox_set_style(radio, R_CHECKBOX_RADIO);
+            Rcheckbox_set_checked(radio, if index == data.quality_index { R_TRUE } else { R_FALSE });
+            Rwidget_add_child(quality_panel, radio);
+            callbacks.quality[index] = radio;
+        }
+        let custom_row = Rwidget_create(R_WIDGET_HBOX);
+        Rpanel_set_spacing(custom_row, 4.0);
+        let spin = Rwidget_create(R_WIDGET_SPIN_BOX);
+        Rspin_box_set_range(spin, converter::CUSTOM_MIN as f64, converter::CUSTOM_MAX as f64);
+        Rspin_box_set_step(spin, 1.0);
+        Rspin_box_set_decimals(spin, 0);
+        Rspin_box_set_value(spin, data.custom_bitrate as f64);
+        Rwidget_set_min_size(spin, 90.0, 0.0);
+        Rwidget_add_child(custom_row, spin);
+        Rwidget_add_child(custom_row, Rlabel_create(cstr("kbps (6–510)").as_ptr()));
+        Rwidget_add_child(quality_panel, custom_row);
+        Rwidget_add_child(content, quality_panel);
+
+        Rwidget_add_child(content, settings_heading("Archivos"));
+        let files_view = Rwidget_create(R_WIDGET_LIST_VIEW);
+        Rwidget_set_min_size(files_view, 400.0, 70.0);
+        Rwidget_set_max_size(files_view, -1.0, 70.0);
+        Rslot_set_fill(files_view, 0.0);
+        callbacks.files_view = files_view;
+        Rwidget_add_child(content, files_view);
+
+        let files_row = Rwidget_create(R_WIDGET_HBOX);
+        Rpanel_set_spacing(files_row, 6.0);
+        let add_button = Rbutton_create(cstr("Añadir FLAC…").as_ptr());
+        Rbutton_set_clicked_callback(
+            add_button,
+            Some(converter_add_files),
+            &mut callbacks as *mut ConverterCallbacks as *mut c_void,
+        );
+        Rwidget_add_child(files_row, add_button);
+        let remove_button = Rbutton_create(cstr("Quitar seleccionado").as_ptr());
+        Rbutton_set_clicked_callback(
+            remove_button,
+            Some(converter_remove_file),
+            &mut callbacks as *mut ConverterCallbacks as *mut c_void,
+        );
+        Rwidget_add_child(files_row, remove_button);
+        let status = Rlabel_create(cstr("").as_ptr());
+        Rlabel_set_text_size(status, 11.0);
+        Rslot_set_fill(status, 1.0);
+        Rslot_set_halign(status, R_HALIGN_RIGHT);
+        callbacks.status = status;
+        Rwidget_add_child(files_row, status);
+        Rwidget_add_child(content, files_row);
+        converter_refresh_files(&callbacks);
+
+        Rwidget_add_child(content, settings_heading("Opciones"));
+        let replace = Rcheckbox_create(cstr("Remplazar cancion en las listas").as_ptr());
+        Rcheckbox_set_checked(replace, if data.replace { R_TRUE } else { R_FALSE });
+        callbacks.replace = replace;
+        Rwidget_add_child(content, replace);
+        let delete = Rcheckbox_create(cstr("Borrar FLAC despues de conversion").as_ptr());
+        Rcheckbox_set_checked(delete, R_FALSE);
+        Rwidget_add_child(content, delete);
+
+        for radio in callbacks.quality {
+            Rcheckbox_set_changed_callback(
+                radio,
+                Some(converter_quality_changed),
+                &mut callbacks as *mut ConverterCallbacks as *mut c_void,
+            );
+        }
+        Rspin_box_set_changed_callback(
+            spin,
+            Some(converter_custom_bitrate_changed),
+            &mut callbacks as *mut ConverterCallbacks as *mut c_void,
+        );
+        Rcheckbox_set_changed_callback(
+            replace,
+            Some(converter_replace_changed),
+            &mut callbacks as *mut ConverterCallbacks as *mut c_void,
+        );
+        Rcheckbox_set_changed_callback(
+            delete,
+            Some(converter_delete_changed),
+            &mut callbacks as *mut ConverterCallbacks as *mut c_void,
+        );
+
+        let buttons = Rwidget_create(R_WIDGET_HBOX);
+        Rpanel_set_spacing(buttons, 8.0);
+        Rslot_set_halign(buttons, R_HALIGN_RIGHT);
+        let cancel = Rbutton_create(cstr("Cancelar").as_ptr());
+        Rbutton_set_clicked_callback(cancel, Some(converter_cancel), std::ptr::null_mut());
+        Rwidget_add_child(buttons, cancel);
+        let convert = Rbutton_create(cstr("Convertir").as_ptr());
+        Rbutton_set_style(convert, R_BUTTON_PRIMARY);
+        Rbutton_set_clicked_callback(
+            convert,
+            Some(converter_accept),
+            &mut callbacks as *mut ConverterCallbacks as *mut c_void,
+        );
+        Rwidget_add_child(buttons, convert);
+        Rwidget_add_child(content, buttons);
+
+        if Rdialog_run(window, content) != R_MESSAGE_RESULT_OK {
+            return;
+        }
+        launch_conversion(window, &state, data);
+    }
+}
+
+unsafe extern "C" fn open_converter_from_app_menu(item: Rid, user_data: *mut c_void) {
+    let state = &*(user_data as *const Rc<RefCell<PlayerState>>);
+    let window = Rwidget_get_window(item);
+    open_converter_dialog(window, Rc::clone(state), None);
+}
+
+unsafe extern "C" fn open_converter_from_context_menu(item: Rid, user_data: *mut c_void) {
+    let context = &*(user_data as *const ContextMenuContext);
+    let path = {
+        let state = context.state.borrow();
+        if state.youtube_mode {
+            return;
+        }
+        state
+            .selected_location()
+            .and_then(|(playlist, track)| {
+                state.playlists.get(playlist)?.tracks.get(track).cloned()
+            })
+            .filter(|path| converter::is_flac(path))
+    };
+    let Some(path) = path else {
+        return;
+    };
+    let window = Rwidget_get_window(item);
+    open_converter_dialog(window, Rc::clone(&context.state), Some(path));
 }
 
 const SETTINGS_SECTIONS: [&str; 4] = ["General", "Listas", "YouTube", "Descargas"];
@@ -6411,16 +7200,25 @@ fn main() {
         }
     }
     create_drop_guide(window, &state);
-    // Raven no puede ocultar items de un menú, así que se crean dos: el de
-    // siempre para las listas locales y uno propio para el buscador.
+    // Raven no puede ocultar items de un menú, así que se crean tres: el de
+    // siempre para las listas locales, uno para el buscador y otro para FLAC.
     let context_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
     let youtube_context_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
-    let mut menus = ContextMenus::new(context_menu, youtube_context_menu);
+    let flac_context_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
+    let mut menus = ContextMenus::new(context_menu, youtube_context_menu, flac_context_menu);
     let app_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
     let edit_metadata_text = cstr("Editar metadatos");
     let edit_metadata_item = unsafe { Rmenu_add_item(context_menu, edit_metadata_text.as_ptr()) };
     let remove_from_list_text = cstr("Eliminar de la lista");
     let remove_from_list_item = unsafe { Rmenu_add_item(context_menu, remove_from_list_text.as_ptr()) };
+    // Menú exclusivo de FLAC: mismas acciones y, como segunda entrada, el
+    // conversor con la ruta de la pista ya puesta en el diálogo.
+    let flac_metadata_text = cstr("Editar metadatos");
+    let flac_metadata_item = unsafe { Rmenu_add_item(flac_context_menu, flac_metadata_text.as_ptr()) };
+    let convert_flac_text = cstr("Convertir a OPUS…");
+    let convert_flac_item = unsafe { Rmenu_add_item(flac_context_menu, convert_flac_text.as_ptr()) };
+    let flac_remove_text = cstr("Eliminar de la lista");
+    let flac_remove_item = unsafe { Rmenu_add_item(flac_context_menu, flac_remove_text.as_ptr()) };
     let download_opus_text = cstr("Descargar en Opus");
     let download_opus_item = unsafe {
         Rmenu_add_item(youtube_context_menu, download_opus_text.as_ptr())
@@ -6433,6 +7231,18 @@ fn main() {
     let settings_text = cstr("Ajustes");
     let settings_item = if app_menu != R_INVALID_ID {
         unsafe { Rmenu_add_item(app_menu, settings_text.as_ptr()) }
+    } else {
+        R_INVALID_ID
+    };
+    // «Herramientas» queda justo debajo de «Ajustes» y agrupa el conversor.
+    let tools_menu = if app_menu != R_INVALID_ID {
+        unsafe { Rmenu_add_menu(app_menu, cstr("Herramientas").as_ptr()) }
+    } else {
+        R_INVALID_ID
+    };
+    let converter_text = cstr("Conversor FLAC a OPUS");
+    let converter_item = if tools_menu != R_INVALID_ID {
+        unsafe { Rmenu_add_item(tools_menu, converter_text.as_ptr()) }
     } else {
         R_INVALID_ID
     };
@@ -6471,6 +7281,21 @@ fn main() {
             Rc::as_ptr(&state) as *mut c_void,
         );
         Rmenu_item_set_clicked_callback(
+            flac_metadata_item,
+            Some(open_metadata_editor_from_context_menu),
+            context_data,
+        );
+        Rmenu_item_set_clicked_callback(
+            convert_flac_item,
+            Some(open_converter_from_context_menu),
+            context_data,
+        );
+        Rmenu_item_set_clicked_callback(
+            flac_remove_item,
+            Some(remove_from_list_from_context_menu),
+            Rc::as_ptr(&state) as *mut c_void,
+        );
+        Rmenu_item_set_clicked_callback(
             download_opus_item,
             Some(download_opus_from_context_menu),
             context_data,
@@ -6484,6 +7309,13 @@ fn main() {
             Rmenu_item_set_clicked_callback(
                 settings_item,
                 Some(open_settings_dialog),
+                &state as *const Rc<RefCell<PlayerState>> as *mut c_void,
+            );
+        }
+        if converter_item != R_INVALID_ID {
+            Rmenu_item_set_clicked_callback(
+                converter_item,
+                Some(open_converter_from_app_menu),
                 &state as *const Rc<RefCell<PlayerState>> as *mut c_void,
             );
         }
@@ -6886,17 +7718,17 @@ fn main() {
 mod tests {
     use super::{
         add_behavior_from_option_index, audio_paths_from_args, auto_scroll_step,
-        behavior_from_option_index, cover_dialog_directory, cstr, displayed_location_for,
-        document_portal_host_path, download_dir_text, drag_guide_y, drag_target, existing_directory,
-        format_time, is_document_portal_path_in, next_track_index, play_starts_selected,
-        playlist_summary_text, previous_track_index, random_track_index, remap_index,
-        repair_audio_file, repair_backup_path, shuffle_progress, tab_at, tab_close_hit,
+        behavior_from_option_index, converter, cover_dialog_directory, cstr, default_quality_index,
+        displayed_location_for, document_portal_host_path, download_dir_text, drag_guide_y,
+        drag_target, existing_directory, format_time, is_document_portal_path_in, next_track_index,
+        play_starts_selected, playlist_summary_text, previous_track_index, random_track_index,
+        remap_index, repair_audio_file, repair_backup_path, shuffle_progress, tab_at, tab_close_hit,
         tab_drop_target, tab_guide_x, tab_natural_width, tab_rect, tab_widths, track_list_row_text,
         track_row, youtube_playback_from_option_index, youtube_result_row, AddBehavior,
         MetadataWriteError, OpenBehavior, Playlist,
         PlaylistStore, SavedPlaylist, StreamingTrack, YoutubePlayback, SavedSettings,
-        TabMetrics, TrackListRows, TrackMetadata, SETTINGS_SECTIONS, INITIAL_VOLUME, R_INVALID_ID,
-        SESSION_PLAYLIST_NAME,
+        TabMetrics, TrackListRows, TrackMetadata, CONVERTER_QUALITY_LABELS, SETTINGS_SECTIONS,
+        INITIAL_VOLUME, R_INVALID_ID, SESSION_PLAYLIST_NAME,
     };
     use rodio::{Decoder, Source};
     use std::cell::RefCell;
@@ -6915,6 +7747,19 @@ mod tests {
         assert!(first
             .file_name()
             .is_some_and(|name| name.to_string_lossy().ends_with("-song.mp3")));
+    }
+
+    #[test]
+    fn converter_defaults_to_recommended_quality() {
+        let index = default_quality_index();
+        assert_eq!(
+            CONVERTER_QUALITY_LABELS[index],
+            "160 kbps (recomendada)"
+        );
+        assert_eq!(
+            converter::quality_from_option(index, 0),
+            Some(converter::Quality::Preset(160))
+        );
     }
 
     #[test]

@@ -233,14 +233,36 @@ fn run_search(query: &str) -> Result<Vec<YoutubeTrack>, String> {
             .trim();
         return Err(format!("No se pudo buscar en YouTube: {detail}"));
     }
-    // Un solo Agent comparte el pool de conexiones: todas las miniaturas
-    // vienen de i.ytimg.com, así que crear uno por imagen solo añadía diez
-    // handshakes TLS seguidos. Se descargan en paralelo antes de publicar los
-    // resultados, sin que la interfaz tenga que convertir bytes en textura.
+    // Un solo Agent comparte el pool de conexiones: las miniaturas vienen de
+    // i.ytimg.com y los títulos originales de www.youtube.com, así que crear un
+    // agente por petición solo añadiría handshakes TLS seguidos. Todo se resuelve
+    // en paralelo antes de publicar los resultados, sin que la interfaz tenga
+    // que convertir bytes en textura ni decidir qué título mostrar.
     let agent: Agent = Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(10)))
         .build()
         .into();
+
+    let original_titles: Vec<Option<String>> = thread::scope(|scope| {
+        let handles: Vec<_> = tracks
+            .iter()
+            .map(|track| {
+                let id = track.id.clone();
+                let agent = &agent;
+                scope.spawn(move || fetch_original_title(&id, agent))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().ok().flatten())
+            .collect()
+    });
+    for (track, title) in tracks.iter_mut().zip(original_titles) {
+        if let Some(title) = title {
+            track.title = title;
+        }
+    }
+
     let indices: Vec<usize> = tracks
         .iter()
         .enumerate()
@@ -349,6 +371,34 @@ fn parse_result_line(line: &str) -> Option<YoutubeTrack> {
 
 fn parse_search_output(output: &str) -> Vec<YoutubeTrack> {
     output.lines().filter_map(parse_result_line).collect()
+}
+
+/// URL de oEmbed para un vídeo. La búsqueda de YouTube entrega títulos
+/// localizados según la región del cliente; oEmbed devuelve el título original
+/// (o el de reserva en inglés) sin aplicar esa traducción.
+fn oembed_url(id: &str) -> String {
+    format!("https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={id}&format=json")
+}
+
+/// Extrae el título de una respuesta oEmbed. Se separa de la petición para
+/// poder probar el formato sin red.
+fn title_from_oembed(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let title = value.get("title")?.as_str()?.trim();
+    (!title.is_empty()).then(|| title.to_owned())
+}
+
+/// Pide el título original de un resultado. Si YouTube no responde, se conserva
+/// el título que ya vino en la búsqueda de yt-dlp.
+fn fetch_original_title(id: &str, agent: &Agent) -> Option<String> {
+    let url = oembed_url(id);
+    let mut response = agent
+        .get(url.as_str())
+        .header("User-Agent", "Freeway-Player")
+        .header("Accept", "application/json")
+        .call()
+        .ok()?;
+    title_from_oembed(&response.body_mut().read_to_vec().ok()?)
 }
 
 /// Descarga la miniatura y la deja en PNG. Los resultados suelen traer WebP o
@@ -762,6 +812,26 @@ mod tests {
             serde_json::from_str(r#"{"thumbnails":[{"url":"pequeña.jpg"},{"url":"grande.jpg"}]}"#)
                 .unwrap();
         assert_eq!(thumbnail_field(&value).as_deref(), Some("grande.jpg"));
+    }
+
+    #[test]
+    fn oembed_url_points_to_the_video() {
+        assert_eq!(
+            oembed_url("abc-123_X"),
+            "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=abc-123_X&format=json"
+        );
+    }
+
+    #[test]
+    fn oembed_title_ignores_missing_or_empty_titles() {
+        let body = r#"{"title":"  Título original  ","author_name":"Canal"}"#;
+        assert_eq!(
+            title_from_oembed(body.as_bytes()).as_deref(),
+            Some("Título original")
+        );
+        assert_eq!(title_from_oembed(br#"{"title":"   "}"#), None);
+        assert_eq!(title_from_oembed(br#"{"author_name":"Canal"}"#), None);
+        assert_eq!(title_from_oembed(b"{no es json"), None);
     }
 
     #[test]
