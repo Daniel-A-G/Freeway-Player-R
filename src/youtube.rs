@@ -5,19 +5,51 @@
 //! a Opus en la caché de la app y avisa cuando ya puede abrirse con `rodio`.
 
 use image::ImageFormat;
+use rodio::Source;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::ffi::OsString;
 use std::fs;
-use std::io::Cursor;
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ureq::Agent;
 
 /// Número de resultados que se piden por búsqueda.
 pub const RESULT_LIMIT: usize = 10;
+
+/// Cómo se reproduce el audio de YouTube. `Streaming` es el predeterminado
+/// porque empieza a sonar sin esperar a la descarga completa; `FullDownload`
+/// conserva el comportamiento anterior de bajar y convertir a Opus primero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum YoutubePlayback {
+    #[default]
+    Streaming,
+    FullDownload,
+}
+
+impl YoutubePlayback {
+    pub const ALL: [YoutubePlayback; 2] = [Self::Streaming, Self::FullDownload];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Streaming => "Streaming (empieza a sonar antes)",
+            Self::FullDownload => "Descarga completa (espera a convertir a Opus)",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::Streaming => 0,
+            Self::FullDownload => 1,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct YoutubeTrack {
@@ -46,7 +78,6 @@ pub enum YoutubeMessage {
     },
 }
 
-#[derive(Debug)]
 pub enum YoutubeAudioMessage {
     Ready {
         generation: u64,
@@ -54,11 +85,62 @@ pub enum YoutubeAudioMessage {
         track: YoutubeTrack,
         path: PathBuf,
     },
+    /// Audio AAC/m4a leído directamente del pipe de `yt-dlp`. No hay archivo
+    /// en caché y el proceso sigue vivo mientras rodio consume la fuente.
+    StreamReady {
+        generation: u64,
+        index: usize,
+        track: YoutubeTrack,
+        source: rodio::Decoder<GrowingPipe>,
+        duration: Option<Duration>,
+    },
     Error {
         generation: u64,
         index: usize,
         message: String,
     },
+}
+
+impl std::fmt::Debug for YoutubeAudioMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready {
+                generation,
+                index,
+                track,
+                path,
+            } => formatter
+                .debug_struct("Ready")
+                .field("generation", generation)
+                .field("index", index)
+                .field("track", track)
+                .field("path", path)
+                .finish(),
+            Self::StreamReady {
+                generation,
+                index,
+                track,
+                duration,
+                ..
+            } => formatter
+                .debug_struct("StreamReady")
+                .field("generation", generation)
+                .field("index", index)
+                .field("track", track)
+                .field("duration", duration)
+                .finish(),
+            Self::Error {
+                generation,
+                index,
+                message,
+            } => formatter
+                .debug_struct("Error")
+                .field("generation", generation)
+                .field("index", index)
+                .field("message", message)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -151,13 +233,30 @@ fn run_search(query: &str) -> Result<Vec<YoutubeTrack>, String> {
             .trim();
         return Err(format!("No se pudo buscar en YouTube: {detail}"));
     }
-    // La carátula se baja aquí, en el mismo hilo que la búsqueda, para que la
-    // interfaz solo tenga que convertir bytes en textura.
-    for track in &mut tracks {
-        if let Some(url) = track.thumbnail.clone() {
-            track.thumbnail_data = download_thumbnail(&url);
+    // Un solo Agent comparte el pool de conexiones: todas las miniaturas
+    // vienen de i.ytimg.com, así que crear uno por imagen solo añadía diez
+    // handshakes TLS seguidos. Se descargan en paralelo antes de publicar los
+    // resultados, sin que la interfaz tenga que convertir bytes en textura.
+    let agent: Agent = Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .into();
+    let indices: Vec<usize> = tracks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, track)| track.thumbnail.as_ref().map(|_| index))
+        .collect();
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(indices.len());
+        for &index in &indices {
+            let url = tracks[index].thumbnail.clone().unwrap();
+            let agent = &agent;
+            handles.push(scope.spawn(move || download_thumbnail(&url, agent)));
         }
-    }
+        for (index, handle) in indices.into_iter().zip(handles) {
+            tracks[index].thumbnail_data = handle.join().ok().flatten();
+        }
+    });
     Ok(tracks)
 }
 
@@ -169,9 +268,21 @@ fn text_field(value: &Value, names: &[&str]) -> String {
         .to_owned()
 }
 
-/// La última miniatura suele ser la de mayor resolución.
+/// YouTube ofrece varias miniaturas del mismo vídeo. La interfaz solo la usa
+/// como guía visual en el panel lateral, así que se elige la más pequeña de
+/// las que declaran tamaño (por ejemplo 360×202 en vez de 720×404). Si no hay
+/// dimensiones, se mantiene el criterio anterior de tomar la última.
 fn thumbnail_field(value: &Value) -> Option<String> {
     if let Some(list) = value.get("thumbnails").and_then(Value::as_array) {
+        let sized = list.iter().filter_map(|entry| {
+            let url = entry.get("url").and_then(Value::as_str)?;
+            let width = entry.get("width").and_then(Value::as_u64)?;
+            let height = entry.get("height").and_then(Value::as_u64)?;
+            (width > 0 && height > 0).then_some((width.saturating_mul(height), url))
+        });
+        if let Some((_, url)) = sized.min_by_key(|(area, _)| *area) {
+            return Some(url.to_owned());
+        }
         if let Some(url) = list
             .iter()
             .rev()
@@ -242,11 +353,7 @@ fn parse_search_output(output: &str) -> Vec<YoutubeTrack> {
 
 /// Descarga la miniatura y la deja en PNG. Los resultados suelen traer WebP o
 /// JPEG; `image` ya tiene ambos decodificadores activados en `Cargo.toml`.
-fn download_thumbnail(url: &str) -> Option<Vec<u8>> {
-    let agent: Agent = Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(10)))
-        .build()
-        .into();
+fn download_thumbnail(url: &str, agent: &Agent) -> Option<Vec<u8>> {
     let mut response = agent
         .get(url)
         .header("User-Agent", "Freeway-Player")
@@ -393,40 +500,202 @@ fn download_audio(track: &YoutubeTrack, dir: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Descarga el audio de reproducción en la caché. `generation` es única por
-/// petición para que la interfaz pueda ignorar descargas anticuadas.
-pub fn start_audio(
-    track: YoutubeTrack,
-    generation: u64,
-    index: usize,
-) -> Result<Receiver<YoutubeAudioMessage>, String> {
+struct PipeInner {
+    child: Child,
+    stdout: ChildStdout,
+    buffer: Vec<u8>,
+    pos: u64,
+    eof: bool,
+}
+
+/// Lector que va creciendo con lo que sale por stdout de `yt-dlp`. Todo lo ya
+/// recibido se expone como bytes aleatorios hacia atrás; hacia delante puede
+/// seguir descargando. El `moov` del m4a de YouTube va al principio, así que
+/// Symphonia inicializa el decodificador con unos pocos kilobytes.
+pub struct GrowingPipe {
+    inner: Mutex<PipeInner>,
+}
+
+impl GrowingPipe {
+    fn new(child: Child, stdout: ChildStdout) -> Self {
+        Self {
+            inner: Mutex::new(PipeInner {
+                child,
+                stdout,
+                buffer: Vec::new(),
+                pos: 0,
+                eof: false,
+            }),
+        }
+    }
+}
+
+impl Read for GrowingPipe {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if inner.pos as usize >= inner.buffer.len() && !inner.eof {
+            let mut chunk = [0u8; 64 * 1024];
+            match inner.stdout.read(&mut chunk)? {
+                0 => inner.eof = true,
+                n => inner.buffer.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let start = inner.pos as usize;
+        let available = inner.buffer.len().saturating_sub(start);
+        if available == 0 {
+            return Ok(0);
+        }
+        let n = available.min(out.len());
+        out[..n].copy_from_slice(&inner.buffer[start..start + n]);
+        inner.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for GrowingPipe {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let mut inner = self.inner.lock().unwrap();
+        let target = match pos {
+            SeekFrom::Start(n) => n as i128,
+            SeekFrom::Current(n) => inner.pos as i128 + n as i128,
+            SeekFrom::End(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "el final del pipe aún no se conoce",
+                ));
+            }
+        };
+        if target < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek negativo",
+            ));
+        }
+        let target = target as u64;
+        let mut chunk = [0u8; 64 * 1024];
+        while target > inner.buffer.len() as u64 && !inner.eof {
+            match inner.stdout.read(&mut chunk)? {
+                0 => inner.eof = true,
+                n => inner.buffer.extend_from_slice(&chunk[..n]),
+            }
+        }
+        inner.pos = target;
+        Ok(target)
+    }
+}
+
+impl Drop for PipeInner {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Abre el audio m4a/AAC original de YouTube directamente desde stdout, sin
+/// conversión. Si el vídeo no ofrece m4a, `yt-dlp` termina con error y el
+/// llamador cae a la descarga completa.
+fn stream_source(url: &str) -> Result<rodio::Decoder<GrowingPipe>, String> {
+    let mut child = Command::new(program())
+        .arg("--ignore-config")
+        .arg("--no-warnings")
+        .arg("--no-playlist")
+        .arg("-f")
+        .arg("bestaudio[ext=m4a]")
+        .arg("--socket-timeout")
+        .arg("15")
+        .arg("--retries")
+        .arg("1")
+        .arg("-o")
+        .arg("-")
+        .arg(url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("No se pudo iniciar el streaming: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "yt-dlp no devolvió datos para el streaming".to_owned())?;
+    rodio::Decoder::builder()
+        .with_data(GrowingPipe::new(child, stdout))
+        .with_hint("m4a")
+        .with_mime_type("audio/mp4")
+        .build()
+        .map_err(|error| format!("No se pudo decodificar el audio AAC: {error}"))
+}
+
+/// Prepara un archivo Opus en la caché con un nombre único por petición.
+fn cache_audio(track: &YoutubeTrack) -> Result<PathBuf, String> {
     let dir = cache_dir()?;
-    // El nombre de la caché incluye un sello único: dos clics seguidos sobre el
-    // mismo resultado no deben sobrescribir el archivo que está sonando.
     let cache_track = YoutubeTrack {
         id: format!("{}_{}", track.id, unique_stamp()),
         ..track.clone()
     };
+    download_audio(&cache_track, &dir)
+}
+
+/// Reproducción según el ajuste del usuario. Con `Streaming` se intenta el
+/// pipe AAC primero; cualquier fallo (formato no disponible, decodificación,
+/// red) cae a la descarga completa sin mostrar un error al usuario.
+pub fn start_audio_auto(
+    track: YoutubeTrack,
+    generation: u64,
+    index: usize,
+    mode: YoutubePlayback,
+) -> Result<Receiver<YoutubeAudioMessage>, String> {
     let (sender, receiver) = mpsc::channel();
     thread::Builder::new()
         .name("freeway-youtube-audio".to_owned())
         .spawn(move || {
-            let message = match download_audio(&cache_track, &dir) {
-                Ok(path) => YoutubeAudioMessage::Ready {
-                    generation,
-                    index,
-                    track,
-                    path,
-                },
-                Err(message) => YoutubeAudioMessage::Error {
-                    generation,
-                    index,
-                    message,
-                },
+            let message = if mode == YoutubePlayback::Streaming {
+                match stream_source(&track.url) {
+                    Ok(source) => {
+                        let duration = source.total_duration().or(track.duration);
+                        YoutubeAudioMessage::StreamReady {
+                            generation,
+                            index,
+                            track,
+                            source,
+                            duration,
+                        }
+                    }
+                    Err(stream_error) => match cache_audio(&track) {
+                        Ok(path) => YoutubeAudioMessage::Ready {
+                            generation,
+                            index,
+                            track,
+                            path,
+                        },
+                        Err(download_error) => YoutubeAudioMessage::Error {
+                            generation,
+                            index,
+                            message: format!(
+                                "No se pudo reproducir el streaming ({stream_error}) ni descargar el audio ({download_error})"
+                            ),
+                        },
+                    },
+                }
+            } else {
+                match cache_audio(&track) {
+                    Ok(path) => YoutubeAudioMessage::Ready {
+                        generation,
+                        index,
+                        track,
+                        path,
+                    },
+                    Err(message) => YoutubeAudioMessage::Error {
+                        generation,
+                        index,
+                        message,
+                    },
+                }
             };
             let _ = sender.send(message);
         })
-        .map_err(|error| format!("No se pudo iniciar la descarga del audio: {error}"))?;
+        .map_err(|error| format!("No se pudo iniciar la reproducción: {error}"))?;
     Ok(receiver)
 }
 
@@ -462,7 +731,7 @@ pub fn start_download(
 mod tests {
     use super::*;
 
-    const FLAT_RESULT: &str = r#"{"_type":"url","id":"abc123","url":"https://www.youtube.com/watch?v=abc123","title":"Canción · prueba","channel":"Canal de prueba","duration":215,"thumbnails":[{"url":"https://i.ytimg.com/vi/abc123/hq.jpg","height":202},{"url":"https://i.ytimg.com/vi/abc123/maxres.jpg","height":1080}],"webpage_url":"https://www.youtube.com/watch?v=abc123"}"#;
+    const FLAT_RESULT: &str = r#"{"_type":"url","id":"abc123","url":"https://www.youtube.com/watch?v=abc123","title":"Canción · prueba","channel":"Canal de prueba","duration":215,"thumbnails":[{"url":"https://i.ytimg.com/vi/abc123/hq.jpg","height":202,"width":360},{"url":"https://i.ytimg.com/vi/abc123/maxres.jpg","height":1080,"width":1920}],"webpage_url":"https://www.youtube.com/watch?v=abc123"}"#;
 
     #[test]
     fn search_url_limits_results() {
@@ -480,11 +749,19 @@ mod tests {
         assert_eq!(track.duration, Some(Duration::from_secs(215)));
         assert_eq!(
             track.thumbnail.as_deref(),
-            Some("https://i.ytimg.com/vi/abc123/maxres.jpg")
+            Some("https://i.ytimg.com/vi/abc123/hq.jpg")
         );
         assert!(track.thumbnail_data.is_none());
         assert_eq!(track.url, "https://www.youtube.com/watch?v=abc123");
         assert!(!track.live);
+    }
+
+    #[test]
+    fn thumbnail_without_dimensions_keeps_the_last_url() {
+        let value: Value =
+            serde_json::from_str(r#"{"thumbnails":[{"url":"pequeña.jpg"},{"url":"grande.jpg"}]}"#)
+                .unwrap();
+        assert_eq!(thumbnail_field(&value).as_deref(), Some("grande.jpg"));
     }
 
     #[test]
@@ -555,11 +832,46 @@ mod tests {
             url: "https://www.youtube.com/watch?v=wMzIHuWh_I0".to_owned(),
             live: false,
         };
-        let messages = start_audio(track, 1, 0).expect("no se pudo arrancar la descarga");
+        let messages = start_audio_auto(track, 1, 0, YoutubePlayback::FullDownload)
+            .expect("no se pudo arrancar la descarga");
         let message = messages.recv_timeout(Duration::from_secs(180));
         match message {
             Ok(YoutubeAudioMessage::Ready { path, .. }) => assert!(path.is_file()),
             other => panic!("la descarga real falló: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "requiere red y yt-dlp"]
+    fn real_streaming_returns_decoded_samples() {
+        let track = YoutubeTrack {
+            id: "wMzIHuWh_I0".to_owned(),
+            title: "Test & Recognise".to_owned(),
+            channel: "Flume".to_owned(),
+            duration: Some(Duration::from_secs(304)),
+            thumbnail: None,
+            thumbnail_data: None,
+            url: "https://www.youtube.com/watch?v=wMzIHuWh_I0".to_owned(),
+            live: false,
+        };
+        let started = std::time::Instant::now();
+        let messages = start_audio_auto(track, 1, 0, YoutubePlayback::Streaming)
+            .expect("no se pudo arrancar el streaming");
+        match messages.recv_timeout(Duration::from_secs(30)) {
+            Ok(YoutubeAudioMessage::StreamReady {
+                mut source,
+                duration,
+                ..
+            }) => {
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed < Duration::from_secs(20),
+                    "el streaming tardó demasiado en inicializar: {elapsed:?}"
+                );
+                assert_eq!(duration.map(|value| value.as_secs()), Some(304));
+                assert!(source.next().is_some(), "el pipe no dio muestras de audio");
+            }
+            other => panic!("el streaming real falló: {other:?}"),
         }
     }
 }

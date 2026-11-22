@@ -30,6 +30,8 @@ mod opus;
 mod updates;
 mod youtube;
 
+use youtube::YoutubePlayback;
+
 const EMBEDDED_UI: &str = include_str!("../ui/main.xml");
 const EMBEDDED_THEME: &str = include_str!("../ui/theme.xml");
 const APP_ICON_PNG: &[u8] = include_bytes!("../icon.png");
@@ -220,6 +222,11 @@ fn add_behavior_from_option_index(index: usize) -> Option<AddBehavior> {
     AddBehavior::ALL.get(index).copied()
 }
 
+/// Posición de las opciones de reproducción de YouTube en el diálogo de ajustes.
+fn youtube_playback_from_option_index(index: usize) -> Option<YoutubePlayback> {
+    YoutubePlayback::ALL.get(index).copied()
+}
+
 /// Preferencias que sobreviven al cierre del programa. Se guardan aparte de
 /// las listas para que un fallo al escribir una no arrastre a las otras.
 #[derive(Serialize, Deserialize)]
@@ -230,6 +237,10 @@ struct SavedSettings {
     open_behavior: OpenBehavior,
     #[serde(default)]
     add_behavior: AddBehavior,
+    /// Reproducción de YouTube; los archivos de ajustes antiguos caen en
+    /// `Streaming` gracias a `default`.
+    #[serde(default)]
+    youtube_playback: YoutubePlayback,
     /// Carpeta elegida para guardar descargas. `None` usa la de descargas del
     /// sistema; nunca se escribe nada ahí hasta que el usuario lo pida.
     #[serde(default)]
@@ -274,6 +285,7 @@ impl Default for SavedSettings {
             last_cover_dir: None,
             open_behavior: OpenBehavior::default(),
             add_behavior: AddBehavior::default(),
+            youtube_playback: YoutubePlayback::default(),
             download_dir: None,
             volume: default_volume(),
         }
@@ -507,6 +519,7 @@ struct PlayerState {
     last_cover_dir: Option<PathBuf>,
     open_behavior: OpenBehavior,
     add_behavior: AddBehavior,
+    youtube_playback: YoutubePlayback,
     download_dir: Option<PathBuf>,
     /// El modo YouTube es solo una vista de búsqueda: no guarda resultados ni
     /// añade pistas a las listas sin una acción explícita del usuario.
@@ -536,6 +549,9 @@ struct PlayerState {
     stream_pending: Option<((usize, usize), u64)>,
     stream_current: Option<(usize, usize)>,
     stream_audio_path: Option<PathBuf>,
+    /// La fuente actual sale directamente del pipe de `yt-dlp`: se reproduce
+    /// en cuanto inicializa, pero no admite un seek real.
+    stream_pipe_active: bool,
     /// Rutas que envían las siguientes instancias de la app.
     instance_paths: Option<Receiver<Vec<PathBuf>>>,
     /// Publicador MPRIS y canal de órdenes entrantes (el hilo D-Bus no toca
@@ -647,6 +663,7 @@ impl PlayerState {
             last_cover_dir: settings.last_cover_dir,
             open_behavior: settings.open_behavior,
             add_behavior: settings.add_behavior,
+            youtube_playback: settings.youtube_playback,
             download_dir: settings.download_dir,
             youtube_mode: false,
             youtube_results: Vec::new(),
@@ -667,6 +684,7 @@ impl PlayerState {
             stream_pending: None,
             stream_current: None,
             stream_audio_path: None,
+            stream_pipe_active: false,
             instance_paths: None,
             mpris: None,
             mpris_commands: None,
@@ -723,6 +741,7 @@ impl PlayerState {
             last_cover_dir: self.last_cover_dir.clone(),
             open_behavior: self.open_behavior,
             add_behavior: self.add_behavior,
+            youtube_playback: self.youtube_playback,
             download_dir: self.download_dir.clone(),
             volume: self.volume,
         };
@@ -1623,6 +1642,7 @@ impl PlayerState {
         }
         self.playing = false;
         self.stopped = true;
+        self.stream_pipe_active = false;
         self.cycle_finished = false;
         self.status = "Detenido".to_owned();
     }
@@ -1783,6 +1803,12 @@ impl PlayerState {
     }
 
     fn seek(&mut self, seconds: f32) {
+        // El pipe de yt-dlp no es aleatorio: la fuente solo avanza. Se deja la
+        // barra informativa, pero no se envía una orden que descuadre el audio.
+        if self.stream_pipe_active {
+            self.status = "El streaming de YouTube no permite cambiar la posición".to_owned();
+            return;
+        }
         // rodio guarda la orden de seek incluso si no hay sonido y la aplica a
         // la siguiente pista que se añada. Evita envenenar esa pista.
         if self.is_stopped() {
@@ -2222,32 +2248,26 @@ impl PlayerState {
         }
     }
 
-    fn set_open_behavior(&mut self, behavior: OpenBehavior) {
+    fn set_open_behavior(&mut self, behavior: OpenBehavior) -> Result<(), String> {
         self.open_behavior = behavior;
-        self.status = format!("Ajustes: {}", behavior.label());
-        if let Err(error) = self.persist_settings() {
-            self.status = format!("No se pudo guardar el ajuste: {error}");
-        }
+        self.persist_settings()
     }
 
-    fn set_add_behavior(&mut self, behavior: AddBehavior) {
+    fn set_add_behavior(&mut self, behavior: AddBehavior) -> Result<(), String> {
         self.add_behavior = behavior;
-        self.status = format!("Ajustes: {}", behavior.label());
-        if let Err(error) = self.persist_settings() {
-            self.status = format!("No se pudo guardar el ajuste: {error}");
-        }
+        self.persist_settings()
     }
 
-    fn set_download_dir(&mut self, dir: Option<PathBuf>) {
+    /// El cambio afecta a la siguiente reproducción: la pista que ya suena no
+    /// se interrumpe al aplicar el ajuste.
+    fn set_youtube_playback(&mut self, mode: YoutubePlayback) -> Result<(), String> {
+        self.youtube_playback = mode;
+        self.persist_settings()
+    }
+
+    fn set_download_dir(&mut self, dir: Option<PathBuf>) -> Result<(), String> {
         self.download_dir = dir;
-        let effective = self.download_dir.clone().or_else(default_download_dir);
-        self.status = match effective {
-            Some(path) => format!("Ajustes: descargas en {}", path.display()),
-            None => "Ajustes: descargas en la carpeta predeterminada".to_owned(),
-        };
-        if let Err(error) = self.persist_settings() {
-            self.status = format!("No se pudo guardar el ajuste: {error}");
-        }
+        self.persist_settings()
     }
 
     /// Entra o sale del buscador de YouTube. No toca listas ni reproducción:
@@ -2304,6 +2324,7 @@ impl PlayerState {
         if let Some(path) = self.youtube_audio_path.take() {
             let _ = fs::remove_file(path);
         }
+        self.stream_pipe_active = false;
     }
 
     /// Lanza una búsqueda en un hilo aparte. La generación evita que una
@@ -2423,9 +2444,25 @@ impl PlayerState {
         })
     }
 
-    /// Reproduce un resultado sin tocar `playlists` ni `active_playlist`. El
-    /// audio se descarga primero a la caché porque `rodio` necesita una fuente
-    /// que se pueda leer como un archivo.
+    /// Entrega una fuente al reproductor. La usan tanto el Opus en caché como
+    /// el pipe AAC en streaming; en este último caso la barra será informativa.
+    fn append_audio_source(&mut self, source: Box<dyn Source + Send>) -> Result<(), String> {
+        let output = self
+            .output
+            .as_ref()
+            .ok_or_else(|| "No hay un dispositivo de salida de audio disponible".to_owned())?;
+        output.player.clear();
+        if output.player.empty() {
+            let _ = output.player.try_seek(Duration::ZERO);
+        }
+        output.player.set_volume(self.volume);
+        output.player.append(source);
+        output.player.play();
+        Ok(())
+    }
+
+    /// Reproduce un resultado sin tocar `playlists` ni `active_playlist`. Según
+    /// el ajuste, abre el pipe AAC en streaming o deja un Opus en la caché.
     fn play_youtube_result(&mut self, selected: Option<usize>) {
         if !self.youtube_mode {
             return;
@@ -2519,8 +2556,13 @@ impl PlayerState {
         self.playing = false;
         self.stopped = true;
         self.cycle_finished = false;
-        self.status = format!("YouTube: descargando audio de «{}»…", track.title);
-        match youtube::start_audio(track, generation, index) {
+        self.stream_pipe_active = false;
+        self.status = if self.youtube_playback == YoutubePlayback::Streaming {
+            format!("YouTube: preparando audio de «{}»…", track.title)
+        } else {
+            format!("YouTube: descargando audio de «{}»…", track.title)
+        };
+        match youtube::start_audio_auto(track, generation, index, self.youtube_playback) {
             Ok(receiver) => {
                 self.youtube_audio = Some(receiver);
                 self.youtube_pending_audio = Some((generation, index));
@@ -2559,19 +2601,15 @@ impl PlayerState {
                     }
                 };
                 let duration = source.total_duration().or(track.duration);
-                {
-                    let Some(output) = &self.output else {
-                        self.status = "No hay un dispositivo de salida de audio disponible".to_owned();
-                        return;
-                    };
-                    output.player.clear();
-                    if output.player.empty() {
-                        let _ = output.player.try_seek(Duration::ZERO);
-                    }
-                    output.player.set_volume(self.volume);
-                    output.player.append(source);
-                    output.player.play();
+                if let Err(error) = self.append_audio_source(source) {
+                    self.current_metadata = None;
+                    self.duration = None;
+                    self.status = error;
+                    self.playing = false;
+                    self.stopped = true;
+                    return;
                 }
+                self.stream_pipe_active = false;
                 if let Some(previous) = self.youtube_audio_path.replace(path) {
                     let _ = fs::remove_file(previous);
                 }
@@ -2590,6 +2628,43 @@ impl PlayerState {
                 self.cycle_finished = false;
                 self.status = "Reproduciendo desde YouTube".to_owned();
             }
+            Some(Ok(youtube::YoutubeAudioMessage::StreamReady {
+                generation,
+                index,
+                track,
+                source,
+                duration,
+            })) if self.youtube_pending_audio == Some((generation, index)) => {
+                self.youtube_audio = None;
+                self.youtube_pending_audio = None;
+                let duration = duration.or(track.duration);
+                if let Err(error) = self.append_audio_source(Box::new(source)) {
+                    self.current_metadata = None;
+                    self.duration = None;
+                    self.status = error;
+                    self.playing = false;
+                    self.stopped = true;
+                    return;
+                }
+                self.stream_pipe_active = true;
+                if let Some(previous) = self.youtube_audio_path.take() {
+                    let _ = fs::remove_file(previous);
+                }
+                self.youtube_current = Some(index);
+                self.youtube_selected = Some(index);
+                self.current = None;
+                self.current_metadata = Some(TrackMetadata {
+                    title: track.title,
+                    artist: track.channel,
+                    duration,
+                    ..TrackMetadata::default()
+                });
+                self.duration = duration;
+                self.playing = true;
+                self.stopped = false;
+                self.cycle_finished = false;
+                self.status = "Reproduciendo desde YouTube en streaming".to_owned();
+            }
             Some(Ok(youtube::YoutubeAudioMessage::Error {
                 generation,
                 index,
@@ -2601,6 +2676,7 @@ impl PlayerState {
                 self.duration = None;
                 self.playing = false;
                 self.stopped = true;
+                self.stream_pipe_active = false;
                 self.status = message;
             }
             Some(Ok(_)) => {}
@@ -2611,6 +2687,7 @@ impl PlayerState {
                     self.duration = None;
                     self.playing = false;
                     self.stopped = true;
+                    self.stream_pipe_active = false;
                     self.status = "La descarga del audio de YouTube se interrumpió".to_owned();
                 }
             }
@@ -2717,9 +2794,9 @@ impl PlayerState {
         }
     }
 
-    /// Prepara una pista en streaming para reproducción. Igual que con los
-    /// resultados del buscador, `yt-dlp` deja un Opus en la caché; aquí además
-    /// se conserva la posición `(lista, pista)` para que Siguiente funcione.
+    /// Prepara una pista guardada como URL. Igual que con los resultados del
+    /// buscador, respeta el ajuste de streaming/descarga; aquí además se
+    /// conserva la posición `(lista, pista)` para que Siguiente funcione.
     fn play_streaming_track(
         &mut self,
         location: (usize, usize),
@@ -2745,10 +2822,14 @@ impl PlayerState {
         self.playing = false;
         self.stopped = true;
         self.cycle_finished = false;
-        self.status = format!(
-            "Descargando audio de «{}» para reproducir en streaming…",
-            stream.title
-        );
+        self.status = if self.youtube_playback == YoutubePlayback::Streaming {
+            format!("Preparando audio de «{}» en streaming…", stream.title)
+        } else {
+            format!(
+                "Descargando audio de «{}» para reproducir en streaming…",
+                stream.title
+            )
+        };
         let track = youtube::YoutubeTrack {
             id: stream.url.clone(),
             title: stream.title,
@@ -2759,7 +2840,8 @@ impl PlayerState {
             url: stream.url,
             live: false,
         };
-        match youtube::start_audio(track, generation, 0) {
+        self.stream_pipe_active = false;
+        match youtube::start_audio_auto(track, generation, 0, self.youtube_playback) {
             Ok(receiver) => {
                 self.stream_audio = Some(receiver);
                 self.stream_pending = Some((location, generation));
@@ -2803,19 +2885,15 @@ impl PlayerState {
                     }
                 };
                 let duration = source.total_duration().or(track.duration);
-                {
-                    let Some(output) = &self.output else {
-                        self.status = "No hay un dispositivo de salida de audio disponible".to_owned();
-                        return;
-                    };
-                    output.player.clear();
-                    if output.player.empty() {
-                        let _ = output.player.try_seek(Duration::ZERO);
-                    }
-                    output.player.set_volume(self.volume);
-                    output.player.append(source);
-                    output.player.play();
+                if let Err(error) = self.append_audio_source(source) {
+                    self.current_metadata = None;
+                    self.duration = None;
+                    self.playing = false;
+                    self.stopped = true;
+                    self.status = error;
+                    return;
                 }
+                self.stream_pipe_active = false;
                 if let Some(previous) = self.stream_audio_path.replace(path) {
                     let _ = fs::remove_file(previous);
                 }
@@ -2833,6 +2911,48 @@ impl PlayerState {
                 self.cycle_finished = false;
                 self.status = "Reproduciendo en streaming".to_owned();
             }
+            Some(Ok(youtube::YoutubeAudioMessage::StreamReady {
+                generation,
+                track,
+                source,
+                duration,
+                ..
+            })) if self
+                .stream_pending
+                .is_some_and(|(location, pending)| pending == generation && Some(location) == self.current) =>
+            {
+                let location = match self.stream_pending.take() {
+                    Some((location, _)) => location,
+                    None => return,
+                };
+                self.stream_audio = None;
+                let duration = duration.or(track.duration);
+                if let Err(error) = self.append_audio_source(Box::new(source)) {
+                    self.current_metadata = None;
+                    self.duration = None;
+                    self.playing = false;
+                    self.stopped = true;
+                    self.status = error;
+                    return;
+                }
+                self.stream_pipe_active = true;
+                if let Some(previous) = self.stream_audio_path.take() {
+                    let _ = fs::remove_file(previous);
+                }
+                self.stream_current = Some(location);
+                self.current = Some(location);
+                self.current_metadata = Some(TrackMetadata {
+                    title: track.title,
+                    artist: track.channel,
+                    duration,
+                    ..TrackMetadata::default()
+                });
+                self.duration = duration;
+                self.playing = true;
+                self.stopped = false;
+                self.cycle_finished = false;
+                self.status = "Reproduciendo en streaming (AAC)".to_owned();
+            }
             Some(Ok(youtube::YoutubeAudioMessage::Error {
                 generation, message, ..
             })) if self
@@ -2845,6 +2965,7 @@ impl PlayerState {
                 self.duration = None;
                 self.playing = false;
                 self.stopped = true;
+                self.stream_pipe_active = false;
                 self.status = message;
             }
             Some(Ok(_)) => {}
@@ -2855,6 +2976,7 @@ impl PlayerState {
                     self.duration = None;
                     self.playing = false;
                     self.stopped = true;
+                    self.stream_pipe_active = false;
                     self.status = "La descarga del streaming se interrumpió".to_owned();
                 }
             }
@@ -2883,6 +3005,7 @@ impl PlayerState {
         if let Some(path) = self.stream_audio_path.take() {
             let _ = fs::remove_file(path);
         }
+        self.stream_pipe_active = false;
     }
 
     fn export_playlist(&mut self, path: &Path) {
@@ -4800,25 +4923,48 @@ unsafe extern "C" fn check_updates_from_app_menu(_item: Rid, user_data: *mut c_v
     }
 }
 
-/// Datos que necesita el diálogo de ajustes mientras está abierto. Raven
-/// borra el contenido al cerrarlo, así que las opciones se leen en la
-/// devolución de llamada de cierre.
+const SETTINGS_SECTIONS: [&str; 4] = ["General", "Listas", "YouTube", "Descargas"];
+
+/// Datos que necesita el diálogo de ajustes mientras está abierto. `Aplicar`
+/// conserva el contexto porque el diálogo sigue en pie; solo al cerrarlo se
+/// libera y, si fue con `Aceptar`, se aplican los cambios pendientes.
 struct SettingsDialogContext {
     state: Rc<RefCell<PlayerState>>,
     open_options: [Rid; 3],
     add_options: [Rid; 2],
+    youtube_options: [Rid; 2],
     download_dir: Rc<RefCell<Option<PathBuf>>>,
     download_dir_label: Rid,
+    menu: Rid,
+    pages: Rid,
+}
+
+unsafe fn settings_heading(text: &str) -> Rid {
+    let label = Rlabel_create(cstr(text).as_ptr());
+    Rlabel_set_text_size(label, 14.0);
+    Rlabel_set_color(label, 0.725, 0.639, 0.961, 1.0);
+    label
+}
+
+unsafe fn settings_description(text: &str) -> Rid {
+    let label = Rlabel_create(cstr(text).as_ptr());
+    Rlabel_set_text_size(label, 12.0);
+    Rlabel_set_wrap(label, R_TRUE);
+    // Sin un ancho máximo Raven mide el texto de una sola línea y el diálogo
+    // se ensancha al cambiar de sección.
+    Rwidget_set_max_size(label, 400.0, -1.0);
+    label
 }
 
 unsafe extern "C" fn open_settings_dialog(item: Rid, user_data: *mut c_void) {
     let state = &*(user_data as *const Rc<RefCell<PlayerState>>);
     let window = Rwidget_get_window(item);
-    let (current_open, current_add, current_download) = {
+    let (current_open, current_add, current_youtube, current_download) = {
         let state = state.borrow();
         (
             state.open_behavior,
             state.add_behavior,
+            state.youtube_playback,
             state.download_dir.clone(),
         )
     };
@@ -4832,47 +4978,52 @@ unsafe extern "C" fn open_settings_dialog(item: Rid, user_data: *mut c_void) {
     Rlabel_set_text_size(title, 19.0);
     Rwidget_add_child(content, title);
 
-    let category = Rlabel_create(cstr("Comportamiento al abrir archivos").as_ptr());
-    Rlabel_set_text_size(category, 14.0);
-    Rlabel_set_color(category, 0.725, 0.639, 0.961, 1.0);
-    Rwidget_add_child(content, category);
+    let body = Rwidget_create(R_WIDGET_HBOX);
+    Rpanel_set_spacing(body, 16.0);
 
-    let description = Rlabel_create(
-        cstr("Elige qué ocurre cuando abres un archivo con Freeway Player ya en marcha.").as_ptr(),
+    let menu = Rwidget_create(R_WIDGET_LIST_VIEW);
+    Rwidget_set_min_size(menu, 160.0, 0.0);
+    for section in SETTINGS_SECTIONS {
+        Rlist_view_add_item(menu, cstr(section).as_ptr());
+    }
+    Rlist_view_set_selected(menu, 0);
+    Rwidget_add_child(body, menu);
+
+    let pages = Rwidget_create(R_WIDGET_SWITCHER);
+    Rwidget_set_min_size(pages, 430.0, 250.0);
+    Rslot_set_fill(pages, 1.0);
+
+    // General: comportamiento al abrir archivos desde fuera de la app.
+    let general = Rwidget_create(R_WIDGET_VBOX);
+    Rpanel_set_spacing(general, 10.0);
+    Rwidget_add_child(general, settings_heading("Comportamiento al abrir archivos"));
+    Rwidget_add_child(
+        general,
+        settings_description("Elige qué ocurre cuando abres un archivo con Freeway Player ya en marcha."),
     );
-    Rlabel_set_text_size(description, 12.0);
-    Rlabel_set_wrap(description, R_TRUE);
-    Rwidget_add_child(content, description);
-
-    // Las casillas radio de cada categoría son hermanas: Raven desmarca las
-    // demás del mismo padre al marcar una.
     let options_panel = Rwidget_create(R_WIDGET_VBOX);
     Rpanel_set_spacing(options_panel, 6.0);
     let mut open_options = [R_INVALID_ID; 3];
     for behavior in OpenBehavior::ALL {
+        // Las casillas radio son hermanas: Raven desmarca las demás del mismo
+        // padre al marcar una.
         let option = Rcheckbox_create(cstr(behavior.label()).as_ptr());
         Rcheckbox_set_style(option, R_CHECKBOX_RADIO);
         Rcheckbox_set_checked(option, if behavior == current_open { R_TRUE } else { R_FALSE });
         Rwidget_add_child(options_panel, option);
         open_options[behavior.index()] = option;
     }
-    Rwidget_add_child(content, options_panel);
+    Rwidget_add_child(general, options_panel);
+    Rwidget_add_child(pages, general);
 
-    let sections_separator = Rwidget_create(R_WIDGET_SEPARATOR);
-    Rwidget_add_child(content, sections_separator);
-
-    let add_category = Rlabel_create(cstr("Comportamiento al añadir a la lista").as_ptr());
-    Rlabel_set_text_size(add_category, 14.0);
-    Rlabel_set_color(add_category, 0.725, 0.639, 0.961, 1.0);
-    Rwidget_add_child(content, add_category);
-
-    let add_description = Rlabel_create(
-        cstr("Elige qué ocurre al añadir pistas desde la app, tanto si las arrastras a la ventana como si usas «+ Añadir pistas». No afecta a los archivos abiertos desde el gestor.").as_ptr(),
+    // Listas: comportamiento al añadir pistas desde la propia app.
+    let lists = Rwidget_create(R_WIDGET_VBOX);
+    Rpanel_set_spacing(lists, 10.0);
+    Rwidget_add_child(lists, settings_heading("Comportamiento al añadir a la lista"));
+    Rwidget_add_child(
+        lists,
+        settings_description("Elige qué ocurre al añadir pistas desde la app, tanto si las arrastras a la ventana como si usas «+ Añadir pistas». No afecta a los archivos abiertos desde el gestor."),
     );
-    Rlabel_set_text_size(add_description, 12.0);
-    Rlabel_set_wrap(add_description, R_TRUE);
-    Rwidget_add_child(content, add_description);
-
     let add_options_panel = Rwidget_create(R_WIDGET_VBOX);
     Rpanel_set_spacing(add_options_panel, 6.0);
     let mut add_options = [R_INVALID_ID; 2];
@@ -4883,21 +5034,38 @@ unsafe extern "C" fn open_settings_dialog(item: Rid, user_data: *mut c_void) {
         Rwidget_add_child(add_options_panel, option);
         add_options[behavior.index()] = option;
     }
-    Rwidget_add_child(content, add_options_panel);
+    Rwidget_add_child(lists, add_options_panel);
+    Rwidget_add_child(pages, lists);
 
-    let downloads_separator = Rwidget_create(R_WIDGET_SEPARATOR);
-    Rwidget_add_child(content, downloads_separator);
+    // YouTube: streaming directo o descarga Opus completa antes de sonar.
+    let youtube = Rwidget_create(R_WIDGET_VBOX);
+    Rpanel_set_spacing(youtube, 10.0);
+    Rwidget_add_child(youtube, settings_heading("Reproducción de YouTube"));
+    Rwidget_add_child(
+        youtube,
+        settings_description("Streaming empieza a sonar en cuanto llega el audio; la descarga completa espera a bajarlo y convertirlo a Opus, y permite avanzar dentro de la pista. El cambio afecta a la siguiente reproducción."),
+    );
+    let youtube_options_panel = Rwidget_create(R_WIDGET_VBOX);
+    Rpanel_set_spacing(youtube_options_panel, 6.0);
+    let mut youtube_options = [R_INVALID_ID; 2];
+    for mode in YoutubePlayback::ALL {
+        let option = Rcheckbox_create(cstr(mode.label()).as_ptr());
+        Rcheckbox_set_style(option, R_CHECKBOX_RADIO);
+        Rcheckbox_set_checked(option, if mode == current_youtube { R_TRUE } else { R_FALSE });
+        Rwidget_add_child(youtube_options_panel, option);
+        youtube_options[mode.index()] = option;
+    }
+    Rwidget_add_child(youtube, youtube_options_panel);
+    Rwidget_add_child(pages, youtube);
 
-    let downloads_category = Rlabel_create(cstr("Descargas").as_ptr());
-    Rlabel_set_text_size(downloads_category, 14.0);
-    Rlabel_set_color(downloads_category, 0.725, 0.639, 0.961, 1.0);
-    Rwidget_add_child(content, downloads_category);
-
-    let downloads_description = Rlabel_create(cstr("Carpeta donde se guardarán las pistas de YouTube que decidas descargar. Buscar y escuchar en streaming no escribe ningún archivo.").as_ptr());
-    Rlabel_set_text_size(downloads_description, 12.0);
-    Rlabel_set_wrap(downloads_description, R_TRUE);
-    Rwidget_add_child(content, downloads_description);
-
+    // Descargas: carpeta para las descargas explícitas en Opus.
+    let downloads = Rwidget_create(R_WIDGET_VBOX);
+    Rpanel_set_spacing(downloads, 10.0);
+    Rwidget_add_child(downloads, settings_heading("Descargas"));
+    Rwidget_add_child(
+        downloads,
+        settings_description("Carpeta donde se guardarán las pistas de YouTube que decidas descargar. Buscar y escuchar en streaming no escribe ningún archivo."),
+    );
     let downloads_row = Rwidget_create(R_WIDGET_HBOX);
     Rpanel_set_spacing(downloads_row, 8.0);
     let download_dir_label = Rlabel_create(
@@ -4907,9 +5075,12 @@ unsafe extern "C" fn open_settings_dialog(item: Rid, user_data: *mut c_void) {
     Rslot_set_fill(download_dir_label, 1.0);
     Rwidget_add_child(downloads_row, download_dir_label);
     let choose_button = Rbutton_create(cstr("Elegir carpeta…").as_ptr());
-    Rbutton_set_clicked_callback(choose_button, Some(choose_download_dir), std::ptr::null_mut());
     Rwidget_add_child(downloads_row, choose_button);
-    Rwidget_add_child(content, downloads_row);
+    Rwidget_add_child(downloads, downloads_row);
+    Rwidget_add_child(pages, downloads);
+
+    Rwidget_add_child(body, pages);
+    Rwidget_add_child(content, body);
 
     let separator = Rwidget_create(R_WIDGET_SEPARATOR);
     Rwidget_add_child(content, separator);
@@ -4917,24 +5088,104 @@ unsafe extern "C" fn open_settings_dialog(item: Rid, user_data: *mut c_void) {
     let buttons = Rwidget_create(R_WIDGET_HBOX);
     Rpanel_set_spacing(buttons, 8.0);
     Rslot_set_halign(buttons, R_HALIGN_RIGHT);
-    let accept = Rbutton_create(cstr("Aceptar").as_ptr());
-    Rbutton_set_style(accept, R_BUTTON_PRIMARY);
-    Rbutton_set_clicked_callback(accept, Some(settings_dialog_accept), std::ptr::null_mut());
     let cancel = Rbutton_create(cstr("Cancelar").as_ptr());
     Rbutton_set_style(cancel, R_BUTTON_FLAT);
-    Rbutton_set_clicked_callback(cancel, Some(settings_dialog_cancel), std::ptr::null_mut());
-    Rwidget_add_child(buttons, accept);
+    let apply = Rbutton_create(cstr("Aplicar").as_ptr());
+    Rbutton_set_style(apply, R_BUTTON_DEFAULT);
+    let accept = Rbutton_create(cstr("Aceptar").as_ptr());
+    Rbutton_set_style(accept, R_BUTTON_PRIMARY);
     Rwidget_add_child(buttons, cancel);
+    Rwidget_add_child(buttons, apply);
+    Rwidget_add_child(buttons, accept);
     Rwidget_add_child(content, buttons);
 
     let context = Box::into_raw(Box::new(SettingsDialogContext {
         state: Rc::clone(state),
         open_options,
         add_options,
+        youtube_options,
         download_dir: current_download,
         download_dir_label,
+        menu,
+        pages,
     })) as *mut c_void;
+    Rbutton_set_clicked_callback(cancel, Some(settings_dialog_cancel), std::ptr::null_mut());
+    Rbutton_set_clicked_callback(apply, Some(settings_dialog_apply), context);
+    Rbutton_set_clicked_callback(accept, Some(settings_dialog_accept), std::ptr::null_mut());
+    Rbutton_set_clicked_callback(choose_button, Some(choose_download_dir), context);
+    Rlist_view_set_selection_changed_callback(menu, Some(settings_dialog_section_changed), context);
     Rdialog_open(window, content, Some(settings_dialog_closed), context);
+}
+
+unsafe extern "C" fn settings_dialog_section_changed(
+    _menu: Rid,
+    index: c_int,
+    user_data: *mut c_void,
+) {
+    if index < 0 || index as usize >= SETTINGS_SECTIONS.len() {
+        return;
+    }
+    let context = &*(user_data as *const SettingsDialogContext);
+    Rswitcher_set_index(context.pages, index);
+}
+
+/// Copia al estado las opciones visibles en el diálogo. Solo escribe en disco
+/// lo que haya cambiado; `Aplicar` llama a esto sin cerrar la ventana.
+unsafe fn apply_settings(context: &SettingsDialogContext) {
+    fn record(result: Result<(), String>, state: &mut PlayerState, failed: &mut bool) {
+        if let Err(error) = result {
+            state.status = format!("No se pudo guardar el ajuste: {error}");
+            *failed = true;
+        }
+    }
+
+    let open_behavior = context
+        .open_options
+        .iter()
+        .position(|option| Rcheckbox_is_checked(*option) != R_FALSE)
+        .and_then(behavior_from_option_index);
+    let add_behavior = context
+        .add_options
+        .iter()
+        .position(|option| Rcheckbox_is_checked(*option) != R_FALSE)
+        .and_then(add_behavior_from_option_index);
+    let youtube_playback = context
+        .youtube_options
+        .iter()
+        .position(|option| Rcheckbox_is_checked(*option) != R_FALSE)
+        .and_then(youtube_playback_from_option_index);
+    let download_dir = context.download_dir.borrow().clone();
+
+    let Ok(mut state) = context.state.try_borrow_mut() else {
+        return;
+    };
+    let mut changed = false;
+    let mut failed = false;
+    if let Some(behavior) = open_behavior {
+        if state.open_behavior != behavior {
+            changed = true;
+            record(state.set_open_behavior(behavior), &mut state, &mut failed);
+        }
+    }
+    if let Some(behavior) = add_behavior {
+        if state.add_behavior != behavior {
+            changed = true;
+            record(state.set_add_behavior(behavior), &mut state, &mut failed);
+        }
+    }
+    if let Some(mode) = youtube_playback {
+        if state.youtube_playback != mode {
+            changed = true;
+            record(state.set_youtube_playback(mode), &mut state, &mut failed);
+        }
+    }
+    if state.download_dir != download_dir {
+        changed = true;
+        record(state.set_download_dir(download_dir), &mut state, &mut failed);
+    }
+    if changed && !failed {
+        state.status = "Ajustes aplicados".to_owned();
+    }
 }
 
 unsafe extern "C" fn choose_download_dir(_button: Rid, user_data: *mut c_void) {
@@ -4953,36 +5204,23 @@ unsafe extern "C" fn settings_dialog_accept(button: Rid, _user_data: *mut c_void
     Rdialog_close(button, R_MESSAGE_RESULT_OK);
 }
 
+unsafe extern "C" fn settings_dialog_apply(_button: Rid, user_data: *mut c_void) {
+    let context = &*(user_data as *const SettingsDialogContext);
+    apply_settings(context);
+}
+
 unsafe extern "C" fn settings_dialog_cancel(button: Rid, _user_data: *mut c_void) {
     Rdialog_close(button, R_MESSAGE_RESULT_CANCEL);
 }
 
 unsafe extern "C" fn settings_dialog_closed(_content: Rid, result: c_int, user_data: *mut c_void) {
     let context = Box::from_raw(user_data as *mut SettingsDialogContext);
-    if result != R_MESSAGE_RESULT_OK {
-        return;
+    // Raven va a destruir el contenido: sellamos la selección para que no
+    // quede una llamada pendiente con este contexto ya liberado.
+    Rlist_view_set_selection_changed_callback(context.menu, None, std::ptr::null_mut());
+    if result == R_MESSAGE_RESULT_OK {
+        apply_settings(&context);
     }
-    let open_behavior = context
-        .open_options
-        .iter()
-        .position(|option| Rcheckbox_is_checked(*option) != R_FALSE)
-        .and_then(behavior_from_option_index);
-    let add_behavior = context
-        .add_options
-        .iter()
-        .position(|option| Rcheckbox_is_checked(*option) != R_FALSE)
-        .and_then(add_behavior_from_option_index);
-    let download_dir = context.download_dir.borrow().clone();
-    let state = Rc::clone(&context.state);
-    if let Ok(mut state) = state.try_borrow_mut() {
-        if let Some(behavior) = open_behavior {
-            state.set_open_behavior(behavior);
-        }
-        if let Some(behavior) = add_behavior {
-            state.set_add_behavior(behavior);
-        }
-        state.set_download_dir(download_dir);
-    };
 }
 
 unsafe extern "C" fn open_about_dialog(_item: Rid, user_data: *mut c_void) {
@@ -6654,9 +6892,10 @@ mod tests {
         playlist_summary_text, previous_track_index, random_track_index, remap_index,
         repair_audio_file, repair_backup_path, shuffle_progress, tab_at, tab_close_hit,
         tab_drop_target, tab_guide_x, tab_natural_width, tab_rect, tab_widths, track_list_row_text,
-        track_row, youtube_result_row, AddBehavior, MetadataWriteError, OpenBehavior, Playlist,
-        PlaylistStore, SavedPlaylist, StreamingTrack,
-        SavedSettings, TabMetrics, TrackListRows, TrackMetadata, INITIAL_VOLUME, R_INVALID_ID,
+        track_row, youtube_playback_from_option_index, youtube_result_row, AddBehavior,
+        MetadataWriteError, OpenBehavior, Playlist,
+        PlaylistStore, SavedPlaylist, StreamingTrack, YoutubePlayback, SavedSettings,
+        TabMetrics, TrackListRows, TrackMetadata, SETTINGS_SECTIONS, INITIAL_VOLUME, R_INVALID_ID,
         SESSION_PLAYLIST_NAME,
     };
     use rodio::{Decoder, Source};
@@ -6793,6 +7032,7 @@ mod tests {
             last_cover_dir: Some(PathBuf::from("/home/persona/Imágenes/caratulas")),
             open_behavior: OpenBehavior::AddOnly,
             add_behavior: AddBehavior::AddOnly,
+            youtube_playback: YoutubePlayback::FullDownload,
             download_dir: Some(PathBuf::from("/home/persona/Descargas")),
             volume: 0.37,
         };
@@ -6801,6 +7041,7 @@ mod tests {
         assert_eq!(back.last_cover_dir, settings.last_cover_dir);
         assert_eq!(back.open_behavior, OpenBehavior::AddOnly);
         assert_eq!(back.add_behavior, AddBehavior::AddOnly);
+        assert_eq!(back.youtube_playback, YoutubePlayback::FullDownload);
         assert_eq!(back.download_dir, settings.download_dir);
         assert_eq!(back.volume, 0.37);
 
@@ -6808,6 +7049,21 @@ mod tests {
         let empty: SavedSettings = serde_json::from_str("{}").unwrap();
         assert!(empty.last_cover_dir.is_none());
         assert!(empty.download_dir.is_none());
+        assert_eq!(empty.youtube_playback, YoutubePlayback::Streaming);
+    }
+
+    #[test]
+    fn missing_youtube_playback_defaults_to_streaming() {
+        let old: SavedSettings =
+            serde_json::from_str(r#"{"open_behavior":"add_only","add_behavior":"add_only"}"#)
+                .unwrap();
+        assert_eq!(old.open_behavior, OpenBehavior::AddOnly);
+        assert_eq!(old.add_behavior, AddBehavior::AddOnly);
+        assert_eq!(old.youtube_playback, YoutubePlayback::Streaming);
+
+        let explicit: SavedSettings =
+            serde_json::from_str(r#"{"youtube_playback":"full_download"}"#).unwrap();
+        assert_eq!(explicit.youtube_playback, YoutubePlayback::FullDownload);
     }
 
     #[test]
@@ -7133,6 +7389,34 @@ mod tests {
             assert_eq!(add_behavior_from_option_index(position), Some(behavior));
         }
         assert_eq!(add_behavior_from_option_index(AddBehavior::ALL.len()), None);
+    }
+
+    #[test]
+    fn youtube_playback_values_have_distinct_indices() {
+        for (position, mode) in YoutubePlayback::ALL.iter().copied().enumerate() {
+            assert_eq!(mode.index(), position);
+            assert!(!mode.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn settings_dialog_youtube_options_map_to_playback() {
+        for (position, mode) in YoutubePlayback::ALL.iter().copied().enumerate() {
+            assert_eq!(youtube_playback_from_option_index(position), Some(mode));
+        }
+        assert_eq!(
+            youtube_playback_from_option_index(YoutubePlayback::ALL.len()),
+            None
+        );
+    }
+
+    #[test]
+    fn settings_sections_match_the_dialog_pages() {
+        assert_eq!(SETTINGS_SECTIONS.len(), 4);
+        assert_eq!(SETTINGS_SECTIONS[0], "General");
+        assert_eq!(SETTINGS_SECTIONS[1], "Listas");
+        assert_eq!(SETTINGS_SECTIONS[2], "YouTube");
+        assert_eq!(SETTINGS_SECTIONS[3], "Descargas");
     }
 
     #[test]
