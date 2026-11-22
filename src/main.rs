@@ -739,7 +739,7 @@ impl PlayerState {
         self.status = format!("{} pistas en la lista", playlist.tracks.len());
         self.save_playlists();
 
-        if self.current.is_none() {
+        if self.is_stopped() {
             if let Err(error) = self.play_track(playlist_index, first_added, true) {
                 self.status = error;
             }
@@ -1037,10 +1037,12 @@ impl PlayerState {
                 mpris::MprisCommand::Next => self.next(),
                 mpris::MprisCommand::Previous => self.previous(),
                 mpris::MprisCommand::Seek(offset) => {
-                    let target = mpris::seek_target(mpris::to_micros(self.position()), offset);
-                    let target = self.mpris_clamp_position(target);
-                    self.seek(target as f32 / 1_000_000.0);
-                    self.notify_mpris_seek();
+                    if !self.is_stopped() {
+                        let target = mpris::seek_target(mpris::to_micros(self.position()), offset);
+                        let target = self.mpris_clamp_position(target);
+                        self.seek(target as f32 / 1_000_000.0);
+                        self.notify_mpris_seek();
+                    }
                 }
                 mpris::MprisCommand::SetPosition { track_id, position } => {
                     let is_current = self
@@ -1181,6 +1183,11 @@ impl PlayerState {
             .ok_or_else(|| "No hay un dispositivo de salida de audio disponible".to_owned())?;
 
         output.player.clear();
+        if output.player.empty() {
+            // `try_seek` guarda la orden aunque no haya sonido; sin esto, un seek
+            // pendiente de la pista anterior se aplicaría al primer sample de esta.
+            let _ = output.player.try_seek(Duration::ZERO);
+        }
         output.player.set_volume(self.volume);
         output.player.append(source);
         if start_playing {
@@ -1320,7 +1327,11 @@ impl PlayerState {
                     .as_ref()
                     .map(|output| output.player.empty())
                     .unwrap_or(true);
-                if empty {
+                // Tras `stop()`, rodio conserva la fuente en la cola durante unos
+                // milisegundos con el flag interno «stopped» activo. `play()` solo
+                // quita la pausa, así que hay que volver a añadir la fuente para
+                // que `append()` limpie ese flag; si no, la pista se detiene sola.
+                if empty || self.stopped {
                     if let Err(error) = self.play_track(playlist, track, true) {
                         self.status = error;
                     }
@@ -1500,6 +1511,11 @@ impl PlayerState {
     }
 
     fn seek(&mut self, seconds: f32) {
+        // rodio guarda la orden de seek incluso si no hay sonido y la aplica a
+        // la siguiente pista que se añada. Evita envenenar esa pista.
+        if self.is_stopped() {
+            return;
+        }
         let Some(output) = &self.output else {
             return;
         };
