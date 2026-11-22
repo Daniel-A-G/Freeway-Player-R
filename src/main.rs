@@ -135,6 +135,42 @@ fn behavior_from_option_index(index: usize) -> Option<OpenBehavior> {
     OpenBehavior::ALL.get(index).copied()
 }
 
+/// Qué hacer al añadir pistas a una lista desde la propia aplicación. Es una
+/// categoría distinta de `OpenBehavior`: aquella rige los archivos abiertos
+/// desde fuera (gestor de archivos, «Abrir con» o la línea de comandos).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AddBehavior {
+    /// Arrancar la primera pista añadida si no había nada sonando (predeterminado).
+    #[default]
+    PlayFirst,
+    /// Añadir las pistas sin tocar la reproducción, la selección ni la cola.
+    AddOnly,
+}
+
+impl AddBehavior {
+    const ALL: [AddBehavior; 2] = [AddBehavior::PlayFirst, AddBehavior::AddOnly];
+
+    fn label(self) -> &'static str {
+        match self {
+            AddBehavior::PlayFirst => "Añadir y reproducir la primera pista si no hay nada sonando",
+            AddBehavior::AddOnly => "Añadir solo a la lista, sin iniciar ni cambiar la reproducción",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            AddBehavior::PlayFirst => 0,
+            AddBehavior::AddOnly => 1,
+        }
+    }
+}
+
+/// Posición de las opciones de «añadir a la lista» en el diálogo de ajustes.
+fn add_behavior_from_option_index(index: usize) -> Option<AddBehavior> {
+    AddBehavior::ALL.get(index).copied()
+}
+
 /// Preferencias que sobreviven al cierre del programa. Se guardan aparte de
 /// las listas para que un fallo al escribir una no arrastre a las otras.
 #[derive(Serialize, Deserialize)]
@@ -143,6 +179,8 @@ struct SavedSettings {
     last_cover_dir: Option<PathBuf>,
     #[serde(default)]
     open_behavior: OpenBehavior,
+    #[serde(default)]
+    add_behavior: AddBehavior,
     #[serde(default = "default_volume")]
     volume: f32,
 }
@@ -156,6 +194,7 @@ impl Default for SavedSettings {
         Self {
             last_cover_dir: None,
             open_behavior: OpenBehavior::default(),
+            add_behavior: AddBehavior::default(),
             volume: default_volume(),
         }
     }
@@ -326,6 +365,12 @@ impl Playlist {
         });
     }
 
+    /// Incorpora las pistas recién añadidas al final de la cola sin barajar el
+    /// orden vigente ni mover `order_position`, para no alterar lo que suena.
+    fn append_new_to_order(&mut self, first_added: usize) {
+        self.order.extend(first_added..self.tracks.len());
+    }
+
     fn reshuffle_cycle_after(&mut self, current_track: usize) {
         let previous = std::mem::take(&mut self.order);
         self.order = reshuffled_cycle_order(self.tracks.len(), Some(current_track), &previous);
@@ -362,6 +407,7 @@ struct PlayerState {
     playlist_tabs_widget: Rid,
     last_cover_dir: Option<PathBuf>,
     open_behavior: OpenBehavior,
+    add_behavior: AddBehavior,
     /// Rutas que envían las siguientes instancias de la app.
     instance_paths: Option<Receiver<Vec<PathBuf>>>,
     /// Publicador MPRIS y canal de órdenes entrantes (el hilo D-Bus no toca
@@ -472,6 +518,7 @@ impl PlayerState {
             playlist_tabs_widget: R_INVALID_ID,
             last_cover_dir: settings.last_cover_dir,
             open_behavior: settings.open_behavior,
+            add_behavior: settings.add_behavior,
             instance_paths: None,
             mpris: None,
             mpris_commands: None,
@@ -527,6 +574,7 @@ impl PlayerState {
         let settings = SavedSettings {
             last_cover_dir: self.last_cover_dir.clone(),
             open_behavior: self.open_behavior,
+            add_behavior: self.add_behavior,
             volume: self.volume,
         };
         save_settings(&settings)
@@ -728,18 +776,30 @@ impl PlayerState {
         }
 
         playlist.revision += 1;
-        playlist.selected = Some(first_added);
-        let order_anchor = self
-            .current
-            .filter(|(current_playlist, _)| *current_playlist == playlist_index)
-            .map(|(_, current_track)| current_track)
-            .or(Some(first_added));
-        playlist.rebuild_order(order_anchor);
-        self.editor_loaded_for = None;
-        self.status = format!("{} pistas en la lista", playlist.tracks.len());
+        let add_only = self.add_behavior == AddBehavior::AddOnly;
+        if add_only {
+            // La petición es «solo añadir»: ni selección nueva, ni barajado,
+            // ni editor reiniciado. Las pistas nuevas quedan al final de la
+            // cola para que se puedan reproducir más tarde.
+            playlist.append_new_to_order(first_added);
+            self.status = format!(
+                "{} pistas en la lista · reproducción sin cambios",
+                playlist.tracks.len()
+            );
+        } else {
+            playlist.selected = Some(first_added);
+            let order_anchor = self
+                .current
+                .filter(|(current_playlist, _)| *current_playlist == playlist_index)
+                .map(|(_, current_track)| current_track)
+                .or(Some(first_added));
+            playlist.rebuild_order(order_anchor);
+            self.editor_loaded_for = None;
+            self.status = format!("{} pistas en la lista", playlist.tracks.len());
+        }
         self.save_playlists();
 
-        if self.is_stopped() {
+        if !add_only && self.is_stopped() {
             if let Err(error) = self.play_track(playlist_index, first_added, true) {
                 self.status = error;
             }
@@ -1925,6 +1985,14 @@ impl PlayerState {
 
     fn set_open_behavior(&mut self, behavior: OpenBehavior) {
         self.open_behavior = behavior;
+        self.status = format!("Ajustes: {}", behavior.label());
+        if let Err(error) = self.persist_settings() {
+            self.status = format!("No se pudo guardar el ajuste: {error}");
+        }
+    }
+
+    fn set_add_behavior(&mut self, behavior: AddBehavior) {
+        self.add_behavior = behavior;
         self.status = format!("Ajustes: {}", behavior.label());
         if let Err(error) = self.persist_settings() {
             self.status = format!("No se pudo guardar el ajuste: {error}");
@@ -3558,13 +3626,17 @@ unsafe extern "C" fn check_updates_from_app_menu(_item: Rid, user_data: *mut c_v
 /// devolución de llamada de cierre.
 struct SettingsDialogContext {
     state: Rc<RefCell<PlayerState>>,
-    options: [Rid; 3],
+    open_options: [Rid; 3],
+    add_options: [Rid; 2],
 }
 
 unsafe extern "C" fn open_settings_dialog(item: Rid, user_data: *mut c_void) {
     let state = &*(user_data as *const Rc<RefCell<PlayerState>>);
     let window = Rwidget_get_window(item);
-    let current = state.borrow().open_behavior;
+    let (current_open, current_add) = {
+        let state = state.borrow();
+        (state.open_behavior, state.add_behavior)
+    };
 
     let content = Rwidget_create(R_WIDGET_VBOX);
     Rpanel_set_spacing(content, 12.0);
@@ -3586,19 +3658,46 @@ unsafe extern "C" fn open_settings_dialog(item: Rid, user_data: *mut c_void) {
     Rlabel_set_wrap(description, R_TRUE);
     Rwidget_add_child(content, description);
 
-    // Las tres casillas radio son hermanas: Raven desmarca las demás del
-    // mismo padre al marcar una.
+    // Las casillas radio de cada categoría son hermanas: Raven desmarca las
+    // demás del mismo padre al marcar una.
     let options_panel = Rwidget_create(R_WIDGET_VBOX);
     Rpanel_set_spacing(options_panel, 6.0);
-    let mut options = [R_INVALID_ID; 3];
+    let mut open_options = [R_INVALID_ID; 3];
     for behavior in OpenBehavior::ALL {
         let option = Rcheckbox_create(cstr(behavior.label()).as_ptr());
         Rcheckbox_set_style(option, R_CHECKBOX_RADIO);
-        Rcheckbox_set_checked(option, if behavior == current { R_TRUE } else { R_FALSE });
+        Rcheckbox_set_checked(option, if behavior == current_open { R_TRUE } else { R_FALSE });
         Rwidget_add_child(options_panel, option);
-        options[behavior.index()] = option;
+        open_options[behavior.index()] = option;
     }
     Rwidget_add_child(content, options_panel);
+
+    let sections_separator = Rwidget_create(R_WIDGET_SEPARATOR);
+    Rwidget_add_child(content, sections_separator);
+
+    let add_category = Rlabel_create(cstr("Comportamiento al añadir a la lista").as_ptr());
+    Rlabel_set_text_size(add_category, 14.0);
+    Rlabel_set_color(add_category, 0.725, 0.639, 0.961, 1.0);
+    Rwidget_add_child(content, add_category);
+
+    let add_description = Rlabel_create(
+        cstr("Elige qué ocurre al añadir pistas desde la app, tanto si las arrastras a la ventana como si usas «+ Añadir pistas». No afecta a los archivos abiertos desde el gestor.").as_ptr(),
+    );
+    Rlabel_set_text_size(add_description, 12.0);
+    Rlabel_set_wrap(add_description, R_TRUE);
+    Rwidget_add_child(content, add_description);
+
+    let add_options_panel = Rwidget_create(R_WIDGET_VBOX);
+    Rpanel_set_spacing(add_options_panel, 6.0);
+    let mut add_options = [R_INVALID_ID; 2];
+    for behavior in AddBehavior::ALL {
+        let option = Rcheckbox_create(cstr(behavior.label()).as_ptr());
+        Rcheckbox_set_style(option, R_CHECKBOX_RADIO);
+        Rcheckbox_set_checked(option, if behavior == current_add { R_TRUE } else { R_FALSE });
+        Rwidget_add_child(add_options_panel, option);
+        add_options[behavior.index()] = option;
+    }
+    Rwidget_add_child(content, add_options_panel);
 
     let separator = Rwidget_create(R_WIDGET_SEPARATOR);
     Rwidget_add_child(content, separator);
@@ -3618,7 +3717,8 @@ unsafe extern "C" fn open_settings_dialog(item: Rid, user_data: *mut c_void) {
 
     let context = Box::into_raw(Box::new(SettingsDialogContext {
         state: Rc::clone(state),
-        options,
+        open_options,
+        add_options,
     })) as *mut c_void;
     Rdialog_open(window, content, Some(settings_dialog_closed), context);
 }
@@ -3636,17 +3736,24 @@ unsafe extern "C" fn settings_dialog_closed(_content: Rid, result: c_int, user_d
     if result != R_MESSAGE_RESULT_OK {
         return;
     }
-    let selected = context
-        .options
+    let open_behavior = context
+        .open_options
         .iter()
         .position(|option| Rcheckbox_is_checked(*option) != R_FALSE)
         .and_then(behavior_from_option_index);
-    let Some(behavior) = selected else {
-        return;
-    };
+    let add_behavior = context
+        .add_options
+        .iter()
+        .position(|option| Rcheckbox_is_checked(*option) != R_FALSE)
+        .and_then(add_behavior_from_option_index);
     let state = Rc::clone(&context.state);
     if let Ok(mut state) = state.try_borrow_mut() {
-        state.set_open_behavior(behavior);
+        if let Some(behavior) = open_behavior {
+            state.set_open_behavior(behavior);
+        }
+        if let Some(behavior) = add_behavior {
+            state.set_add_behavior(behavior);
+        }
     };
 }
 
@@ -5262,10 +5369,10 @@ mod tests {
         is_document_portal_path_in, next_track_index, play_starts_selected, previous_track_index,
         random_track_index,
         remap_index, repair_audio_file, repair_backup_path, tab_at, tab_close_hit, tab_drop_target,
-        tab_guide_x, tab_natural_width, tab_rect, tab_widths, track_row, behavior_from_option_index,
-        playlist_summary_text, shuffle_progress, MetadataWriteError, OpenBehavior, Playlist,
-        SavedPlaylist, SavedSettings, TabMetrics, TrackMetadata, INITIAL_VOLUME,
-        SESSION_PLAYLIST_NAME,
+        tab_guide_x, tab_natural_width, tab_rect, tab_widths, track_row,
+        add_behavior_from_option_index, behavior_from_option_index, playlist_summary_text,
+        shuffle_progress, AddBehavior, MetadataWriteError, OpenBehavior, Playlist, SavedPlaylist,
+        SavedSettings, TabMetrics, TrackMetadata, INITIAL_VOLUME, SESSION_PLAYLIST_NAME,
     };
     use rodio::{Decoder, Source};
     use std::io::Cursor;
@@ -5397,12 +5504,14 @@ mod tests {
         let settings = SavedSettings {
             last_cover_dir: Some(PathBuf::from("/home/persona/Imágenes/caratulas")),
             open_behavior: OpenBehavior::AddOnly,
+            add_behavior: AddBehavior::AddOnly,
             volume: 0.37,
         };
         let json = serde_json::to_string(&settings).unwrap();
         let back: SavedSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.last_cover_dir, settings.last_cover_dir);
         assert_eq!(back.open_behavior, OpenBehavior::AddOnly);
+        assert_eq!(back.add_behavior, AddBehavior::AddOnly);
         assert_eq!(back.volume, 0.37);
 
         // Un archivo antiguo o vacío no impide arrancar.
@@ -5415,6 +5524,13 @@ mod tests {
         let settings: SavedSettings = serde_json::from_str(r#"{"last_cover_dir":null}"#).unwrap();
         assert_eq!(settings.open_behavior, OpenBehavior::AddAndPlay);
         assert_eq!(OpenBehavior::default(), OpenBehavior::AddAndPlay);
+    }
+
+    #[test]
+    fn missing_add_behavior_defaults_to_play_first() {
+        let settings: SavedSettings = serde_json::from_str(r#"{"last_cover_dir":null}"#).unwrap();
+        assert_eq!(settings.add_behavior, AddBehavior::PlayFirst);
+        assert_eq!(AddBehavior::default(), AddBehavior::PlayFirst);
     }
 
     #[test]
@@ -5589,6 +5705,43 @@ mod tests {
             assert_eq!(behavior_from_option_index(position), Some(behavior));
         }
         assert_eq!(behavior_from_option_index(OpenBehavior::ALL.len()), None);
+    }
+
+    #[test]
+    fn add_behavior_values_have_distinct_indices() {
+        for (position, behavior) in AddBehavior::ALL.iter().copied().enumerate() {
+            assert_eq!(behavior.index(), position);
+            assert!(!behavior.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn settings_dialog_add_options_map_to_behaviors() {
+        for (position, behavior) in AddBehavior::ALL.iter().copied().enumerate() {
+            assert_eq!(add_behavior_from_option_index(position), Some(behavior));
+        }
+        assert_eq!(add_behavior_from_option_index(AddBehavior::ALL.len()), None);
+    }
+
+    #[test]
+    fn appending_tracks_without_playback_keeps_the_queue_position() {
+        let mut playlist = Playlist::new("Mezclada".to_owned());
+        playlist.tracks = vec![
+            PathBuf::from("a.flac"),
+            PathBuf::from("b.flac"),
+            PathBuf::from("c.flac"),
+        ];
+        playlist.shuffle = true;
+        playlist.rebuild_order(Some(1));
+        let previous_order = playlist.order.clone();
+        let previous_position = playlist.order_position;
+
+        playlist.tracks.push(PathBuf::from("d.flac"));
+        playlist.append_new_to_order(3);
+
+        assert_eq!(playlist.order_position, previous_position);
+        assert_eq!(&playlist.order[..previous_order.len()], &previous_order[..]);
+        assert_eq!(playlist.order.last(), Some(&3));
     }
 
     #[test]

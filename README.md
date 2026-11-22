@@ -14,7 +14,7 @@ Los bindings se incluyen en `vendor/raven-gui` desde la etiqueta `v0.2.1` de Rav
 
 - Interfaz oscura y opaca con acento lila, superficies planas y separadores sutiles; biblioteca, carátula/editor y controles forman una sola composición sin paneles tipo tarjeta.
 - El icono `icon.png` se incrusta en el binario para la ventana y el encabezado, y se instala para el lanzador Flatpak.
-- El logo abre el menú de la aplicación. La primera opción, **Ajustes**, abre una ventana con las preferencias agrupadas por categorías. La categoría **Comportamiento al abrir archivos** decide qué hacer cuando se abre un archivo con la ventana ya abierta: **Añadir a Sesión y reproducir** (predeterminado), **Añadir a Sesión sin cambiar la reproducción** o **Reemplazar Sesión y reproducir**. El botón **Aceptar** guarda la elección en `$XDG_CONFIG_HOME/freeway-player/settings.json`; **Cancelar** o Escape la descarta. El menú también permite buscar una release nueva; tras confirmarlo, el portal Flatpak instala la actualización desde el remoto de Freeway Player y relanza la aplicación.
+- El logo abre el menú de la aplicación. La primera opción, **Ajustes**, abre una ventana con las preferencias agrupadas por categorías. La categoría **Comportamiento al abrir archivos** decide qué hacer cuando se abre un archivo con la ventana ya abierta: **Añadir a Sesión y reproducir** (predeterminado), **Añadir a Sesión sin cambiar la reproducción** o **Reemplazar Sesión y reproducir**. La categoría **Comportamiento al añadir a la lista** decide qué ocurre al añadir pistas desde la propia app, arrastrándolas a la ventana o con «+ Añadir pistas»: **Añadir y reproducir la primera pista si no hay nada sonando** (predeterminado) o **Añadir solo a la lista, sin iniciar ni cambiar la reproducción**. Esta última opción deja intactas la reproducción, la selección y la cola, y añade las pistas nuevas al final. El botón **Aceptar** guarda ambas elecciones en `$XDG_CONFIG_HOME/freeway-player/settings.json`; **Cancelar** o Escape las descarta. El menú también permite buscar una release nueva; tras confirmarlo, el portal Flatpak instala la actualización desde el remoto de Freeway Player y relanza la aplicación.
 - Los símbolos de controles y las notas musicales usan fuentes Noto incluidas en el programa; aleatorio, repetición y el botón de pista al azar usan iconos monocromos propios. Así no dependen de las fuentes o temas de iconos instalados en cada distribución.
 - Abrir una o varias pistas con el selector del escritorio. En Linux usa XDG Desktop Portal, de modo que el diálogo puede mostrar las ubicaciones fijadas en GTK/KDE y dar acceso a archivos elegidos fuera del espacio concedido directamente al Flatpak.
 - El lanzador declara los tipos de audio compatibles (`MimeType`) y acepta rutas o URIs `%U`, así que puede elegirse como reproductor predeterminado. La aplicación usa una sola instancia: si ya está abierta, los archivos se envían a la ventana existente, que se trae al frente, en lugar de abrir otra. Los archivos abiertos desde el gestor o con «Abrir con» van a la lista **Sesión**, que se reproduce al momento según el ajuste elegido y se distingue con un fondo rojo suave en su pestaña. No se guarda al cerrar: renómbrala para conservarla como lista normal.
@@ -94,11 +94,11 @@ En el equipo de destino se instala o actualiza con `flatpak install --user --bun
 
 ### Releases automáticos en GitHub
 
-El workflow `.github/workflows/flatpak-release.yml` compila un bundle x86_64 y crea un GitHub Release al publicar un tag `v*`. El tag debe coincidir con la versión de `Cargo.toml`; por ejemplo, para la versión `0.3.6`:
+El workflow `.github/workflows/flatpak-release.yml` compila un bundle x86_64 y crea un GitHub Release al publicar un tag `v*`. El tag debe coincidir con la versión de `Cargo.toml`; por ejemplo, para la versión `0.3.7`:
 
 ```sh
-git tag -a v0.3.6 -m "Freeway Player v0.3.6"
-git push origin main v0.3.6
+git tag -a v0.3.7 -m "Freeway Player v0.3.7"
+git push origin main v0.3.7
 ```
 
 Conviene subir `main` junto con el tag para que la rama remota quede alineada con el Release.
