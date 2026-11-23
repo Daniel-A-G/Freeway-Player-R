@@ -10,7 +10,7 @@ use std::collections::{
     hash_map::{DefaultHasher, RandomState},
     HashSet,
 };
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fs::{self, File};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -483,6 +483,39 @@ impl Playlist {
         self.order.extend(first_added..self.tracks.len());
     }
 
+    /// Coloca las pistas recién insertadas en la cola sin perder la posición
+    /// de la que ya sonaba. Se usa cuando el drop ocurre en medio de la lista
+    /// con «Añadir solo a la lista»: las pistas nuevas entran justo antes del
+    /// primer elemento desplazado, y `order_position` sigue señalando la misma
+    /// pista de antes.
+    fn insert_new_into_order(&mut self, first_added: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if self.order.is_empty() {
+            self.order = (0..self.tracks.len()).collect();
+            return;
+        }
+        for index in &mut self.order {
+            if *index >= first_added {
+                *index += count;
+            }
+        }
+        let insertion = self
+            .order
+            .iter()
+            .position(|&index| index >= first_added + count)
+            .unwrap_or(self.order.len());
+        for offset in 0..count {
+            self.order.insert(insertion + offset, first_added + offset);
+        }
+        if let Some(position) = self.order_position {
+            if position >= insertion {
+                self.order_position = Some(position + count);
+            }
+        }
+    }
+
     fn reshuffle_cycle_after(&mut self, current_track: usize) {
         let previous = std::mem::take(&mut self.order);
         self.order = reshuffled_cycle_order(self.tracks.len(), Some(current_track), &previous);
@@ -601,6 +634,13 @@ struct PlayerState {
     converter_pending: Option<PendingConversion>,
     drag: DragState,
     tab_drag: TabDragState,
+    /// Raven no expone el desplazamiento del `ListView`. Lo marcamos cuando
+    /// detectamos scroll propio; mientras esté activo, un drop externo cae al
+    /// final como antes, para no insertar en un índice equivocado.
+    track_list_scrolled: bool,
+    /// Fila donde se insertarían los archivos que se están arrastrando sobre
+    /// la lista. Solo se usa para pintar la guía durante el drop.
+    external_drop_index: Option<usize>,
 }
 
 /// Estado del gesto de reordenación por arrastre.
@@ -733,6 +773,8 @@ impl PlayerState {
             converter_pending: None,
             drag: DragState::Idle,
             tab_drag: TabDragState::Idle,
+            track_list_scrolled: false,
+            external_drop_index: None,
         }
     }
 
@@ -980,51 +1022,84 @@ impl PlayerState {
     }
 
     fn add_tracks(&mut self, paths: Vec<PathBuf>) {
+        self.add_tracks_at(paths, None);
+    }
+
+    /// Añade pistas al final (`insert_at = None`) o en la posición indicada.
+    /// Los drops sobre el `ListView` usan la inserción cuando sabemos que la
+    /// lista no está desplazada; en ese caso hay que reubicar también la cola
+    /// y los índices de la pista en reproducción.
+    fn add_tracks_at(&mut self, paths: Vec<PathBuf>, insert_at: Option<usize>) {
         if self.playlists.is_empty() || paths.is_empty() {
             return;
         }
         let playlist_index = self.active_playlist;
-        let playlist = &mut self.playlists[playlist_index];
-        let first_added = playlist.tracks.len();
-        playlist.streams.resize_with(first_added, || None);
-        let mut existing: HashSet<_> = playlist.tracks.iter().cloned().collect();
+        let len = self.playlists[playlist_index].tracks.len();
+        let target = insert_at.unwrap_or(len).min(len);
+
+        let mut existing: HashSet<_> = self.playlists[playlist_index]
+            .tracks
+            .iter()
+            .cloned()
+            .collect();
+        let mut new_paths = Vec::new();
         for path in paths {
             if existing.insert(path.clone()) {
-                playlist.tracks.push(path);
-                playlist.streams.push(None);
+                new_paths.push(path);
             }
         }
-        if playlist.tracks.len() == first_added {
+        if new_paths.is_empty() {
             self.status = "Esos archivos ya están en la lista".to_owned();
             return;
         }
-
-        playlist.revision += 1;
+        let added = new_paths.len();
         let add_only = self.add_behavior == AddBehavior::AddOnly;
-        if add_only {
-            // La petición es «solo añadir»: ni selección nueva, ni barajado,
-            // ni editor reiniciado. Las pistas nuevas quedan al final de la
-            // cola para que se puedan reproducir más tarde.
-            playlist.append_new_to_order(first_added);
-            self.status = format!(
-                "{} pistas en la lista · reproducción sin cambios",
-                playlist.tracks.len()
-            );
-        } else {
-            playlist.selected = Some(first_added);
-            let order_anchor = self
-                .current
-                .filter(|(current_playlist, _)| *current_playlist == playlist_index)
-                .map(|(_, current_track)| current_track)
-                .or(Some(first_added));
-            playlist.rebuild_order(order_anchor);
-            self.editor_loaded_for = None;
-            self.status = format!("{} pistas en la lista", playlist.tracks.len());
+        let anchor = self
+            .current
+            .filter(|(playlist, _)| *playlist == playlist_index)
+            .map(|(_, track)| if track >= target { track + added } else { track });
+
+        {
+            let playlist = &mut self.playlists[playlist_index];
+            // Listas guardadas antes de que existiera `streams` pueden traer
+            // menos entradas que pistas.
+            playlist.streams.resize_with(playlist.tracks.len(), || None);
+            for (offset, path) in new_paths.into_iter().enumerate() {
+                playlist.tracks.insert(target + offset, path);
+                playlist.streams.insert(target + offset, None);
+            }
+            playlist.revision += 1;
+            if add_only {
+                // «Solo añadir» no cambia la reproducción: las pistas nuevas
+                // entran en la cola justo antes de la primera desplazada.
+                if insert_at.is_some() {
+                    playlist.insert_new_into_order(target, added);
+                } else {
+                    playlist.append_new_to_order(target);
+                }
+                self.status = format!(
+                    "{} pistas en la lista · reproducción sin cambios",
+                    playlist.tracks.len()
+                );
+            } else {
+                playlist.selected = Some(target);
+                playlist.rebuild_order(anchor.or(Some(target)));
+                self.editor_loaded_for = None;
+                self.status = format!("{} pistas en la lista", playlist.tracks.len());
+            }
+        }
+        // Un editor o una carátula pendiente apuntaban a la fila antigua.
+        self.pending_cover = None;
+
+        if let Some((playlist, track)) = self.current {
+            if playlist == playlist_index && track >= target {
+                self.current = Some((playlist, track + added));
+            }
         }
         self.save_playlists();
 
         if !add_only && self.is_stopped() {
-            if let Err(error) = self.play_track(playlist_index, first_added, true) {
+            if let Err(error) = self.play_track(playlist_index, target, true) {
                 self.status = error;
             }
         }
@@ -6247,7 +6322,50 @@ unsafe extern "C" fn window_close_callback(_window: Rid, user_data: *mut c_void)
     R_TRUE
 }
 
-// Drop callback: receive files dragged from the file manager into the window
+/// Índice de inserción al soltar sobre el `ListView`, a partir de la posición
+/// vertical dentro del widget. La mitad superior de una fila inserta antes de
+/// ella y la inferior, después; se limita a `[0, len]`.
+fn drop_insert_index(local_y: f32, row_height: f32, len: usize) -> usize {
+    if len == 0 || row_height <= 0.0 {
+        return 0;
+    }
+    let row = ((local_y / row_height).round() as isize).clamp(0, len as isize);
+    row as usize
+}
+
+/// Extrae las rutas de audio de un drop del gestor de archivos.
+///
+/// Se usa tanto en el callback de la ventana como en el del `ListView`. La
+/// ruta se toma tal cual la entrega el gestor: canonicalizarla puede resolver
+/// un symlink hacia un destino al que el sandbox no tiene acceso.
+unsafe fn audio_paths_from_drop(event: *const RDropEvent) -> Vec<PathBuf> {
+    let path_count = (*event).path_count;
+    let paths_ptr = (*event).paths;
+    if path_count <= 0 || paths_ptr.is_null() {
+        return Vec::new();
+    }
+    let audio_extensions = ["mp3", "flac", "wav", "ogg", "opus", "m4a"];
+    let mut tracks = Vec::new();
+    for i in 0..path_count {
+        let path_c = *paths_ptr.add(i as usize);
+        if path_c.is_null() {
+            continue;
+        }
+        let raw = String::from_utf8_lossy(CStr::from_ptr(path_c).to_bytes()).into_owned();
+        let raw = raw.strip_prefix("file://").unwrap_or(&raw);
+        let path = PathBuf::from(decode_uri_path(raw));
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            let ext_lower = ext.to_lowercase();
+            if audio_extensions.iter().any(|&e| e == ext_lower) {
+                tracks.push(path);
+            }
+        }
+    }
+    tracks
+}
+
+/// Drop sobre cualquier zona de la ventana que no sea la lista: se mantiene
+/// el comportamiento de siempre, añadir al final.
 unsafe extern "C" fn window_drop_callback(
     _target: Rid,
     event: *const RDropEvent,
@@ -6256,45 +6374,74 @@ unsafe extern "C" fn window_drop_callback(
     if (*event).phase != R_DROP_DROPPED {
         return R_TRUE;
     }
-    let state = &*(user_data as *const RefCell<PlayerState>);
-    let path_count = (*event).path_count;
-    let paths_ptr = (*event).paths;
-    if path_count <= 0 || paths_ptr.is_null() {
-        return R_TRUE;
-    }
-
-    let audio_extensions = ["mp3", "flac", "wav", "ogg", "opus", "m4a"];
-    let mut tracks = Vec::new();
-    for i in 0..path_count {
-        let path_c = *paths_ptr.add(i as usize);
-        if path_c.is_null() {
-            continue;
-        }
-        // Print raw bytes for debugging
-        let raw_bytes = std::ffi::CStr::from_ptr(path_c).to_bytes();
-        eprintln!("[DROP DEBUG] raw path bytes: {:?}", raw_bytes);
-        let raw = String::from_utf8_lossy(raw_bytes).into_owned();
-        eprintln!("[DROP DEBUG] raw string: {:?}", raw);
-        // Strip file:// URI scheme if present (file managers may drop URIs)
-        let raw = raw.strip_prefix("file://").unwrap_or(&raw);
-        // Decode percent-encoded characters (e.g., %20 -> space, %C3%A1 -> á)
-        let decoded = decode_uri_path(raw);
-        eprintln!("[DROP DEBUG] decoded: {:?}", decoded);
-        let path = PathBuf::from(&decoded);
-        eprintln!("[DROP DEBUG] path: {:?}", path);
-        // Use the path as provided by the file manager; do not canonicalize
-        // because symlinks may point outside the sandbox or to inaccessible locations.
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            let ext_lower = ext.to_lowercase();
-            if audio_extensions.iter().any(|&e| e == ext_lower) {
-                tracks.push(path);
-            }
-        }
-    }
+    let tracks = audio_paths_from_drop(event);
     if !tracks.is_empty() {
+        let state = &*(user_data as *const RefCell<PlayerState>);
         if let Ok(mut state) = state.try_borrow_mut() {
             state.add_tracks(tracks);
         }
+    }
+    R_TRUE
+}
+
+/// Drop directamente sobre la lista de pistas.
+///
+/// Raven da `local_y` relativo al `ListView`, así que podemos calcular la fila
+/// sobre la que se suelta. Solo se usa si la lista no se ha desplazado: el
+/// `ListView` no expone su offset y una estimación podría insertar en el sitio
+/// equivocado. Con scroll (o en el buscador de YouTube) se cae al final.
+unsafe extern "C" fn track_list_drop_callback(
+    _target: Rid,
+    event: *const RDropEvent,
+    user_data: *mut c_void,
+) -> c_int {
+    let state = &*(user_data as *const RefCell<PlayerState>);
+    let phase = (*event).phase;
+    let local_y = (*event).local_y;
+    let window = (*event).window;
+
+    if matches!(phase, R_DROP_ENTER | R_DROP_MOVE) {
+        if let Ok(mut st) = state.try_borrow_mut() {
+            let row_height = Rtheme_get_metric(R_METRIC_ROW_HEIGHT);
+            let len = st
+                .playlists
+                .get(st.active_playlist)
+                .map_or(0, |playlist| playlist.tracks.len());
+            st.external_drop_index = if st.youtube_mode || st.track_list_scrolled || len == 0 {
+                None
+            } else {
+                Some(drop_insert_index(local_y, row_height, len))
+            };
+        }
+        Rwindow_request_redraw(window);
+        return R_TRUE;
+    }
+    if phase == R_DROP_LEAVE {
+        if let Ok(mut st) = state.try_borrow_mut() {
+            st.external_drop_index = None;
+        }
+        Rwindow_request_redraw(window);
+        return R_TRUE;
+    }
+    if phase == R_DROP_DROPPED {
+        let tracks = audio_paths_from_drop(event);
+        if let Ok(mut st) = state.try_borrow_mut() {
+            let row_height = Rtheme_get_metric(R_METRIC_ROW_HEIGHT);
+            let len = st
+                .playlists
+                .get(st.active_playlist)
+                .map_or(0, |playlist| playlist.tracks.len());
+            let insert_at = if st.youtube_mode || st.track_list_scrolled || len == 0 {
+                None
+            } else {
+                Some(drop_insert_index(local_y, row_height, len))
+            };
+            st.external_drop_index = None;
+            if !tracks.is_empty() {
+                st.add_tracks_at(tracks, insert_at);
+            }
+        }
+        Rwindow_request_redraw(window);
     }
     R_TRUE
 }
@@ -6517,6 +6664,31 @@ fn drag_guide_y(from: usize, start_y: f32, target: usize, row_height: f32) -> f3
     start_y + (delta as f32 + delta.signum() as f32 * 0.5) * row_height
 }
 
+/// Línea horizontal en el `ListView`, con `offset_y` relativo al widget.
+unsafe fn paint_track_list_guide(painter: *mut RPainter, list: Rid, offset_y: f32) {
+    if list == R_INVALID_ID {
+        return;
+    }
+    let (mut list_x, mut list_y, mut list_w, mut list_h) = (0.0, 0.0, 0.0, 0.0);
+    Rwidget_get_rect(list, &mut list_x, &mut list_y, &mut list_w, &mut list_h);
+    if list_w <= 0.0 || list_h <= 0.0 {
+        return;
+    }
+    let line_y = list_y + offset_y.clamp(0.0, list_h);
+    Rdraw_line(
+        painter,
+        list_x,
+        line_y,
+        list_x + list_w,
+        line_y,
+        2.0,
+        0.725,
+        0.639,
+        0.961,
+        0.9,
+    );
+}
+
 /// Dibuja la guía del gesto de arrastre activo.
 ///
 /// El widget de guía cubre toda la ventana, así que sus coordenadas locales son
@@ -6616,6 +6788,14 @@ unsafe extern "C" fn drop_guide_paint(
         return;
     }
 
+    if let Some(index) = st.external_drop_index {
+        let row_height = Rtheme_get_metric(R_METRIC_ROW_HEIGHT);
+        if row_height > 0.0 {
+            paint_track_list_guide(painter, st.track_list_widget, index as f32 * row_height);
+        }
+        return;
+    }
+
     let DragState::Dragging {
         from,
         start_y,
@@ -6633,30 +6813,8 @@ unsafe extern "C" fn drop_guide_paint(
     if row_height <= 0.0 {
         return;
     }
-    let list = st.track_list_widget;
-    if list == R_INVALID_ID {
-        return;
-    }
-
-    let (mut list_x, mut list_y, mut list_w, mut list_h) = (0.0, 0.0, 0.0, 0.0);
-    Rwidget_get_rect(list, &mut list_x, &mut list_y, &mut list_w, &mut list_h);
-    if list_w <= 0.0 || list_h <= 0.0 {
-        return;
-    }
     let guide_y = drag_guide_y(from, start_y, target, row_height);
-    let line_y = list_y + guide_y.clamp(0.0, list_h);
-    Rdraw_line(
-        painter,
-        list_x,
-        line_y,
-        list_x + list_w,
-        line_y,
-        2.0,
-        0.725,
-        0.639,
-        0.961,
-        0.9,
-    );
+    paint_track_list_guide(painter, st.track_list_widget, guide_y);
 }
 
 /// Crea un overlay sobre la ventana con el widget de dibujo de la guía.
@@ -6874,7 +7032,7 @@ unsafe extern "C" fn playlist_tabs_event_callback(
 
 // Event callback for track list: handle drag-to-reorder
 unsafe extern "C" fn track_list_event_callback(
-    _widget: Rid,
+    widget: Rid,
     event: *const REvent,
     user_data: *mut c_void,
 ) -> c_int {
@@ -6898,6 +7056,14 @@ unsafe extern "C" fn track_list_event_callback(
                 st.drag = DragState::Idle;
                 return R_FALSE;
             }
+            // Clic en la franja de la barra de desplazamiento: Raven la gestiona
+            // internamente y no avisa del cambio de offset. Marcamos la lista
+            // como desplazada para no insertar en una fila equivocada.
+            let (mut list_x, mut list_y, mut list_w, mut list_h) = (0.0, 0.0, 0.0, 0.0);
+            Rwidget_get_rect(widget, &mut list_x, &mut list_y, &mut list_w, &mut list_h);
+            if list_w > 0.0 && (*event).local_x >= list_w - 12.0 {
+                st.track_list_scrolled = true;
+            }
             // Un clic nuevo cancela cualquier gesto anterior. Dejamos pasar el
             // evento (R_FALSE) para que Raven seleccione la fila pulsada: nuestro
             // callback se ejecuta ANTES del widget, así que leer la selección aquí
@@ -6909,10 +7075,13 @@ unsafe extern "C" fn track_list_event_callback(
             // Congelar el viewport mientras haya un clic o arrastre en curso.
             // Si la lista scrollea a mitad del gesto, `local_y` deja de corresponder
             // al índice capturado y el destino salta filas.
-            let Ok(st) = state.try_borrow() else {
+            let Ok(mut st) = state.try_borrow_mut() else {
                 return R_FALSE;
             };
             if matches!(st.drag, DragState::Idle) {
+                if (*event).wheel_x != 0.0 || (*event).wheel_y != 0.0 {
+                    st.track_list_scrolled = true;
+                }
                 R_FALSE
             } else {
                 R_TRUE
@@ -6989,6 +7158,9 @@ unsafe extern "C" fn track_list_event_callback(
                     target = new_target;
                     scroll_to = Some(index);
                     last_scroll = Some(now);
+                    // El auto-scroll también desplaza la vista; el drop externo
+                    // posterior no podrá mapear `local_y` a una fila real.
+                    st.track_list_scrolled = true;
                 }
             }
             st.drag = DragState::Dragging {
@@ -7362,7 +7534,13 @@ fn main() {
             Some(track_list_event_callback),
             Rc::as_ptr(&state) as *mut c_void,
         );
-
+        // Los drops sobre la lista se aceptan aquí para saber dónde suelta el
+        // ratón; el callback de la ventana sigue cubriendo el resto.
+        Rwidget_set_drop_callback(
+            ui.track_list,
+            Some(track_list_drop_callback),
+            Rc::as_ptr(&state) as *mut c_void,
+        );
     }
     let (tabs, active_playlist) = {
         let state = state.borrow();
@@ -7720,7 +7898,8 @@ mod tests {
         add_behavior_from_option_index, audio_paths_from_args, auto_scroll_step,
         behavior_from_option_index, converter, cover_dialog_directory, cstr, default_quality_index,
         displayed_location_for, document_portal_host_path, download_dir_text, drag_guide_y,
-        drag_target, existing_directory, format_time, is_document_portal_path_in, next_track_index,
+        drag_target, drop_insert_index, existing_directory, format_time, is_document_portal_path_in,
+        next_track_index,
         play_starts_selected, playlist_summary_text, previous_track_index, random_track_index,
         remap_index, repair_audio_file, repair_backup_path, shuffle_progress, tab_at, tab_close_hit,
         tab_drop_target, tab_guide_x, tab_natural_width, tab_rect, tab_widths, track_list_row_text,
@@ -8389,6 +8568,46 @@ mod tests {
         assert_eq!(drag_target(5, 100.0, 1000.0, 40.0, 10), 9);
         assert_eq!(drag_target(5, 100.0, -1000.0, 40.0, 10), 0);
         assert_eq!(drag_target(5, 100.0, 185.0, 0.0, 10), 5);
+    }
+
+    #[test]
+    fn drop_insert_index_uses_the_nearest_row_edge() {
+        // La mitad superior de una fila inserta antes; la inferior, después.
+        assert_eq!(drop_insert_index(0.0, 40.0, 5), 0);
+        assert_eq!(drop_insert_index(19.0, 40.0, 5), 0);
+        assert_eq!(drop_insert_index(20.0, 40.0, 5), 1);
+        assert_eq!(drop_insert_index(60.0, 40.0, 5), 2);
+        assert_eq!(drop_insert_index(1000.0, 40.0, 5), 5);
+        assert_eq!(drop_insert_index(-100.0, 40.0, 5), 0);
+        assert_eq!(drop_insert_index(100.0, 0.0, 5), 0);
+        assert_eq!(drop_insert_index(100.0, 40.0, 0), 0);
+    }
+
+    #[test]
+    fn insert_new_into_order_keeps_the_playing_track() {
+        let mut playlist = Playlist::new("Prueba".to_owned());
+        playlist.tracks = (0..6).map(|i| PathBuf::from(format!("pista-{i}.flac"))).collect();
+        playlist.order = vec![2, 0, 3, 1];
+        playlist.order_position = Some(1); // la pista 0 suena en ese momento
+
+        playlist.insert_new_into_order(2, 2);
+
+        assert_eq!(playlist.tracks.len(), 6);
+        assert_eq!(playlist.order, vec![2, 3, 4, 0, 5, 1]);
+        assert_eq!(playlist.order[playlist.order_position.unwrap()], 0);
+    }
+
+    #[test]
+    fn insert_new_into_order_appends_when_nothing_moves() {
+        let mut playlist = Playlist::new("Prueba".to_owned());
+        playlist.tracks = (0..4).map(|i| PathBuf::from(format!("pista-{i}.flac"))).collect();
+        playlist.order = vec![0, 1, 2];
+        playlist.order_position = Some(2);
+
+        playlist.insert_new_into_order(3, 1);
+
+        assert_eq!(playlist.order, vec![0, 1, 2, 3]);
+        assert_eq!(playlist.order_position, Some(2));
     }
 
     #[test]
