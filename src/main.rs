@@ -2296,7 +2296,7 @@ impl PlayerState {
             Ok(()) => {}
             Err(error) if error.can_repair() && ask_repair_confirmation(window, error.message()) => {
                 repaired = true;
-                match self.repair_track(&path, &metadata, cover_change) {
+                match self.repair_track(window, &path, &metadata, cover_change) {
                     Ok(warning) => repair_warning = warning,
                     Err(error) => save_error = Some(error),
                 }
@@ -2363,6 +2363,7 @@ impl PlayerState {
 
     fn repair_track(
         &mut self,
+        window: Rid,
         path: &Path,
         metadata: &TrackMetadata,
         cover_change: Option<CoverChange>,
@@ -2405,14 +2406,41 @@ impl PlayerState {
             ));
         }
 
-        let warning = write_track_metadata(path, metadata, cover_change)
-            .err()
-            .map(|error| {
-                format!(
-                    "El archivo se reparó, pero no se pudieron reaplicar los metadatos: {}",
-                    error.message()
-                )
-            });
+        // Verificación: intentar guardar metadatos. Incluso sin cambios, escribirlos
+        // debe detectar contenedores/etiquetas que siguen dañados tras el remux normal.
+        let warning = match write_track_metadata(path, metadata, cover_change.clone()) {
+            Ok(()) => None,
+            Err(error) => {
+                if error.can_repair()
+                    && ask_aggressive_repair_confirmation(window, error.message())
+                {
+                    let aggressive_temporary = repair_audio_file_aggressive(path).map_err(|aggressive_error| {
+                        format!(
+                            "La reparación normal no bastó ({}) y la reparación agresiva también falló: {}",
+                            error.message(),
+                            aggressive_error
+                        )
+                    })?;
+                    if let Err(rename_error) = fs::rename(&aggressive_temporary, path) {
+                        let _ = fs::remove_file(&aggressive_temporary);
+                        return Err(format!(
+                            "No se pudo sustituir el archivo tras la reparación agresiva: {rename_error}"
+                        ));
+                    }
+                    write_track_metadata(path, metadata, cover_change).err().map(|write_error| {
+                        format!(
+                            "El archivo se reparó de forma agresiva, pero no se pudieron guardar los metadatos: {}",
+                            write_error.message()
+                        )
+                    })
+                } else {
+                    Some(format!(
+                        "El archivo se reparó, pero no se pudieron reaplicar los metadatos: {}",
+                        error.message()
+                    ))
+                }
+            }
+        };
 
         if self.pending_repair_for(path).is_none() {
             self.pending_repairs.push(PendingRepair {
@@ -3496,6 +3524,17 @@ fn repair_backup_path(path: &Path) -> PathBuf {
 /// Remuxa el archivo a un temporal junto al original. `-c copy` no recodifica,
 /// así que la reparación es rápida y conserva la calidad y los metadatos.
 fn repair_audio_file(path: &Path) -> Result<PathBuf, String> {
+    repair_audio_file_with(path, false)
+}
+
+/// Reparación más agresiva: solo conserva el audio y descarta metadatos y
+/// contenedores secundarios. Puede arreglar archivos con datos corruptos que el
+/// remux normal no soluciona, pero borra los metadatos existentes.
+fn repair_audio_file_aggressive(path: &Path) -> Result<PathBuf, String> {
+    repair_audio_file_with(path, true)
+}
+
+fn repair_audio_file_with(path: &Path, aggressive: bool) -> Result<PathBuf, String> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let stem = path
         .file_stem()
@@ -3507,33 +3546,46 @@ fn repair_audio_file(path: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| {
             "El archivo no tiene una extensión que ffmpeg pueda reconocer".to_owned()
         })?;
-    let temporary = parent.join(format!(".{stem}.freeway-repair.{extension}"));
+    let suffix = if aggressive {
+        "freeway-repair-aggressive"
+    } else {
+        "freeway-repair"
+    };
+    let temporary = parent.join(format!(".{stem}.{suffix}.{extension}"));
     let _ = fs::remove_file(&temporary);
 
-    let output = Command::new("ffmpeg")
+    let mut command = Command::new("ffmpeg");
+    command
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
         .arg("-y")
         .arg("-i")
-        .arg(path)
-        .arg("-c")
-        .arg("copy")
-        .arg("-map_metadata")
-        .arg("0")
-        .arg(&temporary)
-        .output()
-        .map_err(|error| {
-            format!("No se pudo ejecutar ffmpeg: {error}. Comprueba que está instalado.")
-        })?;
+        .arg(path);
+    if aggressive {
+        // Mantiene solo audio y descarta metadatos/corrupciones fuera del stream.
+        command.arg("-map").arg("0:a").arg("-map_metadata").arg("-1");
+    } else {
+        command.arg("-c").arg("copy").arg("-map_metadata").arg("0");
+    }
+    command.arg("-c").arg("copy").arg(&temporary);
+
+    let output = command.output().map_err(|error| {
+        format!("No se pudo ejecutar ffmpeg: {error}. Comprueba que está instalado.")
+    })?;
     if !output.status.success() {
         let _ = fs::remove_file(&temporary);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.trim();
-        return Err(if detail.is_empty() {
-            "ffmpeg no pudo reparar el archivo".to_owned()
+        let action = if aggressive {
+            "reparar el archivo de forma agresiva"
         } else {
-            format!("ffmpeg no pudo reparar el archivo: {detail}")
+            "reparar el archivo"
+        };
+        return Err(if detail.is_empty() {
+            format!("ffmpeg no pudo {action}")
+        } else {
+            format!("ffmpeg no pudo {action}: {detail}")
         });
     }
 
@@ -3559,6 +3611,23 @@ fn ask_repair_confirmation(window: Rid, error: &str) -> bool {
              por si necesitas restaurarlo después."
         ),
         "Reparar",
+        "Cancelar",
+    )
+}
+
+fn ask_aggressive_repair_confirmation(window: Rid, error: &str) -> bool {
+    confirm_dialog(
+        window,
+        "Reparación agresiva",
+        &format!(
+            "La reparación normal no permitió guardar los metadatos: {error}\n\n\
+             Se puede intentar una reparación más agresiva con ffmpeg. Esta opción conserva solo \
+             el audio y elimina los metadatos existentes del archivo. Se intentarán volver a \
+             guardar los metadatos que has editado, pero la carátula y otras etiquetas \
+             originales pueden perderse.\n\n\
+             ¿Quieres continuar?"
+        ),
+        "Reparar y borrar metadatos",
         "Cancelar",
     )
 }

@@ -8,8 +8,9 @@ command: freeway-player
 finish-args:
   - --share=ipc
   - --share=network
-  - --socket=wayland
-  - --socket=fallback-x11
+  # Raven se compila con RAVEN_PLATFORM=x11; exponer el socket Wayland hace
+  # que el DND de archivos falle en algunos escritorios Wayland/KDE.
+  - --socket=x11
   - --device=dri
   - --socket=pulseaudio
   - --filesystem=home
