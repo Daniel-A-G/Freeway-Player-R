@@ -18,6 +18,7 @@
 !.env.example
 
 # Editor and operating system files
+/.idea/
 *.swp
 *~
 .DS_Store
