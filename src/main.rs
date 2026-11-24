@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{
     hash_map::{DefaultHasher, RandomState},
-    HashSet,
+    HashMap, HashSet,
 };
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fs::{self, File};
@@ -28,6 +28,7 @@ mod converter;
 mod instance;
 mod mpris;
 mod opus;
+mod podcasts;
 mod updates;
 mod youtube;
 
@@ -78,6 +79,10 @@ enum CoverMarker {
         generation: u64,
         id: String,
         index: usize,
+    },
+    Podcast {
+        key: String,
+        url: Option<String>,
     },
 }
 
@@ -242,6 +247,9 @@ struct SavedSettings {
     /// `Streaming` gracias a `default`.
     #[serde(default)]
     youtube_playback: YoutubePlayback,
+    /// Reproducción de podcasts: streaming por defecto o descarga completa.
+    #[serde(default)]
+    podcast_playback: YoutubePlayback,
     /// Carpeta elegida para guardar descargas. `None` usa la de descargas del
     /// sistema; nunca se escribe nada ahí hasta que el usuario lo pida.
     #[serde(default)]
@@ -287,6 +295,7 @@ impl Default for SavedSettings {
             open_behavior: OpenBehavior::default(),
             add_behavior: AddBehavior::default(),
             youtube_playback: YoutubePlayback::default(),
+            podcast_playback: YoutubePlayback::default(),
             download_dir: None,
             volume: default_volume(),
         }
@@ -353,6 +362,8 @@ struct TrackListRows {
     /// En modo YouTube la lista muestra resultados en memoria, no pistas.
     youtube: bool,
     youtube_results: Vec<youtube::YoutubeTrack>,
+    podcast: bool,
+    podcast_rows: Vec<Option<CString>>,
 }
 
 impl Playlist {
@@ -556,6 +567,13 @@ fn replacement_target(replacements: &[(PathBuf, PathBuf)], path: PathBuf) -> Pat
         .unwrap_or(path)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LibraryView {
+    Normal,
+    YouTube,
+    Podcasts,
+}
+
 struct PlayerState {
     output: Option<AudioOutput>,
     playlists: Vec<Playlist>,
@@ -583,14 +601,15 @@ struct PlayerState {
     cover_texture: Rid,
     track_list_widget: Rid,
     playlist_tabs_widget: Rid,
+    window: Rid,
     last_cover_dir: Option<PathBuf>,
     open_behavior: OpenBehavior,
     add_behavior: AddBehavior,
     youtube_playback: YoutubePlayback,
+    podcast_playback: YoutubePlayback,
     download_dir: Option<PathBuf>,
-    /// El modo YouTube es solo una vista de búsqueda: no guarda resultados ni
-    /// añade pistas a las listas sin una acción explícita del usuario.
-    youtube_mode: bool,
+    /// Vista activa: biblioteca normal, buscador YouTube o podcasts.
+    view: LibraryView,
     /// Resultados de la última búsqueda, en memoria. Se descartan al salir del
     /// modo YouTube o al abrir una lista.
     youtube_results: Vec<youtube::YoutubeTrack>,
@@ -619,6 +638,29 @@ struct PlayerState {
     /// La fuente actual sale directamente del pipe de `yt-dlp`: se reproduce
     /// en cuanto inicializa, pero no admite un seek real.
     stream_pipe_active: bool,
+    /// Estado de podcasts: suscripciones, episodios y estado escuchado.
+    podcast_store: podcasts::PodcastStore,
+    podcast_messages: Option<Receiver<podcasts::PodcastMessage>>,
+    podcast_generation: u64,
+    podcast_search_results: Vec<podcasts::PodcastSearchResult>,
+    podcast_selected_feed: Option<usize>,
+    podcast_selected_episode: Option<usize>,
+    podcast_selected_search: Option<usize>,
+    /// Suscripción marcada en la página de inicio, para mostrar su carátula.
+    podcast_selected_subscription: Option<usize>,
+    podcast_hint: String,
+    podcast_audio: Option<Receiver<podcasts::PodcastAudioMessage>>,
+    podcast_audio_generation: u64,
+    podcast_pending_episode: Option<String>,
+    podcast_current_episode: Option<String>,
+    podcast_audio_path: Option<PathBuf>,
+    podcast_last_position_save: Option<Instant>,
+    podcast_resume_position: Option<u64>,
+    /// Carátulas de podcasts descargadas en segundo plano, por clave de episodio/feed.
+    podcast_art: HashMap<String, Vec<u8>>,
+    podcast_art_pending: HashSet<String>,
+    podcast_art_tx: Option<Sender<(String, Vec<u8>)>>,
+    podcast_art_rx: Option<Receiver<(String, Vec<u8>)>>,
     /// Rutas que envían las siguientes instancias de la app.
     instance_paths: Option<Receiver<Vec<PathBuf>>>,
     /// Publicador MPRIS y canal de órdenes entrantes (el hilo D-Bus no toca
@@ -709,6 +751,7 @@ impl PlayerState {
                 format!("No se pudo iniciar la salida de audio: {error}"),
             ),
         };
+        let (podcast_art_tx, podcast_art_rx) = std::sync::mpsc::channel();
 
         Self {
             output,
@@ -735,12 +778,14 @@ impl PlayerState {
             cover_texture: R_INVALID_ID,
             track_list_widget: R_INVALID_ID,
             playlist_tabs_widget: R_INVALID_ID,
+            window: R_INVALID_ID,
             last_cover_dir: settings.last_cover_dir,
             open_behavior: settings.open_behavior,
             add_behavior: settings.add_behavior,
             youtube_playback: settings.youtube_playback,
+            podcast_playback: settings.podcast_playback,
             download_dir: settings.download_dir,
-            youtube_mode: false,
+            view: LibraryView::Normal,
             youtube_results: Vec::new(),
             youtube_query: String::new(),
             youtube_messages: None,
@@ -760,6 +805,26 @@ impl PlayerState {
             stream_current: None,
             stream_audio_path: None,
             stream_pipe_active: false,
+            podcast_store: podcasts::PodcastStore::load(&podcasts::podcast_store_path()),
+            podcast_messages: None,
+            podcast_generation: 0,
+            podcast_search_results: Vec::new(),
+            podcast_selected_feed: None,
+            podcast_selected_episode: None,
+            podcast_selected_search: None,
+            podcast_selected_subscription: None,
+            podcast_hint: "Busca podcasts o pega una URL RSS para suscribirte".to_owned(),
+            podcast_audio: None,
+            podcast_audio_generation: 0,
+            podcast_pending_episode: None,
+            podcast_current_episode: None,
+            podcast_audio_path: None,
+            podcast_last_position_save: None,
+            podcast_resume_position: None,
+            podcast_art: HashMap::new(),
+            podcast_art_pending: HashSet::new(),
+            podcast_art_tx: Some(podcast_art_tx),
+            podcast_art_rx: Some(podcast_art_rx),
             instance_paths: None,
             mpris: None,
             mpris_commands: None,
@@ -821,6 +886,7 @@ impl PlayerState {
             open_behavior: self.open_behavior,
             add_behavior: self.add_behavior,
             youtube_playback: self.youtube_playback,
+            podcast_playback: self.podcast_playback,
             download_dir: self.download_dir.clone(),
             volume: self.volume,
         };
@@ -929,11 +995,11 @@ impl PlayerState {
         }
         // Elegir una lista normal (aunque sea la misma que estaba activa antes
         // de entrar en el buscador) sale siempre del modo YouTube.
-        let leaving_youtube = self.youtube_mode;
+        let leaving_youtube = self.view == LibraryView::YouTube;
         if index == self.active_playlist && !leaving_youtube {
             return;
         }
-        self.youtube_mode = false;
+        self.view = LibraryView::Normal;
         if leaving_youtube {
             self.clear_youtube_results();
         }
@@ -1551,11 +1617,19 @@ impl PlayerState {
             .ok_or_else(|| "No hay una pista seleccionada".to_owned())?;
         let source = opus::source_for_path(&path)?;
         let duration = source.total_duration();
+        if self.podcast_current_episode.is_some() || self.podcast_pending_episode.is_some() {
+            self.save_podcast_position();
+            self.podcast_audio = None;
+            self.podcast_audio_generation = self.podcast_audio_generation.wrapping_add(1);
+            self.podcast_pending_episode = None;
+            self.podcast_current_episode = None;
+            self.podcast_audio_path = None;
+            self.podcast_last_position_save = None;
+        }
         let output = self
             .output
             .as_ref()
             .ok_or_else(|| "No hay un dispositivo de salida de audio disponible".to_owned())?;
-
         output.player.clear();
         if output.player.empty() {
             // `try_seek` guarda la orden aunque no haya sonido; sin esto, un seek
@@ -1598,6 +1672,20 @@ impl PlayerState {
     /// cuando hay más de una para que el botón siempre cambie de pista. No
     /// depende del modo aleatorio: sirve también para listas normales.
     fn play_random(&mut self) {
+        if self.view == LibraryView::YouTube {
+            let len = self.youtube_results.len();
+            let current = self.youtube_selected.or(self.youtube_current);
+            let Some(index) = random_track_index(len, current) else {
+                self.status = "Busca un resultado para reproducirlo".to_owned();
+                return;
+            };
+            self.play_youtube_result(Some(index));
+            return;
+        }
+        if self.view == LibraryView::Podcasts {
+            self.play_random_podcast();
+            return;
+        }
         let playlist_index = self.active_playlist;
         let Some(playlist) = self.playlists.get(playlist_index) else {
             return;
@@ -1619,8 +1707,12 @@ impl PlayerState {
     fn play_selected(&mut self, selected: Option<usize>) {
         // En el buscador el índice es de resultado, no de pista: usarlo con
         // `play_track` sería lo que hacía recorrer la lista que estaba abierta.
-        if self.youtube_mode {
+        if self.view == LibraryView::YouTube {
             self.play_youtube_result(selected);
+            return;
+        }
+        if self.view == LibraryView::Podcasts {
+            self.play_podcast_selected(selected);
             return;
         }
         let playlist_index = self.active_playlist;
@@ -1689,7 +1781,7 @@ impl PlayerState {
             self.status = "No hay un dispositivo de salida de audio disponible".to_owned();
             return;
         }
-        if self.youtube_mode {
+        if self.view == LibraryView::YouTube {
             self.play_youtube_result(None);
             return;
         }
@@ -1728,6 +1820,15 @@ impl PlayerState {
                 return;
             }
         }
+        if self.podcast_current_episode.is_some() && !self.is_stopped() {
+            if let Some(output) = &self.output {
+                output.player.play();
+                self.playing = true;
+                self.stopped = false;
+                self.status = "Reproduciendo".to_owned();
+            }
+            return;
+        }
         self.play_selected(None);
     }
 
@@ -1739,16 +1840,22 @@ impl PlayerState {
             output.player.pause();
             self.playing = false;
             self.status = "En pausa".to_owned();
+            if self.podcast_current_episode.is_some() {
+                self.save_podcast_position();
+            }
         }
     }
 
     fn stop(&mut self) {
-        if self.youtube_mode
+        if self.view == LibraryView::YouTube
             && (self.youtube_current.is_some() || self.youtube_pending_audio.is_some())
         {
             self.reset_youtube_playback();
         } else if self.stream_pending.is_some() || self.stream_current.is_some() {
             self.reset_stream_playback();
+        } else if self.podcast_current_episode.is_some() || self.podcast_pending_episode.is_some() {
+            self.save_podcast_position();
+            self.reset_podcast_playback();
         } else if let Some(output) = &self.output {
             output.player.stop();
         }
@@ -1792,7 +1899,7 @@ impl PlayerState {
     }
 
     fn step_track(&mut self, forward: bool) {
-        if self.youtube_mode {
+        if self.view == LibraryView::YouTube {
             let length = self.youtube_results.len();
             let Some(from) = self.displayed_youtube_index() else {
                 self.status = "Busca un resultado para reproducirlo".to_owned();
@@ -1950,7 +2057,7 @@ impl PlayerState {
             return;
         }
 
-        if self.youtube_mode {
+        if self.view == LibraryView::YouTube {
             let Some(index) = self.youtube_current else {
                 self.playing = false;
                 return;
@@ -1965,6 +2072,21 @@ impl PlayerState {
                 return;
             };
             self.play_youtube_result(Some(next));
+            return;
+        }
+
+        if let Some(ep_id) = self.podcast_current_episode.clone() {
+            self.podcast_store.mark_played(&ep_id, true);
+            self.podcast_store.set_position(&ep_id, 0);
+            let _ = self.podcast_store.save(&podcasts::podcast_store_path());
+            self.podcast_current_episode = None;
+            self.podcast_pending_episode = None;
+            self.current_metadata = None;
+            self.duration = None;
+            self.playing = false;
+            self.stopped = true;
+            self.status = "Episodio finalizado".to_owned();
+            self.ui_rendered_playlist = None;
             return;
         }
 
@@ -2631,6 +2753,11 @@ impl PlayerState {
         self.persist_settings()
     }
 
+    fn set_podcast_playback(&mut self, mode: YoutubePlayback) -> Result<(), String> {
+        self.podcast_playback = mode;
+        self.persist_settings()
+    }
+
     fn set_download_dir(&mut self, dir: Option<PathBuf>) -> Result<(), String> {
         self.download_dir = dir;
         self.persist_settings()
@@ -2640,18 +2767,381 @@ impl PlayerState {
     /// es solo un cambio de vista. Al salir se descartan los resultados, porque
     /// el buscador no guarda nada.
     fn toggle_youtube_mode(&mut self) {
-        self.youtube_mode = !self.youtube_mode;
-        if !self.youtube_mode {
+        self.view = if self.view == LibraryView::YouTube { LibraryView::Normal } else { LibraryView::YouTube };
+        if self.view != LibraryView::YouTube {
             self.clear_youtube_results();
         }
-        // La lista de la izquierda cambia de contenido: hay que forzar el
-        // renderizado aunque la lista activa no haya cambiado de revisión.
         self.ui_rendered_playlist = None;
-        self.status = if self.youtube_mode {
+        self.status = if self.view == LibraryView::YouTube {
             "Modo YouTube: la lista está desactivada; escribe una búsqueda y pulsa Enter".to_owned()
         } else {
             "Modo YouTube desactivado: vuelve la lista activa".to_owned()
         };
+    }
+
+    fn toggle_podcast_mode(&mut self) {
+        self.view = if self.view == LibraryView::Podcasts { LibraryView::Normal } else { LibraryView::Podcasts };
+        if self.view == LibraryView::Podcasts {
+            self.podcast_show_home();
+            self.status = "Modo Podcasts: tus suscripciones · busca o pega una URL RSS".to_owned();
+        } else {
+            self.podcast_messages = None;
+            self.status = "Modo Podcasts desactivado: vuelve la lista activa".to_owned();
+        }
+        self.ui_rendered_playlist = None;
+    }
+
+    /// Vuelve a la página de suscripciones y conserva marcado el podcast que
+    /// estuviera abierto para que su carátula siga visible.
+    fn podcast_show_home(&mut self) {
+        let keep = self.podcast_selected_feed.or(self.podcast_selected_subscription);
+        self.podcast_selected_subscription = keep
+            .filter(|idx| *idx < self.podcast_store.subscriptions.len())
+            .or_else(|| (!self.podcast_store.subscriptions.is_empty()).then_some(0));
+        self.podcast_search_results.clear();
+        self.podcast_selected_feed = None;
+        self.podcast_selected_episode = None;
+        self.podcast_selected_search = None;
+        self.podcast_hint = if self.podcast_store.subscriptions.is_empty() {
+            "Busca podcasts o pega una URL RSS para suscribirte".to_owned()
+        } else {
+            "Tus suscripciones · selecciona un podcast para ver sus episodios".to_owned()
+        };
+        self.ui_rendered_playlist = None;
+    }
+
+    fn podcast_mark_selected(&mut self, played: bool) {
+        let Some(feed_idx) = self.podcast_selected_feed else { return };
+        let Some(ep_idx) = self.podcast_selected_episode else { return };
+        let Some(feed) = self.podcast_store.subscriptions.get(feed_idx) else { return };
+        let Some(ep) = feed.episodes.get(ep_idx) else { return };
+        let id = ep.id.clone();
+        self.podcast_store.mark_played(&id, played);
+        let _ = self.podcast_store.save(&podcasts::podcast_store_path());
+        self.ui_rendered_playlist = None;
+        self.status = if played { "Episodio marcado como escuchado".to_owned() } else { "Episodio marcado como no escuchado".to_owned() };
+    }
+
+    fn podcast_refresh_selected_feed(&mut self) {
+        let Some(feed_idx) = self.podcast_selected_feed else { return };
+        let Some(feed) = self.podcast_store.subscriptions.get(feed_idx) else { return };
+        let url = feed.url.clone();
+        self.podcast_generation = self.podcast_generation.wrapping_add(1);
+        let generation = self.podcast_generation;
+        self.podcast_messages = Some(podcasts::start_refresh_feed(url, generation));
+        self.status = "Actualizando feed…".to_owned();
+    }
+
+    /// Suscribe el podcast seleccionado: desde un resultado de búsqueda carga el
+    /// feed; si ya estamos dentro de un feed, lo actualiza.
+    fn podcast_subscribe_selected(&mut self) {
+        if !self.podcast_search_results.is_empty() {
+            let idx = self.podcast_selected_search.unwrap_or(0);
+            let Some(result) = self.podcast_search_results.get(idx) else { return };
+            let url = result.feed_url.clone();
+            self.podcast_generation = self.podcast_generation.wrapping_add(1);
+            let generation = self.podcast_generation;
+            self.podcast_messages = Some(podcasts::start_refresh_feed(url, generation));
+            self.status = format!("Suscribiendo a {}…", result.title);
+            return;
+        }
+        if let Some(feed_idx) = self.podcast_selected_feed {
+            let title = self.podcast_store.subscriptions.get(feed_idx)
+                .map(|feed| feed.title.clone())
+                .unwrap_or_default();
+            self.podcast_refresh_selected_feed();
+            self.status = format!("Suscripción actualizada: {title}");
+            return;
+        }
+        self.status = "Selecciona un podcast para suscribirte".to_owned();
+    }
+
+    fn podcast_remove_selected_feed(&mut self) {
+        let Some(feed_idx) = self.podcast_selected_feed else { return };
+        if feed_idx < self.podcast_store.subscriptions.len() {
+            let name = self.podcast_store.subscriptions[feed_idx].title.clone();
+            self.podcast_store.subscriptions.remove(feed_idx);
+            self.podcast_selected_feed = if self.podcast_store.subscriptions.is_empty() { None } else { Some(feed_idx.min(self.podcast_store.subscriptions.len()-1)) };
+            self.podcast_selected_subscription = self.podcast_selected_feed;
+            self.podcast_selected_episode = None;
+            let _ = self.podcast_store.save(&podcasts::podcast_store_path());
+            self.ui_rendered_playlist = None;
+            self.status = format!("Suscripción eliminada: {name}");
+        }
+    }
+
+    fn start_podcast_search(&mut self, query: String) {
+        let query = query.trim().to_owned();
+        if query.is_empty() { return; }
+        self.view = LibraryView::Podcasts;
+        self.podcast_generation = self.podcast_generation.wrapping_add(1);
+        let generation = self.podcast_generation;
+        self.podcast_hint = "Buscando…".to_owned();
+        self.status = format!("Podcasts: buscando «{query}»…");
+        self.ui_rendered_playlist = None;
+        self.podcast_messages = Some(podcasts::start_search(query, generation));
+    }
+
+    fn poll_podcast_messages(&mut self) {
+        let Some(rx) = &self.podcast_messages else { return };
+        match rx.try_recv() {
+            Ok(podcasts::PodcastMessage::Searching { generation }) => {
+                if generation == self.podcast_generation { self.status = "Buscando podcasts…".to_owned(); }
+            }
+            Ok(podcasts::PodcastMessage::SearchResults { generation, results }) => {
+                if generation == self.podcast_generation {
+                    self.podcast_search_results = results;
+                    self.podcast_selected_feed = None;
+                    self.podcast_selected_episode = None;
+                    self.podcast_selected_search = None;
+                    self.podcast_hint = if self.podcast_search_results.is_empty() { "Sin resultados".to_owned() } else { "Resultados de búsqueda".to_owned() };
+                    self.status = format!("{} resultados", self.podcast_search_results.len());
+                    self.ui_rendered_playlist = None;
+                }
+            }
+            Ok(podcasts::PodcastMessage::FeedLoading { generation, .. }) => {
+                if generation == self.podcast_generation { self.status = "Cargando feed…".to_owned(); }
+            }
+            Ok(podcasts::PodcastMessage::FeedLoaded { generation, feed }) => {
+                if generation == self.podcast_generation {
+                    if let Some(pos) = self.podcast_store.subscriptions.iter().position(|f| f.url == feed.url) {
+                        self.podcast_store.subscriptions[pos] = feed;
+                        self.podcast_selected_feed = Some(pos);
+                    } else {
+                        self.podcast_store.subscriptions.push(feed);
+                        self.podcast_selected_feed = Some(self.podcast_store.subscriptions.len()-1);
+                    }
+                    self.podcast_selected_episode = None;
+                    self.podcast_selected_search = None;
+                    self.podcast_selected_subscription = self.podcast_selected_feed;
+                    self.podcast_search_results.clear();
+                    let _ = self.podcast_store.save(&podcasts::podcast_store_path());
+                    self.ui_rendered_playlist = None;
+                    self.status = "Feed cargado".to_owned();
+                }
+            }
+            Ok(podcasts::PodcastMessage::Error { generation, message }) => {
+                if generation == self.podcast_generation {
+                    self.status = format!("Podcasts: {message}");
+                    self.podcast_hint = message;
+                    self.ui_rendered_playlist = None;
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => { self.podcast_messages = None; }
+        }
+    }
+
+    fn play_podcast_selected(&mut self, selected: Option<usize>) {
+        let Some(idx) = selected.or(self.podcast_selected_episode) else { return };
+        if !self.podcast_search_results.is_empty() {
+            if let Some(r) = self.podcast_search_results.get(idx) {
+                let url = r.feed_url.clone();
+                self.podcast_generation = self.podcast_generation.wrapping_add(1);
+                let generation = self.podcast_generation;
+                self.podcast_messages = Some(podcasts::start_refresh_feed(url, generation));
+                self.status = "Suscribiendo al feed…".to_owned();
+            }
+            return;
+        }
+        if let Some(feed_idx) = self.podcast_selected_feed {
+            let episode = self.podcast_store.subscriptions.get(feed_idx)
+                .and_then(|f| f.episodes.get(idx).cloned());
+            if let Some(ep) = episode {
+                self.podcast_selected_episode = Some(idx);
+                self.start_podcast_episode(ep);
+            }
+        } else {
+            // select feed
+            if idx < self.podcast_store.subscriptions.len() {
+                self.podcast_selected_feed = Some(idx);
+                self.podcast_selected_subscription = Some(idx);
+                self.podcast_selected_episode = None;
+                self.podcast_selected_search = None;
+                self.ui_rendered_playlist = None;
+            }
+        }
+    }
+
+    /// Reproduce un episodio al azar cuando hay un feed cargado; desde la página
+    /// de inicio elige una suscripción al azar y reproduce uno de sus episodios.
+    fn play_random_podcast(&mut self) {
+        if !self.podcast_search_results.is_empty() {
+            let idx = random_track_index(self.podcast_search_results.len(), self.podcast_selected_search)
+                .unwrap_or(0);
+            self.podcast_selected_search = Some(idx);
+            self.podcast_subscribe_selected();
+            return;
+        }
+        let feed_idx = if let Some(idx) = self.podcast_selected_feed {
+            idx
+        } else {
+            let Some(idx) = random_track_index(self.podcast_store.subscriptions.len(), None) else {
+                self.status = "Suscríbete a un podcast antes de reproducir al azar".to_owned();
+                return;
+            };
+            self.podcast_selected_feed = Some(idx);
+            self.podcast_selected_subscription = Some(idx);
+            self.podcast_selected_episode = None;
+            self.ui_rendered_playlist = None;
+            idx
+        };
+        let Some(feed) = self.podcast_store.subscriptions.get(feed_idx) else { return };
+        let current = self.podcast_current_episode.as_ref()
+            .and_then(|id| feed.episodes.iter().position(|ep| &ep.id == id));
+        let Some(idx) = random_track_index(feed.episodes.len(), current) else {
+            self.status = "Este podcast no tiene episodios con audio".to_owned();
+            return;
+        };
+        let episode = feed.episodes[idx].clone();
+        self.podcast_selected_episode = Some(idx);
+        self.start_podcast_episode(episode);
+    }
+
+    fn start_podcast_episode(&mut self, episode: podcasts::PodcastEpisode) {
+        let saved_pos = self.podcast_store.episode_state(&episode.id).position_secs;
+        self.podcast_resume_position = None;
+        if saved_pos > 0 && self.window != R_INVALID_ID {
+            let msg = format!(
+                "Este episodio tiene progreso guardado ({}).\n\n¿Quieres continuar donde lo dejaste?",
+                format_time(Duration::from_secs(saved_pos))
+            );
+            let cont = confirm_dialog(
+                self.window,
+                "Continuar reproducción",
+                &msg,
+                "Continuar",
+                "Empezar desde 0",
+            );
+            if cont {
+                self.podcast_resume_position = Some(saved_pos);
+            } else {
+                self.podcast_store.set_position(&episode.id, 0);
+                let _ = self.podcast_store.save(&podcasts::podcast_store_path());
+            }
+        }
+        self.save_podcast_position();
+        if self.youtube_current.is_some() || self.youtube_pending_audio.is_some() {
+            self.reset_youtube_playback();
+        }
+        if self.stream_current.is_some() || self.stream_pending.is_some() {
+            self.reset_stream_playback();
+        }
+        self.current = None;
+        self.podcast_audio_generation = self.podcast_audio_generation.wrapping_add(1);
+        let generation = self.podcast_audio_generation;
+        self.podcast_pending_episode = Some(episode.id.clone());
+        self.podcast_current_episode = Some(episode.id.clone());
+        self.status = format!("Cargando episodio: {}", episode.title);
+        self.podcast_messages = None;
+        let cache_dir = podcasts::podcast_cache_dir();
+        self.podcast_audio = Some(podcasts::start_download_episode(episode, generation, cache_dir));
+    }
+
+    fn save_podcast_position(&mut self) {
+        let Some(ep_id) = self.podcast_current_episode.clone() else { return };
+        if self.stopped { return; }
+        let pos = self.position().as_secs();
+        self.podcast_store.set_position(&ep_id, pos);
+        self.podcast_last_position_save = Some(Instant::now());
+        let _ = self.podcast_store.save(&podcasts::podcast_store_path());
+    }
+
+    fn reset_podcast_playback(&mut self) {
+        self.podcast_audio = None;
+        self.podcast_audio_generation = self.podcast_audio_generation.wrapping_add(1);
+        self.podcast_pending_episode = None;
+        self.podcast_current_episode = None;
+        self.podcast_audio_path = None;
+        self.podcast_last_position_save = None;
+        if let Some(output) = &self.output {
+            output.player.stop();
+            output.player.clear();
+        }
+    }
+
+    fn poll_podcast_art(&mut self) {
+        let Some(rx) = &self.podcast_art_rx else { return };
+        loop {
+            match rx.try_recv() {
+                Ok((key, data)) => {
+                    self.podcast_art_pending.remove(&key);
+                    if !data.is_empty() {
+                        self.podcast_art.insert(key, data);
+                    }
+                    self.cover_rendered_for = None;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => { self.podcast_art_rx = None; break; }
+            }
+        }
+    }
+
+    fn poll_podcast_audio(&mut self) {
+        let Some(rx) = &self.podcast_audio else { return };
+        match rx.try_recv() {
+            Ok(podcasts::PodcastAudioMessage::Ready { generation, episode_id, path, duration }) => {
+                if generation != self.podcast_audio_generation { return; }
+                self.podcast_audio = None;
+                self.podcast_pending_episode = None;
+                self.podcast_audio_path = None;
+                if let Some(output) = &self.output {
+                    output.player.stop();
+                    match File::open(&path) {
+                        Ok(file) => {
+                            match rodio::Decoder::try_from(file) {
+                                Ok(source) => {
+                                    output.player.append(source);
+                                    output.player.play();
+                                    self.playing = true;
+                                    self.stopped = false;
+                                    self.stream_pipe_active = false;
+                                    self.duration = duration.or_else(|| self.duration);
+                                    self.podcast_audio_path = Some(path);
+                                    self.current_metadata = Some(TrackMetadata {
+                                        title: self.current_podcast_title(&episode_id).unwrap_or_else(|| "Episodio".to_owned()),
+                                        artist: self.current_podcast_feed_title(&episode_id).unwrap_or_default(),
+                                        ..TrackMetadata::default()
+                                    });
+                                    if let Some(pos) = self.podcast_resume_position.take() {
+                                        if pos > 0 {
+                                            let _ = output.player.try_seek(Duration::from_secs(pos));
+                                        }
+                                    }
+                                    self.podcast_last_position_save = Some(Instant::now());
+                                    self.status = "Reproduciendo podcast".to_owned();
+                                    self.ui_rendered_playlist = None;
+                                }
+                                Err(e) => { self.status = format!("No se pudo reproducir el episodio: {e}"); let _ = fs::remove_file(path); }
+                            }
+                        }
+                        Err(e) => { self.status = format!("No se pudo abrir el episodio: {e}"); }
+                    }
+                }
+            }
+            Ok(podcasts::PodcastAudioMessage::Error { generation, message, .. }) => {
+                if generation == self.podcast_audio_generation {
+                    self.podcast_audio = None;
+                    self.podcast_pending_episode = None;
+                    self.status = format!("Podcasts: {message}");
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => { self.podcast_audio = None; }
+        }
+    }
+
+    fn current_podcast_title(&self, episode_id: &str) -> Option<String> {
+        for feed in &self.podcast_store.subscriptions {
+            if let Some(ep) = feed.episodes.iter().find(|e| e.id == episode_id) { return Some(ep.title.clone()); }
+        }
+        None
+    }
+    fn current_podcast_feed_title(&self, episode_id: &str) -> Option<String> {
+        for feed in &self.podcast_store.subscriptions {
+            if feed.episodes.iter().any(|e| e.id == episode_id) { return Some(feed.title.clone()); }
+        }
+        None
     }
 
     fn clear_youtube_results(&mut self) {
@@ -2701,8 +3191,8 @@ impl PlayerState {
             self.status = "Escribe algo para buscar en YouTube".to_owned();
             return;
         }
-        if !self.youtube_mode {
-            self.youtube_mode = true;
+        if !(self.view == LibraryView::YouTube) {
+            self.view = LibraryView::YouTube;
         }
         self.reset_youtube_playback();
         self.youtube_generation = self.youtube_generation.wrapping_add(1);
@@ -2779,7 +3269,7 @@ impl PlayerState {
     /// Raven no avisa de cada cambio de selección, así que se lee en cada
     /// fotograma. En modo buscador esa fila nunca se copia a una lista.
     fn sync_youtube_selection(&mut self, selected: i32) {
-        if !self.youtube_mode {
+        if !(self.view == LibraryView::YouTube) {
             return;
         }
         self.youtube_selected = if selected >= 0 && (selected as usize) < self.youtube_results.len()
@@ -2790,6 +3280,55 @@ impl PlayerState {
             // siga sonando un resultado, ese es el marcador válido.
             self.youtube_current
         };
+    }
+
+    fn sync_podcast_selection(&mut self, selected: i32) {
+        if self.view != LibraryView::Podcasts {
+            return;
+        }
+        if !self.podcast_search_results.is_empty() {
+            if selected >= 0 && (selected as usize) < self.podcast_search_results.len() {
+                self.podcast_selected_search = Some(selected as usize);
+            }
+            return;
+        }
+        if self.podcast_selected_feed.is_none() {
+            // Página de inicio: la fila marcada es una suscripción.
+            if selected >= 0 && (selected as usize) < self.podcast_store.subscriptions.len() {
+                self.podcast_selected_subscription = Some(selected as usize);
+            }
+            return;
+        }
+        let len = self
+            .podcast_selected_feed
+            .and_then(|i| self.podcast_store.subscriptions.get(i))
+            .map(|f| f.episodes.len())
+            .unwrap_or(0);
+        self.podcast_selected_episode = if selected >= 0 && (selected as usize) < len {
+            Some(selected as usize)
+        } else {
+            self.podcast_selected_episode
+        };
+    }
+
+    /// Carátula que corresponde a la fila seleccionada en modo Podcasts.
+    fn displayed_podcast_art(&self) -> Option<(String, Option<String>)> {
+        if self.view != LibraryView::Podcasts { return None; }
+        if !self.podcast_search_results.is_empty() {
+            let idx = self.podcast_selected_search.unwrap_or(0);
+            let result = self.podcast_search_results.get(idx)?;
+            return Some((format!("search:{}", result.feed_url), result.artwork_url.clone()));
+        }
+        let feed_idx = self.podcast_selected_feed.or(self.podcast_selected_subscription)?;
+        let feed = self.podcast_store.subscriptions.get(feed_idx)?;
+        let ep_idx = self.podcast_selected_episode.or_else(|| {
+            self.podcast_current_episode.as_ref()
+                .and_then(|id| feed.episodes.iter().position(|ep| &ep.id == id))
+        });
+        if let Some(ep) = ep_idx.and_then(|i| feed.episodes.get(i)) {
+            return Some((format!("ep:{}", ep.id), ep.image_url.clone().or_else(|| feed.artwork_url.clone())));
+        }
+        Some((format!("feed:{}", feed.id), feed.artwork_url.clone()))
     }
 
     /// En el buscador manda la fila seleccionada: así la carátula cambia en
@@ -2830,7 +3369,7 @@ impl PlayerState {
     /// Reproduce un resultado sin tocar `playlists` ni `active_playlist`. Según
     /// el ajuste, abre el pipe AAC en streaming o deja un Opus en la caché.
     fn play_youtube_result(&mut self, selected: Option<usize>) {
-        if !self.youtube_mode {
+        if !(self.view == LibraryView::YouTube) {
             return;
         }
         let Some(index) = selected
@@ -2904,6 +3443,10 @@ impl PlayerState {
         // Un streaming de la lista podría seguir en el reproductor: al pasar a
         // un resultado de YouTube se descarta su audio temporal.
         self.reset_stream_playback();
+        if self.podcast_current_episode.is_some() || self.podcast_pending_episode.is_some() {
+            self.save_podcast_position();
+            self.reset_podcast_playback();
+        }
         self.youtube_audio = None;
         self.youtube_pending_audio = None;
         self.youtube_audio_generation = self.youtube_audio_generation.wrapping_add(1);
@@ -3817,7 +4360,7 @@ fn play_starts_selected(
 }
 
 fn update_cover_art(state: &mut PlayerState, ui: Ui) {
-    let marker = if state.youtube_mode {
+    let marker = if state.view == LibraryView::YouTube {
         state.displayed_youtube_index().and_then(|index| {
             state.youtube_results.get(index).map(|track| CoverMarker::Youtube {
                 generation: state.youtube_generation,
@@ -3825,6 +4368,8 @@ fn update_cover_art(state: &mut PlayerState, ui: Ui) {
                 index,
             })
         })
+    } else if state.view == LibraryView::Podcasts {
+        state.displayed_podcast_art().map(|(key, url)| CoverMarker::Podcast { key, url })
     } else {
         state.displayed_location().and_then(|(playlist, track)| {
             state
@@ -3842,6 +4387,7 @@ fn update_cover_art(state: &mut PlayerState, ui: Ui) {
             .youtube_results
             .get(*index)
             .and_then(|track| track.thumbnail_data.clone()),
+        Some(CoverMarker::Podcast { key, .. }) => state.podcast_art.get(key).cloned(),
         Some(CoverMarker::Local(playlist, track, _)) => state
             .playlists
             .get(*playlist)
@@ -3849,7 +4395,19 @@ fn update_cover_art(state: &mut PlayerState, ui: Ui) {
             .and_then(|path| read_cover_art(path)),
         None => None,
     };
-    if state.youtube_mode {
+    if let Some(CoverMarker::Podcast { key, url }) = &marker {
+        if image_data.is_none() {
+            if let Some(url) = url.clone() {
+                if !state.podcast_art_pending.contains(key) {
+                    state.podcast_art_pending.insert(key.clone());
+                    if let Some(tx) = state.podcast_art_tx.clone() {
+                        podcasts::start_fetch_artwork(url, key.clone(), tx);
+                    }
+                }
+            }
+        }
+    }
+    if state.view == LibraryView::YouTube {
         state.cover_hint = match (&marker, &image_data) {
             (Some(CoverMarker::Youtube { .. }), Some(_)) => {
                 "Miniatura del resultado de YouTube".to_owned()
@@ -3858,6 +4416,17 @@ fn update_cover_art(state: &mut PlayerState, ui: Ui) {
                 "Este resultado no tiene miniatura".to_owned()
             }
             _ => "Selecciona un resultado para ver su carátula".to_owned(),
+        };
+    } else if state.view == LibraryView::Podcasts {
+        state.cover_hint = match (&marker, &image_data) {
+            (Some(CoverMarker::Podcast { .. }), Some(_)) => "Carátula del podcast".to_owned(),
+            (Some(CoverMarker::Podcast { url: Some(_), .. }), None) => {
+                "Descargando carátula…".to_owned()
+            }
+            (Some(CoverMarker::Podcast { .. }), None) => {
+                "Este podcast no tiene carátula".to_owned()
+            }
+            _ => "Selecciona un podcast para ver su carátula".to_owned(),
         };
     }
     let new_texture = image_data
@@ -4032,10 +4601,14 @@ struct Ui {
     playlist_name: Rid,
     playlist_summary: Rid,
     library_title: Rid,
+    library_title_hit: Rid,
     youtube_search: Rid,
+    podcast_search: Rid,
+    podcast_subscribe_button: Rid,
     track_list: Rid,
     youtube_button: Rid,
     youtube_icon: Rid,
+    podcast_icon: Rid,
     right_panel: Rid,
     cover_switcher: Rid,
     cover_image: Rid,
@@ -4074,10 +4647,14 @@ impl Ui {
             playlist_name: widget_find(window, "playlist-name"),
             playlist_summary: widget_find(window, "playlist-summary"),
             library_title: widget_find(window, "library-title"),
+            library_title_hit: widget_find(window, "library-title-hit"),
             youtube_search: widget_find(window, "youtube-search"),
+            podcast_search: widget_find(window, "podcast-search"),
+            podcast_subscribe_button: widget_find(window, "podcast-subscribe-button"),
             track_list: widget_find(window, "track-list"),
             youtube_button: widget_find(window, "youtube-button"),
             youtube_icon: widget_find(window, "youtube-icon"),
+            podcast_icon: widget_find(window, "podcast-icon"),
             right_panel: widget_find(window, "right-panel"),
             cover_switcher: widget_find(window, "cover-switcher"),
             cover_image: widget_find(window, "cover-image"),
@@ -4155,14 +4732,15 @@ fn load_action_icons(ui: Ui) -> Rid {
 
     unsafe {
         for (image, min_u, max_u) in [
-            (ui.shuffle_icon, 0.0, 1.0 / 8.0),
-            (ui.repeat_icon, 1.0 / 8.0, 2.0 / 8.0),
-            (ui.import_icon, 2.0 / 8.0, 3.0 / 8.0),
-            (ui.export_icon, 3.0 / 8.0, 4.0 / 8.0),
-            (ui.restore_icon, 4.0 / 8.0, 5.0 / 8.0),
-            (ui.confirm_icon, 5.0 / 8.0, 6.0 / 8.0),
-            (ui.random_icon, 6.0 / 8.0, 7.0 / 8.0),
-            (ui.youtube_icon, 7.0 / 8.0, 1.0),
+            (ui.shuffle_icon, 0.0, 1.0 / 9.0),
+            (ui.repeat_icon, 1.0 / 9.0, 2.0 / 9.0),
+            (ui.import_icon, 2.0 / 9.0, 3.0 / 9.0),
+            (ui.export_icon, 3.0 / 9.0, 4.0 / 9.0),
+            (ui.restore_icon, 4.0 / 9.0, 5.0 / 9.0),
+            (ui.confirm_icon, 5.0 / 9.0, 6.0 / 9.0),
+            (ui.random_icon, 6.0 / 9.0, 7.0 / 9.0),
+            (ui.youtube_icon, 7.0 / 9.0, 8.0 / 9.0),
+            (ui.podcast_icon, 8.0 / 9.0, 1.0),
         ] {
             if image != R_INVALID_ID {
                 Rimage_set_texture(image, texture);
@@ -4398,6 +4976,16 @@ unsafe extern "C" fn track_list_row_text(
             .map(|text| text.as_ptr())
             .unwrap_or(EMPTY.as_ptr().cast());
     }
+    if rows.podcast {
+        let index = index as usize;
+        if index >= rows.podcast_rows.len() {
+            return EMPTY.as_ptr().cast();
+        }
+        return rows.podcast_rows[index]
+            .as_ref()
+            .map(|text| text.as_ptr())
+            .unwrap_or(EMPTY.as_ptr().cast());
+    }
     if let Some(placeholder) = rows.placeholder.as_ref() {
         return placeholder.as_ptr();
     }
@@ -4479,7 +5067,7 @@ fn update_track_list(
         .map(|pending| pending.path.clone())
         .collect();
 
-    if state.youtube_mode {
+    if state.view == LibraryView::YouTube {
         let marker = (usize::MAX, 0);
         if state.ui_rendered_playlist == Some(marker) {
             return;
@@ -4496,6 +5084,8 @@ fn update_track_list(
             rows.youtube = true;
             rows.youtube_results = state.youtube_results.clone();
             rows.placeholder = placeholder;
+            rows.podcast = false;
+            rows.podcast_rows.clear();
         }
         let user_data = row_cache as *const RefCell<TrackListRows> as *mut c_void;
         unsafe {
@@ -4506,6 +5096,80 @@ fn update_track_list(
                 user_data,
             );
             Rlist_view_set_selected(ui.track_list, -1);
+        }
+        state.ui_rendered_playlist = Some(marker);
+        state.editor_loaded_for = None;
+        state.ui_selection_dirty = false;
+        set_input(ui.playlist_name, "");
+        return;
+    }
+
+    if state.view == LibraryView::Podcasts {
+        let marker = (
+            usize::MAX - 1,
+            (state.podcast_generation as u64)
+                ^ ((state.podcast_store.subscriptions.len() as u64) << 32)
+                ^ ((state.podcast_search_results.len() as u64) << 16)
+                ^ (state.podcast_selected_feed.unwrap_or(9999) as u64),
+        );
+        if state.ui_rendered_playlist == Some(marker) {
+            return;
+        }
+        let mut display_rows: Vec<String> = Vec::new();
+        if !state.podcast_search_results.is_empty() {
+            for (i, r) in state.podcast_search_results.iter().enumerate() {
+                display_rows.push(format!("{:02}   {}  ·  {}", i + 1, r.title, if r.author.is_empty() { "Podcast" } else { &r.author }));
+            }
+        } else if let Some(feed_idx) = state.podcast_selected_feed {
+            if let Some(feed) = state.podcast_store.subscriptions.get(feed_idx) {
+                for (i, ep) in feed.episodes.iter().enumerate() {
+                    let st = state.podcast_store.episode_state(&ep.id);
+                    let mark = if st.played { "✓" } else { " " };
+                    let dur = ep.duration_secs.map(|s| format_time(Duration::from_secs(s))).unwrap_or_else(|| "--:--".to_owned());
+                    display_rows.push(format!("{:02} {} {}  ·  {}     {}", i + 1, mark, ep.title, feed.title, dur));
+                }
+                if display_rows.is_empty() {
+                    display_rows.push("Este feed no tiene episodios con audio".to_owned());
+                }
+            }
+        } else {
+            if state.podcast_store.subscriptions.is_empty() {
+                display_rows.push(state.podcast_hint.clone());
+            } else {
+                for (i, feed) in state.podcast_store.subscriptions.iter().enumerate() {
+                    display_rows.push(format!("{:02}   {}  ·  {} episodios", i + 1, feed.title, feed.episodes.len()));
+                }
+            }
+        }
+        let count = display_rows.len();
+        {
+            let mut rows = row_cache.borrow_mut();
+            rows.tracks.clear();
+            rows.streams.clear();
+            rows.text.clear();
+            rows.pending_repairs.clear();
+            rows.youtube = false;
+            rows.youtube_results.clear();
+            rows.placeholder = None;
+            rows.podcast = true;
+            rows.podcast_rows = display_rows.into_iter().map(|s| Some(cstr(&s))).collect();
+        }
+        let sel = if !state.podcast_search_results.is_empty() {
+            -1
+        } else if state.podcast_selected_feed.is_some() {
+            state.podcast_selected_episode.map(|i| i as i32).unwrap_or(-1)
+        } else {
+            state.podcast_selected_feed.map(|i| i as i32).unwrap_or(-1)
+        };
+        let user_data = row_cache as *const RefCell<TrackListRows> as *mut c_void;
+        unsafe {
+            Rlist_view_set_virtual_items(
+                ui.track_list,
+                count.max(1) as i32,
+                Some(track_list_row_text),
+                user_data,
+            );
+            Rlist_view_set_selected(ui.track_list, sel);
         }
         state.ui_rendered_playlist = Some(marker);
         state.editor_loaded_for = None;
@@ -4537,6 +5201,8 @@ fn update_track_list(
         rows.placeholder = None;
         rows.youtube = false;
         rows.youtube_results.clear();
+        rows.podcast = false;
+        rows.podcast_rows.clear();
     }
 
     let user_data = row_cache as *const RefCell<TrackListRows> as *mut c_void;
@@ -4561,7 +5227,7 @@ fn update_metadata_editor(state: &mut PlayerState, ui: Ui) {
     // En el buscador la fila seleccionada es un resultado, no una pista de la
     // lista: sincronizarla cambiaría `playlist.selected` y podría abrir el
     // editor de una pista local que no tiene nada que ver.
-    if state.youtube_mode {
+    if state.view == LibraryView::YouTube {
         state.ui_selection_dirty = false;
         state.metadata_hint = "Los resultados de YouTube no se editan".to_owned();
         return;
@@ -4660,7 +5326,10 @@ fn refresh_ui(
     menus: &mut ContextMenus,
     window: Rid,
 ) {
-    menus.sync(ui, state.youtube_mode, state.selected_is_flac());
+    let podcast_subscribe_visible = state.view == LibraryView::Podcasts
+        && state.podcast_search_results.is_empty()
+        && state.podcast_selected_feed.is_some();
+    menus.sync(ui, state.view, state.selected_is_flac(), podcast_subscribe_visible);
     state.poll_update_check(window);
     state.poll_instance_messages(window);
     state.update_after_frame();
@@ -4668,20 +5337,40 @@ fn refresh_ui(
     state.poll_youtube_search();
     state.poll_youtube_audio();
     state.poll_youtube_downloads();
+    state.poll_podcast_messages();
+    state.poll_podcast_audio();
+    state.poll_podcast_art();
     state.poll_stream_audio();
     state.poll_conversion();
+    if state.playing && state.podcast_current_episode.is_some() {
+        let due = state
+            .podcast_last_position_save
+            .map(|t| t.elapsed() >= Duration::from_secs(15))
+            .unwrap_or(true);
+        if due {
+            state.save_podcast_position();
+        }
+    }
     update_track_list(state, ui, row_cache);
     let selected = unsafe { Rlist_view_get_selected(ui.track_list) };
     state.sync_youtube_selection(selected);
+    state.sync_podcast_selection(selected);
     set_label(
         ui.library_title,
-        if state.youtube_mode {
-            "YouTube"
-        } else {
-            "Biblioteca"
+        match state.view {
+            LibraryView::YouTube => "YouTube",
+            LibraryView::Podcasts => "Podcasts",
+            LibraryView::Normal => "Biblioteca",
         },
     );
-    if state.youtube_mode {
+    // El botón invisible debe cubrir exactamente el texto del título.
+    unsafe {
+        let mut width = 0.0;
+        let mut height = 0.0;
+        Rwidget_get_desired_size(ui.library_title, &mut width, &mut height);
+        Rwidget_set_size(ui.library_title_hit, width, height);
+    }
+    if state.view == LibraryView::YouTube {
         let count = state.youtube_results.len();
         let summary = if count == 0 {
             "Buscador · los resultados no se guardan".to_owned()
@@ -4692,11 +5381,22 @@ fn refresh_ui(
             )
         };
         set_label(ui.playlist_summary, &summary);
+    } else if state.view == LibraryView::Podcasts {
+        let summary = if !state.podcast_search_results.is_empty() {
+            format!("{} resultados de búsqueda", state.podcast_search_results.len())
+        } else if let Some(feed_idx) = state.podcast_selected_feed {
+            state.podcast_store.subscriptions.get(feed_idx)
+                .map(|f| format!("{} · {} episodios", f.title, f.episodes.len()))
+                .unwrap_or_else(|| "Podcasts".to_owned())
+        } else {
+            format!("{} suscripciones", state.podcast_store.subscriptions.len())
+        };
+        set_label(ui.playlist_summary, &summary);
     } else if let Some(playlist) = state.playlists.get(state.active_playlist) {
         let summary = playlist_summary_text(playlist, state.current, state.active_playlist);
         set_label(ui.playlist_summary, &summary);
     }
-    let youtube_tooltip = if state.youtube_mode {
+    let youtube_tooltip = if state.view == LibraryView::YouTube {
         "Volver a la lista de música"
     } else {
         "Buscar música en YouTube (solo búsqueda, no guarda nada)"
@@ -5212,7 +5912,7 @@ struct ContextMenuContext {
 unsafe extern "C" fn open_metadata_editor_from_context_menu(_item: Rid, user_data: *mut c_void) {
     let context = &*(user_data as *const ContextMenuContext);
     let selected = Rlist_view_get_selected(context.ui.track_list);
-    if selected < 0 || context.state.borrow().youtube_mode {
+    if selected < 0 || (context.state.borrow().view == LibraryView::YouTube) {
         return;
     }
 
@@ -5248,7 +5948,7 @@ unsafe extern "C" fn download_opus_from_context_menu(_item: Rid, user_data: *mut
     let Ok(mut state) = context.state.try_borrow_mut() else {
         return;
     };
-    if !state.youtube_mode {
+    if !(state.view == LibraryView::YouTube) {
         return;
     }
     let index = (selected >= 0).then_some(selected as usize);
@@ -5263,11 +5963,46 @@ unsafe extern "C" fn add_to_playlist_from_context_menu(_item: Rid, user_data: *m
     let Ok(mut state) = context.state.try_borrow_mut() else {
         return;
     };
-    if !state.youtube_mode {
+    if !(state.view == LibraryView::YouTube) {
         return;
     }
     let index = (selected >= 0).then_some(selected as usize);
     state.add_youtube_to_playlist(index);
+}
+
+unsafe extern "C" fn podcast_subscribe_from_context_menu(_item: Rid, user_data: *mut c_void) {
+    let state = &*(user_data as *const RefCell<PlayerState>);
+    if let Ok(mut st) = state.try_borrow_mut() {
+        st.podcast_subscribe_selected();
+    }
+}
+
+unsafe extern "C" fn podcast_mark_played_from_context_menu(_item: Rid, user_data: *mut c_void) {
+    let state = &*(user_data as *const RefCell<PlayerState>);
+    if let Ok(mut st) = state.try_borrow_mut() {
+        st.podcast_mark_selected(true);
+    }
+}
+
+unsafe extern "C" fn podcast_mark_unplayed_from_context_menu(_item: Rid, user_data: *mut c_void) {
+    let state = &*(user_data as *const RefCell<PlayerState>);
+    if let Ok(mut st) = state.try_borrow_mut() {
+        st.podcast_mark_selected(false);
+    }
+}
+
+unsafe extern "C" fn podcast_refresh_from_context_menu(_item: Rid, user_data: *mut c_void) {
+    let state = &*(user_data as *const RefCell<PlayerState>);
+    if let Ok(mut st) = state.try_borrow_mut() {
+        st.podcast_refresh_selected_feed();
+    }
+}
+
+unsafe extern "C" fn podcast_remove_from_context_menu(_item: Rid, user_data: *mut c_void) {
+    let state = &*(user_data as *const RefCell<PlayerState>);
+    if let Ok(mut st) = state.try_borrow_mut() {
+        st.podcast_remove_selected_feed();
+    }
 }
 
 /// Sincroniza la vista con el modo del buscador: menú contextual, caja de
@@ -5278,49 +6013,66 @@ struct ContextMenus {
     normal: Rid,
     youtube: Rid,
     flac: Rid,
-    showing: Option<(bool, bool)>,
+    podcast: Rid,
+    showing: Option<(LibraryView, bool, bool)>,
 }
 
 impl ContextMenus {
-    fn new(normal: Rid, youtube: Rid, flac: Rid) -> Self {
+    fn new(normal: Rid, youtube: Rid, flac: Rid, podcast: Rid) -> Self {
         Self {
             normal,
             youtube,
             flac,
+            podcast,
             showing: None,
         }
     }
 
-    fn sync(&mut self, ui: Ui, youtube_mode: bool, flac_mode: bool) {
-        if self.showing == Some((youtube_mode, flac_mode)) {
+    fn sync(&mut self, ui: Ui, view: LibraryView, flac_mode: bool, podcast_subscribe_visible: bool) {
+        if self.showing == Some((view, flac_mode, podcast_subscribe_visible)) {
             return;
         }
-        self.showing = Some((youtube_mode, flac_mode));
-        let menu = if youtube_mode {
-            self.youtube
-        } else if flac_mode {
-            self.flac
-        } else {
-            self.normal
+        self.showing = Some((view, flac_mode, podcast_subscribe_visible));
+        let menu = match view {
+            LibraryView::YouTube => self.youtube,
+            LibraryView::Podcasts => self.podcast,
+            LibraryView::Normal if flac_mode => self.flac,
+            LibraryView::Normal => self.normal,
         };
         unsafe {
             Rwidget_set_context_menu(ui.track_list, menu);
-            // El modo YouTube es la «lista» activa: se atenúan las pestañas para
-            // que la anterior no parezca la seleccionada (siguen siendo clicables).
-            Rwidget_set_opacity(ui.playlist_tabs, if youtube_mode { 0.6 } else { 1.0 });
-            // El buscador solo existe mientras está activo el modo YouTube.
+            let special = view != LibraryView::Normal;
+            Rwidget_set_opacity(ui.playlist_tabs, if special { 0.6 } else { 1.0 });
             Rwidget_set_visibility(
                 ui.youtube_search,
-                if youtube_mode { R_VISIBLE } else { R_COLLAPSED },
+                if view == LibraryView::YouTube { R_VISIBLE } else { R_COLLAPSED },
             );
-            if youtube_mode {
-                // El logo se tiñe con el acento mientras el modo está activo.
+            Rwidget_set_visibility(
+                ui.podcast_search,
+                if view == LibraryView::Podcasts { R_VISIBLE } else { R_COLLAPSED },
+            );
+            Rwidget_set_visibility(
+                ui.podcast_subscribe_button,
+                if view == LibraryView::Podcasts && podcast_subscribe_visible { R_VISIBLE } else { R_COLLAPSED },
+            );
+            if view == LibraryView::YouTube {
                 Rimage_set_tint_text(ui.youtube_icon, R_FALSE);
                 Rimage_set_tint_color(ui.youtube_icon, 0.725, 0.639, 0.961, 1.0);
-                // Al aparecer, el campo ya está listo para escribir.
                 Rwidget_focus(ui.youtube_search);
             } else {
                 Rimage_set_tint_text(ui.youtube_icon, R_TRUE);
+            }
+            if view == LibraryView::Podcasts {
+                Rimage_set_tint_text(ui.podcast_icon, R_FALSE);
+                Rimage_set_tint_color(ui.podcast_icon, 0.725, 0.639, 0.961, 1.0);
+                Rwidget_focus(ui.podcast_search);
+                let home_tip = cstr("Volver a tus suscripciones");
+                Rwidget_set_tooltip(ui.library_title_hit, home_tip.as_ptr());
+                Rwidget_set_cursor(ui.library_title_hit, R_CURSOR_HAND);
+            } else {
+                Rimage_set_tint_text(ui.podcast_icon, R_TRUE);
+                Rwidget_set_tooltip(ui.library_title_hit, std::ptr::null());
+                Rwidget_set_cursor(ui.library_title_hit, R_CURSOR_ARROW);
             }
         }
     }
@@ -5331,6 +6083,7 @@ impl ContextMenus {
             Rwidget_destroy(self.normal);
             Rwidget_destroy(self.youtube);
             Rwidget_destroy(self.flac);
+            Rwidget_destroy(self.podcast);
         }
     }
 }
@@ -5835,7 +6588,7 @@ unsafe extern "C" fn open_converter_from_context_menu(item: Rid, user_data: *mut
     let context = &*(user_data as *const ContextMenuContext);
     let path = {
         let state = context.state.borrow();
-        if state.youtube_mode {
+        if state.view == LibraryView::YouTube {
             return;
         }
         state
@@ -5852,7 +6605,7 @@ unsafe extern "C" fn open_converter_from_context_menu(item: Rid, user_data: *mut
     open_converter_dialog(window, Rc::clone(&context.state), Some(path));
 }
 
-const SETTINGS_SECTIONS: [&str; 4] = ["General", "Listas", "YouTube", "Descargas"];
+const SETTINGS_SECTIONS: [&str; 5] = ["General", "Listas", "YouTube", "Podcasts", "Descargas"];
 
 /// Datos que necesita el diálogo de ajustes mientras está abierto. `Aplicar`
 /// conserva el contexto porque el diálogo sigue en pie; solo al cerrarlo se
@@ -5862,6 +6615,7 @@ struct SettingsDialogContext {
     open_options: [Rid; 3],
     add_options: [Rid; 2],
     youtube_options: [Rid; 2],
+    podcast_options: [Rid; 2],
     download_dir: Rc<RefCell<Option<PathBuf>>>,
     download_dir_label: Rid,
     menu: Rid,
@@ -5888,12 +6642,13 @@ unsafe fn settings_description(text: &str) -> Rid {
 unsafe extern "C" fn open_settings_dialog(item: Rid, user_data: *mut c_void) {
     let state = &*(user_data as *const Rc<RefCell<PlayerState>>);
     let window = Rwidget_get_window(item);
-    let (current_open, current_add, current_youtube, current_download) = {
+    let (current_open, current_add, current_youtube, current_podcast, current_download) = {
         let state = state.borrow();
         (
             state.open_behavior,
             state.add_behavior,
             state.youtube_playback,
+            state.podcast_playback,
             state.download_dir.clone(),
         )
     };
@@ -5987,6 +6742,27 @@ unsafe extern "C" fn open_settings_dialog(item: Rid, user_data: *mut c_void) {
     Rwidget_add_child(youtube, youtube_options_panel);
     Rwidget_add_child(pages, youtube);
 
+    // Podcasts: streaming o descarga completa.
+    let podcasts_page = Rwidget_create(R_WIDGET_VBOX);
+    Rpanel_set_spacing(podcasts_page, 10.0);
+    Rwidget_add_child(podcasts_page, settings_heading("Reproducción de podcasts"));
+    Rwidget_add_child(
+        podcasts_page,
+        settings_description("En esta versión ambas opciones descargan el episodio a la caché antes de reproducirlo. El ajuste se guarda de cara a añadir streaming progresivo en el futuro."),
+    );
+    let podcast_options_panel = Rwidget_create(R_WIDGET_VBOX);
+    Rpanel_set_spacing(podcast_options_panel, 6.0);
+    let mut podcast_options = [R_INVALID_ID; 2];
+    for mode in YoutubePlayback::ALL {
+        let option = Rcheckbox_create(cstr(mode.label()).as_ptr());
+        Rcheckbox_set_style(option, R_CHECKBOX_RADIO);
+        Rcheckbox_set_checked(option, if mode == current_podcast { R_TRUE } else { R_FALSE });
+        Rwidget_add_child(podcast_options_panel, option);
+        podcast_options[mode.index()] = option;
+    }
+    Rwidget_add_child(podcasts_page, podcast_options_panel);
+    Rwidget_add_child(pages, podcasts_page);
+
     // Descargas: carpeta para las descargas explícitas en Opus.
     let downloads = Rwidget_create(R_WIDGET_VBOX);
     Rpanel_set_spacing(downloads, 10.0);
@@ -6033,6 +6809,7 @@ unsafe extern "C" fn open_settings_dialog(item: Rid, user_data: *mut c_void) {
         open_options,
         add_options,
         youtube_options,
+        podcast_options,
         download_dir: current_download,
         download_dir_label,
         menu,
@@ -6083,6 +6860,11 @@ unsafe fn apply_settings(context: &SettingsDialogContext) {
         .iter()
         .position(|option| Rcheckbox_is_checked(*option) != R_FALSE)
         .and_then(youtube_playback_from_option_index);
+    let podcast_playback = context
+        .podcast_options
+        .iter()
+        .position(|option| Rcheckbox_is_checked(*option) != R_FALSE)
+        .and_then(youtube_playback_from_option_index);
     let download_dir = context.download_dir.borrow().clone();
 
     let Ok(mut state) = context.state.try_borrow_mut() else {
@@ -6106,6 +6888,12 @@ unsafe fn apply_settings(context: &SettingsDialogContext) {
         if state.youtube_playback != mode {
             changed = true;
             record(state.set_youtube_playback(mode), &mut state, &mut failed);
+        }
+    }
+    if let Some(mode) = podcast_playback {
+        if state.podcast_playback != mode {
+            changed = true;
+            record(state.set_podcast_playback(mode), &mut state, &mut failed);
         }
     }
     if state.download_dir != download_dir {
@@ -6475,7 +7263,7 @@ unsafe extern "C" fn track_list_drop_callback(
                 .playlists
                 .get(st.active_playlist)
                 .map_or(0, |playlist| playlist.tracks.len());
-            st.external_drop_index = if st.youtube_mode || len == 0 {
+            st.external_drop_index = if (st.view == LibraryView::YouTube) || len == 0 {
                 None
             } else {
                 Some(drop_insert_index(local_y, row_height, scroll_offset, len))
@@ -6499,7 +7287,7 @@ unsafe extern "C" fn track_list_drop_callback(
                 .playlists
                 .get(st.active_playlist)
                 .map_or(0, |playlist| playlist.tracks.len());
-            let insert_at = if st.youtube_mode || len == 0 {
+            let insert_at = if (st.view == LibraryView::YouTube) || len == 0 {
                 None
             } else {
                 Some(drop_insert_index(local_y, row_height, scroll_offset, len))
@@ -7126,7 +7914,7 @@ unsafe extern "C" fn track_list_event_callback(
             };
             // Los resultados no se pueden arrastrar: la fila no corresponde a
             // una pista de la lista activa.
-            if st.youtube_mode {
+            if st.view == LibraryView::YouTube {
                 st.drag = DragState::Idle;
                 return R_FALSE;
             }
@@ -7287,7 +8075,7 @@ unsafe extern "C" fn track_list_event_callback(
                 let Ok(mut st) = state.try_borrow_mut() else {
                     return R_FALSE;
                 };
-                if st.youtube_mode {
+                if st.view == LibraryView::YouTube {
                     return R_FALSE;
                 }
                 st.remove_selected_track();
@@ -7419,6 +8207,7 @@ fn main() {
         let mut st = state.borrow_mut();
         st.track_list_widget = ui.track_list;
         st.playlist_tabs_widget = ui.playlist_tabs;
+        st.window = window;
         st.mpris = mpris;
         st.mpris_commands = Some(mpris_commands);
     }
@@ -7433,12 +8222,13 @@ fn main() {
         }
     }
     create_drop_guide(window, &state);
-    // Raven no puede ocultar items de un menú, así que se crean tres: el de
-    // siempre para las listas locales, uno para el buscador y otro para FLAC.
+    // Raven no puede ocultar items de un menú, así que se crean cuatro: local,
+    // YouTube, FLAC y podcasts.
     let context_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
     let youtube_context_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
     let flac_context_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
-    let mut menus = ContextMenus::new(context_menu, youtube_context_menu, flac_context_menu);
+    let podcast_context_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
+    let mut menus = ContextMenus::new(context_menu, youtube_context_menu, flac_context_menu, podcast_context_menu);
     let app_menu = unsafe { Rwidget_create(R_WIDGET_MENU) };
     let edit_metadata_text = cstr("Editar metadatos");
     let edit_metadata_item = unsafe { Rmenu_add_item(context_menu, edit_metadata_text.as_ptr()) };
@@ -7458,6 +8248,16 @@ fn main() {
     };
     let add_stream_text = cstr("Añadir a lista de reproducción (Streaming)");
     let add_stream_item = unsafe { Rmenu_add_item(youtube_context_menu, add_stream_text.as_ptr()) };
+    let podcast_subscribe_text = cstr("Suscribirse a este podcast");
+    let podcast_subscribe_item = unsafe { Rmenu_add_item(podcast_context_menu, podcast_subscribe_text.as_ptr()) };
+    let podcast_played_text = cstr("Marcar como escuchado");
+    let podcast_played_item = unsafe { Rmenu_add_item(podcast_context_menu, podcast_played_text.as_ptr()) };
+    let podcast_unplayed_text = cstr("Marcar como no escuchado");
+    let podcast_unplayed_item = unsafe { Rmenu_add_item(podcast_context_menu, podcast_unplayed_text.as_ptr()) };
+    let podcast_refresh_text = cstr("Actualizar feed");
+    let podcast_refresh_item = unsafe { Rmenu_add_item(podcast_context_menu, podcast_refresh_text.as_ptr()) };
+    let podcast_remove_text = cstr("Eliminar suscripción");
+    let podcast_remove_item = unsafe { Rmenu_add_item(podcast_context_menu, podcast_remove_text.as_ptr()) };
 
     // «Ajustes» va primero para que el comportamiento al abrir archivos esté
     // a mano: es lo que más se toca al usar la app como reproductor del sistema.
@@ -7538,6 +8338,31 @@ fn main() {
             Some(add_to_playlist_from_context_menu),
             context_data,
         );
+        Rmenu_item_set_clicked_callback(
+            podcast_subscribe_item,
+            Some(podcast_subscribe_from_context_menu),
+            Rc::as_ptr(&state) as *mut c_void,
+        );
+        Rmenu_item_set_clicked_callback(
+            podcast_played_item,
+            Some(podcast_mark_played_from_context_menu),
+            Rc::as_ptr(&state) as *mut c_void,
+        );
+        Rmenu_item_set_clicked_callback(
+            podcast_unplayed_item,
+            Some(podcast_mark_unplayed_from_context_menu),
+            Rc::as_ptr(&state) as *mut c_void,
+        );
+        Rmenu_item_set_clicked_callback(
+            podcast_refresh_item,
+            Some(podcast_refresh_from_context_menu),
+            Rc::as_ptr(&state) as *mut c_void,
+        );
+        Rmenu_item_set_clicked_callback(
+            podcast_remove_item,
+            Some(podcast_remove_from_context_menu),
+            Rc::as_ptr(&state) as *mut c_void,
+        );
         if settings_item != R_INVALID_ID {
             Rmenu_item_set_clicked_callback(
                 settings_item,
@@ -7589,6 +8414,9 @@ fn main() {
             Some(window_drop_callback),
             Rc::as_ptr(&state) as *mut c_void,
         );
+        // La etiqueta del título dibuja el texto; el botón transparente que
+        // hay debajo recibe el clic para volver al inicio de Podcasts.
+        Rwidget_set_hit_testable(ui.library_title, R_FALSE);
         // Allow dragging tracks to reorder them in the list
         Rwidget_set_event_callback(
             ui.track_list,
@@ -7737,6 +8565,36 @@ fn main() {
             let query = input_value(sender);
             state.borrow_mut().start_youtube_search(query);
             set_input(ui.youtube_search, "");
+        });
+    }
+    {
+        let state = Rc::clone(&state);
+        action_bind("player.podcast_toggle", move |_, _| {
+            state.borrow_mut().toggle_podcast_mode();
+        });
+    }
+    {
+        let state = Rc::clone(&state);
+        action_bind("player.podcast_home", move |_, _| {
+            let mut state = state.borrow_mut();
+            if state.view == LibraryView::Podcasts {
+                state.podcast_show_home();
+            }
+        });
+    }
+    {
+        let state = Rc::clone(&state);
+        let ui = ui;
+        action_bind("player.podcast_search", move |sender, _| {
+            let query = input_value(sender);
+            state.borrow_mut().start_podcast_search(query);
+            set_input(ui.podcast_search, "");
+        });
+    }
+    {
+        let state = Rc::clone(&state);
+        action_bind("player.podcast_subscribe", move |_, _| {
+            state.borrow_mut().podcast_subscribe_selected();
         });
     }
     {
@@ -8118,6 +8976,7 @@ mod tests {
             open_behavior: OpenBehavior::AddOnly,
             add_behavior: AddBehavior::AddOnly,
             youtube_playback: YoutubePlayback::FullDownload,
+            podcast_playback: YoutubePlayback::FullDownload,
             download_dir: Some(PathBuf::from("/home/persona/Descargas")),
             volume: 0.37,
         };
@@ -8127,6 +8986,7 @@ mod tests {
         assert_eq!(back.open_behavior, OpenBehavior::AddOnly);
         assert_eq!(back.add_behavior, AddBehavior::AddOnly);
         assert_eq!(back.youtube_playback, YoutubePlayback::FullDownload);
+        assert_eq!(back.podcast_playback, YoutubePlayback::FullDownload);
         assert_eq!(back.download_dir, settings.download_dir);
         assert_eq!(back.volume, 0.37);
 
@@ -8170,6 +9030,8 @@ mod tests {
             placeholder: Some(cstr("Busca en YouTube…")),
             youtube: true,
             youtube_results: Vec::new(),
+            podcast: false,
+            podcast_rows: Vec::new(),
         });
         let pointer = unsafe {
             track_list_row_text(
@@ -8204,6 +9066,8 @@ mod tests {
             placeholder: None,
             youtube: true,
             youtube_results: vec![track.clone()],
+            podcast: false,
+            podcast_rows: Vec::new(),
         });
         let pointer = unsafe {
             track_list_row_text(
@@ -8497,11 +9361,12 @@ mod tests {
 
     #[test]
     fn settings_sections_match_the_dialog_pages() {
-        assert_eq!(SETTINGS_SECTIONS.len(), 4);
+        assert_eq!(SETTINGS_SECTIONS.len(), 5);
         assert_eq!(SETTINGS_SECTIONS[0], "General");
         assert_eq!(SETTINGS_SECTIONS[1], "Listas");
         assert_eq!(SETTINGS_SECTIONS[2], "YouTube");
-        assert_eq!(SETTINGS_SECTIONS[3], "Descargas");
+        assert_eq!(SETTINGS_SECTIONS[3], "Podcasts");
+        assert_eq!(SETTINGS_SECTIONS[4], "Descargas");
     }
 
     #[test]

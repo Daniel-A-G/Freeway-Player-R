@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Freeway Player — Reproductor de música para Linux</title>
-<meta name="description" content="Reproductor de música local para Linux con listas, YouTube, edición de metadatos, conversión FLAC a Opus y actualizaciones Flatpak. Escrito en Rust.">
+<meta name="description" content="Reproductor de música local para Linux con listas, YouTube, podcasts, edición de metadatos, conversión FLAC a Opus y actualizaciones Flatpak. Escrito en Rust.">
 <style>
 :root {
   --bg: #131118;
@@ -168,7 +168,7 @@ footer a { color: var(--accent); }
   <div class="container">
     <img src="icon.png" alt="Freeway Player" class="hero-icon">
     <h1>Freeway <span>Player</span></h1>
-    <p class="tagline">Tu música, en orden. Reproductor local para Linux con listas, YouTube, edición de metadatos y conversión de audio.</p>
+    <p class="tagline">Tu música, en orden. Reproductor local para Linux con listas, YouTube, podcasts, edición de metadatos y conversión de audio.</p>
     <div class="hero-buttons">
       <a href="io.github.freewayplayer.FreewayPlayer.flatpakref" class="btn btn-primary">⬇ Instalar ahora</a>
       <a href="https://github.com/Daniel-A-G/Freeway-Player-R/releases" class="btn btn-secondary">Ver releases</a>
@@ -190,6 +190,11 @@ footer a { color: var(--accent); }
         <div class="feature-icon">▶️</div>
         <h3>YouTube integrado</h3>
         <p>Busca en YouTube, reproduce audio en streaming y descarga pistas en Opus cuando quieras guardarlas. Los resultados muestran los títulos originales.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🎙️</div>
+        <h3>Podcasts</h3>
+        <p>Descubre podcasts, suscríbete por URL RSS/Atom y escucha episodios con progreso guardado, estado de escuchado y carátulas. Todo se mantiene en tu equipo.</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon">🖼️</div>
@@ -270,6 +275,10 @@ footer a { color: var(--accent); }
       <div class="tech-item">
         <h4>Lofty</h4>
         <p>Lectura y escritura de metadatos de audio</p>
+      </div>
+      <div class="tech-item">
+        <h4>feed-rs</h4>
+        <p>Lectura de feeds RSS y Atom</p>
       </div>
       <div class="tech-item">
         <h4>Flatpak</h4>

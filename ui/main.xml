@@ -21,10 +21,15 @@
             <VBox Spacing="10" Slot.Fill="2" Slot.Padding="0,4,18,10">
                 <HBox Spacing="10">
                     <VBox Spacing="2">
-                        <Label Name="library-title" Text="Biblioteca" TextSize="21"/>
+                        <Overlay>
+                            <Button Name="library-title-hit" Style="Flat" OnClicked="player.podcast_home"/>
+                            <Label Name="library-title" Text="Biblioteca" TextSize="21"/>
+                        </Overlay>
                         <Label Name="playlist-summary" Text="Lista vacía" TextSize="12" Color.Text="#8F8999"/>
                         <TextInput Name="youtube-search" Width="220" Placeholder="Buscar en YouTube…" Tooltip="Escribe una búsqueda y pulsa Enter" OnCommitted="player.youtube_search"/>
+                        <TextInput Name="podcast-search" Width="220" Placeholder="Buscar podcasts o pegar URL RSS…" Tooltip="Escribe una búsqueda, o pega una URL RSS y pulsa Enter" OnCommitted="player.podcast_search" Visibility="Collapsed"/>
                     </VBox>
+                    <Button Name="podcast-subscribe-button" Text="+" Style="Flat" Tooltip="Suscribirse a este podcast" OnClicked="player.podcast_subscribe" Visibility="Collapsed" Slot.VAlign="Center"/>
                     <Button Name="random-button" Style="Flat" Tooltip="Reproducir una pista al azar de esta lista" OnClicked="player.play_random" Slot.VAlign="Center">
                         <Image Name="random-icon" Width="18" Height="18" TintText="true"/>
                     </Button>
@@ -143,6 +148,9 @@
                 <HBox Spacing="0" Width="272">
                     <Button Name="youtube-button" Width="56" Height="40" Style="Flat" Tooltip="Buscar música en YouTube (solo búsqueda, no guarda nada)" OnClicked="player.youtube_toggle">
                         <Image Name="youtube-icon" Width="24" Height="24" TintText="true"/>
+                    </Button>
+                    <Button Name="podcast-button" Width="56" Height="40" Style="Flat" Tooltip="Modo podcast" OnClicked="player.podcast_toggle">
+                        <Image Name="podcast-icon" Width="24" Height="24" TintText="true"/>
                     </Button>
                     <Spacer Slot.Fill="1"/>
                 </HBox>
