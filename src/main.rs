@@ -634,10 +634,7 @@ struct PlayerState {
     converter_pending: Option<PendingConversion>,
     drag: DragState,
     tab_drag: TabDragState,
-    /// Raven no expone el desplazamiento del `ListView`. Lo marcamos cuando
-    /// detectamos scroll propio; mientras esté activo, un drop externo cae al
-    /// final como antes, para no insertar en un índice equivocado.
-    track_list_scrolled: bool,
+
     /// Fila donde se insertarían los archivos que se están arrastrando sobre
     /// la lista. Solo se usa para pintar la guía durante el drop.
     external_drop_index: Option<usize>,
@@ -773,7 +770,6 @@ impl PlayerState {
             converter_pending: None,
             drag: DragState::Idle,
             tab_drag: TabDragState::Idle,
-            track_list_scrolled: false,
             external_drop_index: None,
         }
     }
@@ -6392,13 +6388,15 @@ unsafe extern "C" fn window_close_callback(_window: Rid, user_data: *mut c_void)
 }
 
 /// Índice de inserción al soltar sobre el `ListView`, a partir de la posición
-/// vertical dentro del widget. La mitad superior de una fila inserta antes de
-/// ella y la inferior, después; se limita a `[0, len]`.
-fn drop_insert_index(local_y: f32, row_height: f32, len: usize) -> usize {
+/// vertical visible dentro del widget y del desplazamiento vertical actual.
+/// La mitad superior de una fila inserta antes de ella y la inferior, después;
+/// se limita a `[0, len]`.
+fn drop_insert_index(local_y: f32, row_height: f32, scroll_offset: f32, len: usize) -> usize {
     if len == 0 || row_height <= 0.0 {
         return 0;
     }
-    let row = ((local_y / row_height).round() as isize).clamp(0, len as isize);
+    let content_y = local_y + scroll_offset.max(0.0);
+    let row = ((content_y / row_height).round() as isize).clamp(0, len as isize);
     row as usize
 }
 
@@ -6455,12 +6453,12 @@ unsafe extern "C" fn window_drop_callback(
 
 /// Drop directamente sobre la lista de pistas.
 ///
-/// Raven da `local_y` relativo al `ListView`, así que podemos calcular la fila
-/// sobre la que se suelta. Solo se usa si la lista no se ha desplazado: el
-/// `ListView` no expone su offset y una estimación podría insertar en el sitio
-/// equivocado. Con scroll (o en el buscador de YouTube) se cae al final.
+/// Raven da `local_y` relativo al `ListView` visible. Con
+/// `Rlist_view_get_scroll_offset` lo convertimos a coordenada de contenido, así
+/// que la inserción funciona también cuando la lista está desplazada. En modo
+/// YouTube o con la lista vacía se mantiene el comportamiento de añadir al final.
 unsafe extern "C" fn track_list_drop_callback(
-    _target: Rid,
+    target: Rid,
     event: *const RDropEvent,
     user_data: *mut c_void,
 ) -> c_int {
@@ -6468,6 +6466,7 @@ unsafe extern "C" fn track_list_drop_callback(
     let phase = (*event).phase;
     let local_y = (*event).local_y;
     let window = (*event).window;
+    let scroll_offset = Rlist_view_get_scroll_offset(target);
 
     if matches!(phase, R_DROP_ENTER | R_DROP_MOVE) {
         if let Ok(mut st) = state.try_borrow_mut() {
@@ -6476,10 +6475,10 @@ unsafe extern "C" fn track_list_drop_callback(
                 .playlists
                 .get(st.active_playlist)
                 .map_or(0, |playlist| playlist.tracks.len());
-            st.external_drop_index = if st.youtube_mode || st.track_list_scrolled || len == 0 {
+            st.external_drop_index = if st.youtube_mode || len == 0 {
                 None
             } else {
-                Some(drop_insert_index(local_y, row_height, len))
+                Some(drop_insert_index(local_y, row_height, scroll_offset, len))
             };
         }
         Rwindow_request_redraw(window);
@@ -6500,10 +6499,10 @@ unsafe extern "C" fn track_list_drop_callback(
                 .playlists
                 .get(st.active_playlist)
                 .map_or(0, |playlist| playlist.tracks.len());
-            let insert_at = if st.youtube_mode || st.track_list_scrolled || len == 0 {
+            let insert_at = if st.youtube_mode || len == 0 {
                 None
             } else {
-                Some(drop_insert_index(local_y, row_height, len))
+                Some(drop_insert_index(local_y, row_height, scroll_offset, len))
             };
             st.external_drop_index = None;
             if !tracks.is_empty() {
@@ -6857,10 +6856,16 @@ unsafe extern "C" fn drop_guide_paint(
         return;
     }
 
+    let scroll_offset = Rlist_view_get_scroll_offset(st.track_list_widget);
+
     if let Some(index) = st.external_drop_index {
         let row_height = Rtheme_get_metric(R_METRIC_ROW_HEIGHT);
         if row_height > 0.0 {
-            paint_track_list_guide(painter, st.track_list_widget, index as f32 * row_height);
+            paint_track_list_guide(
+                painter,
+                st.track_list_widget,
+                index as f32 * row_height - scroll_offset,
+            );
         }
         return;
     }
@@ -6882,7 +6887,7 @@ unsafe extern "C" fn drop_guide_paint(
     if row_height <= 0.0 {
         return;
     }
-    let guide_y = drag_guide_y(from, start_y, target, row_height);
+    let guide_y = drag_guide_y(from, start_y, target, row_height) - scroll_offset;
     paint_track_list_guide(painter, st.track_list_widget, guide_y);
 }
 
@@ -7101,7 +7106,7 @@ unsafe extern "C" fn playlist_tabs_event_callback(
 
 // Event callback for track list: handle drag-to-reorder
 unsafe extern "C" fn track_list_event_callback(
-    widget: Rid,
+    _widget: Rid,
     event: *const REvent,
     user_data: *mut c_void,
 ) -> c_int {
@@ -7125,14 +7130,6 @@ unsafe extern "C" fn track_list_event_callback(
                 st.drag = DragState::Idle;
                 return R_FALSE;
             }
-            // Clic en la franja de la barra de desplazamiento: Raven la gestiona
-            // internamente y no avisa del cambio de offset. Marcamos la lista
-            // como desplazada para no insertar en una fila equivocada.
-            let (mut list_x, mut list_y, mut list_w, mut list_h) = (0.0, 0.0, 0.0, 0.0);
-            Rwidget_get_rect(widget, &mut list_x, &mut list_y, &mut list_w, &mut list_h);
-            if list_w > 0.0 && (*event).local_x >= list_w - 12.0 {
-                st.track_list_scrolled = true;
-            }
             // Un clic nuevo cancela cualquier gesto anterior. Dejamos pasar el
             // evento (R_FALSE) para que Raven seleccione la fila pulsada: nuestro
             // callback se ejecuta ANTES del widget, así que leer la selección aquí
@@ -7144,13 +7141,10 @@ unsafe extern "C" fn track_list_event_callback(
             // Congelar el viewport mientras haya un clic o arrastre en curso.
             // Si la lista scrollea a mitad del gesto, `local_y` deja de corresponder
             // al índice capturado y el destino salta filas.
-            let Ok(mut st) = state.try_borrow_mut() else {
+            let Ok(st) = state.try_borrow_mut() else {
                 return R_FALSE;
             };
             if matches!(st.drag, DragState::Idle) {
-                if (*event).wheel_x != 0.0 || (*event).wheel_y != 0.0 {
-                    st.track_list_scrolled = true;
-                }
                 R_FALSE
             } else {
                 R_TRUE
@@ -7227,9 +7221,7 @@ unsafe extern "C" fn track_list_event_callback(
                     target = new_target;
                     scroll_to = Some(index);
                     last_scroll = Some(now);
-                    // El auto-scroll también desplaza la vista; el drop externo
-                    // posterior no podrá mapear `local_y` a una fila real.
-                    st.track_list_scrolled = true;
+
                 }
             }
             st.drag = DragState::Dragging {
@@ -8642,14 +8634,22 @@ mod tests {
     #[test]
     fn drop_insert_index_uses_the_nearest_row_edge() {
         // La mitad superior de una fila inserta antes; la inferior, después.
-        assert_eq!(drop_insert_index(0.0, 40.0, 5), 0);
-        assert_eq!(drop_insert_index(19.0, 40.0, 5), 0);
-        assert_eq!(drop_insert_index(20.0, 40.0, 5), 1);
-        assert_eq!(drop_insert_index(60.0, 40.0, 5), 2);
-        assert_eq!(drop_insert_index(1000.0, 40.0, 5), 5);
-        assert_eq!(drop_insert_index(-100.0, 40.0, 5), 0);
-        assert_eq!(drop_insert_index(100.0, 0.0, 5), 0);
-        assert_eq!(drop_insert_index(100.0, 40.0, 0), 0);
+        assert_eq!(drop_insert_index(0.0, 40.0, 0.0, 5), 0);
+        assert_eq!(drop_insert_index(19.0, 40.0, 0.0, 5), 0);
+        assert_eq!(drop_insert_index(20.0, 40.0, 0.0, 5), 1);
+        assert_eq!(drop_insert_index(60.0, 40.0, 0.0, 5), 2);
+        assert_eq!(drop_insert_index(1000.0, 40.0, 0.0, 5), 5);
+        assert_eq!(drop_insert_index(-100.0, 40.0, 0.0, 5), 0);
+        assert_eq!(drop_insert_index(100.0, 0.0, 0.0, 5), 0);
+        assert_eq!(drop_insert_index(100.0, 40.0, 0.0, 0), 0);
+    }
+
+    #[test]
+    fn drop_insert_index_accounts_for_scroll_offset() {
+        // Con scroll, el contenido visible empieza más abajo en la lista.
+        assert_eq!(drop_insert_index(0.0, 40.0, 80.0, 10), 2);
+        assert_eq!(drop_insert_index(20.0, 40.0, 80.0, 10), 3);
+        assert_eq!(drop_insert_index(1000.0, 40.0, 80.0, 10), 10);
     }
 
     #[test]

@@ -1,0 +1,25 @@
+--- a/include/raven/raven_controls.h
++++ b/include/raven/raven_controls.h
+@@ -279,6 +279,8 @@
+ 	RAVEN_API void Rlist_view_set_selected(Rid list_view, int index);
+ 	RAVEN_API int Rlist_view_get_selected(Rid list_view);
+ 	RAVEN_API void Rlist_view_scroll_to_item(Rid list_view, int index);
++	/** @brief Current vertical scroll offset in pixels. */
++	RAVEN_API float Rlist_view_get_scroll_offset(Rid list_view);
+ 	typedef void (*RListEventCallback)(Rid list_view, int index, void* user_data);
+ 	RAVEN_API void Rlist_view_set_selection_changed_callback(Rid list_view, RListEventCallback callback, void* user_data);
+ 	/** @brief Called on double click or Enter. This also fires the action of the widget. */
+--- a/src/widgets/list_view.c
++++ b/src/widgets/list_view.c
+@@ -427,6 +427,11 @@
+ 	rvn_list_reveal(widget, index);
+ }
+ 
++float Rlist_view_get_scroll_offset(Rid id) {
++	RVN_WIDGET(widget, id, R_WIDGET_LIST_VIEW, 0.0f);
++	return ((rvn_list_view_t*)widget)->bar.offset;
++}
++
+ void Rlist_view_set_selection_changed_callback(Rid id, RListEventCallback callback, void* user_data) {
+ 	RVN_WIDGET_VOID(widget, id, R_WIDGET_LIST_VIEW);
+ 	((rvn_list_view_t*)widget)->selection_callback = callback;

@@ -2553,6 +2553,8 @@ extern "C" {
     pub fn Rlist_view_set_selected(list_view: Rid, index: c_int);
     pub fn Rlist_view_get_selected(list_view: Rid) -> c_int;
     pub fn Rlist_view_scroll_to_item(list_view: Rid, index: c_int);
+    /// Current vertical scroll offset in pixels.
+    pub fn Rlist_view_get_scroll_offset(list_view: Rid) -> f32;
     pub fn Rlist_view_set_selection_changed_callback(list_view: Rid, callback: RListEventCallback, user_data: *mut c_void);
     /// Called on double click or Enter. This also fires the action of the widget.
     pub fn Rlist_view_set_activated_callback(list_view: Rid, callback: RListEventCallback, user_data: *mut c_void);
